@@ -10,12 +10,16 @@ const VCPKG_ROOT_FALLBACK = "C:/tools/vcpkg/";
 
 fn getVcpkgRoot(allocator: std.mem.Allocator) str {
     const env_map = std.process.getEnvMap(allocator) catch {
+        log.warn("Failed to get environment variables, fallback to '{s}'", .{VCPKG_ROOT_FALLBACK});
         return VCPKG_ROOT_FALLBACK;
     };
-    const vcpkg_root = env_map.get("VCPKG_ROOT");
-    if (vcpkg_root) |r| {
+    defer env_map.deinit();
+    const root_ = env_map.get("VCPKG_ROOT");
+    if (root_) |r| {
+        log.info("use environment variable VCPKG_ROOT={s}", .{r});
         return r;
     }
+    log.warn("VCPKG_ROOT not found in environment variables, fallback to '{s}'", .{VCPKG_ROOT_FALLBACK});
     return VCPKG_ROOT_FALLBACK;
 }
 

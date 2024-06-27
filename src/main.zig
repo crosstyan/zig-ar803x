@@ -12,10 +12,6 @@ pub fn main() !void {
     if (ret != 0) {
         return std.debug.panic("libusb_init_context failed: {}", .{ret});
     }
-    ret = usb.libusb_init(&p_context);
-    if (ret != 0) {
-        return std.debug.panic("libusb_init failed: {}", .{ret});
-    }
     defer usb.libusb_exit(p_context);
     const pc_version = usb.libusb_get_version();
     const p_version: ?*const usb.libusb_version = @ptrCast(pc_version);

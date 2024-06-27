@@ -6,7 +6,18 @@ const fs = std.fs;
 const str = []const u8;
 
 // only useful in Windows
-const VCPKG_ROOT = "C:/tools/vcpkg/";
+const VCPKG_ROOT_FALLBACK = "C:/tools/vcpkg/";
+
+fn getVcpkgRoot(allocator: std.mem.Allocator) str {
+    const env_map = std.process.getEnvMap(allocator) catch {
+        return VCPKG_ROOT_FALLBACK;
+    };
+    const vcpkg_root = env_map.get("VCPKG_ROOT");
+    if (vcpkg_root) |r| {
+        return r;
+    }
+    return VCPKG_ROOT_FALLBACK;
+}
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -37,6 +48,7 @@ pub fn build(b: *std.Build) void {
         // I still don't want to deal with Zig package system bullshit
         // That's ugly but it works, except you MUST reconfigure
         // it for different host (that's the configure stage for, zig just skips it)
+        const VCPKG_ROOT = getVcpkgRoot(b.allocator);
         const vcpkg_packages_path = b.pathJoin(&.{ VCPKG_ROOT, "packages/" });
         const libusb_prefix = b.pathJoin(&.{ vcpkg_packages_path, "libusb_x64-windows/" });
         const usb_lib_dir = b.pathJoin(&.{ libusb_prefix, "lib/" });

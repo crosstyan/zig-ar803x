@@ -5,13 +5,21 @@ const usb = @cImport({
 const log = std.log;
 
 pub fn main() !void {
-    const ret = usb.libusb_init(null);
-    log.info("libusb_init returned: {}", .{ret});
+    // https://libusb.sourceforge.io/api-1.0/libusb_contexts.html
+    var p_context: ?*usb.libusb_context = null;
+    var ret: c_int = undefined;
+    ret = usb.libusb_init_context(&p_context, null, 0);
+    if (ret != 0) {
+        return std.debug.panic("libusb_init_context failed: {}", .{ret});
+    }
+    ret = usb.libusb_init(&p_context);
+    if (ret != 0) {
+        return std.debug.panic("libusb_init failed: {}", .{ret});
+    }
+    defer usb.libusb_exit(p_context);
+    const pc_version = usb.libusb_get_version();
+    const p_version: ?*const usb.libusb_version = @ptrCast(pc_version);
+    log.info("libusb version: {}.{}.{}.{}", .{ p_version.?.major, p_version.?.minor, p_version.?.micro, p_version.?.nano });
 }
 
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+test "simple test" {}

@@ -1,6 +1,12 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const log = std.log;
 const bd = std.Build;
+const fs = std.fs;
+const str = []const u8;
+
+// only useful in Windows
+const VCPKG_ROOT = "C:/tools/vcpkg/";
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -23,32 +29,36 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // C:\tools\vcpkg\packages\libusb_x64-windows\lib\pkgconfig
-    // I still don't want to deal with Zig package system bullshit
-    // That's ugly but it works, except you MUST reconfigure
-    // it for different host (that's the configure stage for, zig just skips it)
-    //
-    // note that this path here should ends with a slash
-    //
-    const vcpkg_path = "C:/tools/vcpkg/";
-    const vcpkg_packages_path = vcpkg_path ++ "packages/";
-    const usb_lib_prefix = vcpkg_packages_path ++ "libusb_x64-windows/";
-    const usb_lib_dir = usb_lib_prefix ++ "lib/";
-    // where the `.dll` file is located
-    const usb_bin_dir = usb_lib_prefix ++ "bin/";
-    const usb_include_dir = usb_lib_prefix ++ "include/";
-    // const usb_pkgconfig_dir = usb_lib_prefix ++ "pkgconfig/";
-    exe.addLibraryPath(bd.LazyPath{ .cwd_relative = usb_lib_dir });
-    exe.addIncludePath(bd.LazyPath{ .cwd_relative = usb_include_dir });
-    exe.linkSystemLibrary("c");
-    // please note that for Windows the `lib` prefix is necessary (for
-    // `lib<name>`) but not for Linux (on the contrary, `lib` prefix is
-    // forbidden, otherwise it will find `liblib<name>`)
-    exe.linkSystemLibrary("libusb-1.0");
-    // and you should copy the DLL to the same directory as the executable
-    const usb_lib_file_path = usb_bin_dir ++ "libusb-1.0.dll";
-    const usb_lib_file_lazy_path = bd.LazyPath{ .cwd_relative = usb_lib_file_path };
-    b.getInstallStep().dependOn(&b.addInstallFileWithDir(usb_lib_file_lazy_path, .prefix, "bin/libusb-1.0.dll").step);
+    if (builtin.os.tag == .windows) {
+        // See also
+        //
+        // C:\tools\vcpkg\packages\libusb_x64-windows\lib\pkgconfig
+        //
+        // I still don't want to deal with Zig package system bullshit
+        // That's ugly but it works, except you MUST reconfigure
+        // it for different host (that's the configure stage for, zig just skips it)
+        const vcpkg_packages_path = b.pathJoin(&.{ VCPKG_ROOT, "packages/" });
+        const libusb_prefix = b.pathJoin(&.{ vcpkg_packages_path, "libusb_x64-windows/" });
+        const usb_lib_dir = b.pathJoin(&.{ libusb_prefix, "lib/" });
+        // where the `.dll` file is located
+        const usb_bin_dir = b.pathJoin(&.{ libusb_prefix, "bin/" });
+        const usb_include_dir = b.pathJoin(&.{ libusb_prefix, "include/" });
+        // const usb_pkgconfig_dir = usb_lib_prefix ++ "pkgconfig/";
+        exe.addLibraryPath(bd.LazyPath{ .cwd_relative = usb_lib_dir });
+        exe.addIncludePath(bd.LazyPath{ .cwd_relative = usb_include_dir });
+        exe.linkSystemLibrary("c");
+        // please note that for Windows the `lib` prefix is necessary (for
+        // `lib<name>`) but not for Linux (on the contrary, `lib` prefix is
+        // forbidden, otherwise it will find `liblib<name>`)
+        exe.linkSystemLibrary("libusb-1.0");
+        // and you should copy the DLL to the same directory as the executable
+        const usb_lib_file_path = b.pathJoin(&.{ usb_bin_dir, "libusb-1.0.dll" });
+        const usb_lib_file_lazy_path = bd.LazyPath{ .cwd_relative = usb_lib_file_path };
+        b.getInstallStep().dependOn(&b.addInstallFileWithDir(usb_lib_file_lazy_path, .prefix, "bin/libusb-1.0.dll").step);
+    } else {
+        // TODO: macOS might needs to be handled differently
+        exe.linkSystemLibrary("usb-1.0");
+    }
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default

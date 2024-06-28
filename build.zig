@@ -58,22 +58,20 @@ pub fn build(b: *std.Build) void {
         const usb_lib_dir = b.pathJoin(&.{ libusb_prefix, "lib/" });
         // where the `.dll` file is located
         const usb_bin_dir = b.pathJoin(&.{ libusb_prefix, "bin/" });
-        const usb_include_dir = b.pathJoin(&.{ libusb_prefix, "include/" });
+        const usb_include_dir = b.pathJoin(&.{ libusb_prefix, "include/libusb-1.0" });
         // const usb_pkgconfig_dir = usb_lib_prefix ++ "pkgconfig/";
         exe.addLibraryPath(bd.LazyPath{ .cwd_relative = usb_lib_dir });
         exe.addIncludePath(bd.LazyPath{ .cwd_relative = usb_include_dir });
         exe.linkSystemLibrary("c");
-        // please note that for Windows the `lib` prefix is necessary (for
-        // `lib<name>`) but not for Linux (on the contrary, `lib` prefix is
-        // forbidden, otherwise it will find `liblib<name>`)
         exe.linkSystemLibrary("libusb-1.0");
         // and you should copy the DLL to the same directory as the executable
         const usb_lib_file_path = b.pathJoin(&.{ usb_bin_dir, "libusb-1.0.dll" });
         const usb_lib_file_lazy_path = bd.LazyPath{ .cwd_relative = usb_lib_file_path };
+        // see b.installFile
         b.getInstallStep().dependOn(&b.addInstallFileWithDir(usb_lib_file_lazy_path, .prefix, "bin/libusb-1.0.dll").step);
     } else {
-        // TODO: macOS might needs to be handled differently
-        exe.linkSystemLibrary("usb-1.0");
+        exe.linkSystemLibrary("c");
+        exe.linkSystemLibrary("libusb-1.0");
     }
 
     // This declares intent for the executable to be installed into the

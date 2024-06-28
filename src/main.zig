@@ -1,6 +1,6 @@
 const std = @import("std");
 const usb = @cImport({
-    @cInclude("libusb-1.0/libusb.h");
+    @cInclude("libusb.h");
 });
 const log = std.log;
 

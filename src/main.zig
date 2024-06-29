@@ -23,7 +23,6 @@ fn print_infos(hdl: *usb.libusb_device_handle, desc: *usb.libusb_device_descript
         }
     };
 
-    // print manufacturer, product, serial number
     const BUF_SIZE = 128;
     var manufacturer_buf: [BUF_SIZE]u8 = undefined;
     const manufacturer = local.get_string_descriptor_or(hdl, desc.iManufacturer, &manufacturer_buf, "N/A");
@@ -39,6 +38,19 @@ fn print_infos(hdl: *usb.libusb_device_handle, desc: *usb.libusb_device_descript
         .string("manufacturer", manufacturer)
         .string("product", product)
         .string("serial", serial).log();
+}
+
+pub fn usb_speed_to_string(speed: c_int) []const u8 {
+    const r = switch (speed) {
+        usb.LIBUSB_SPEED_UNKNOWN => "UNKNOWN",
+        usb.LIBUSB_SPEED_LOW => "LOW",
+        usb.LIBUSB_SPEED_FULL => "FULL",
+        usb.LIBUSB_SPEED_HIGH => "HIGH",
+        usb.LIBUSB_SPEED_SUPER => "SUPER",
+        usb.LIBUSB_SPEED_SUPER_PLUS => "SUPER_PLUS",
+        else => "INVALID",
+    };
+    return r;
 }
 
 pub fn main() !void {
@@ -59,18 +71,18 @@ pub fn main() !void {
     });
     defer logz.deinit();
 
-    var p_context: ?*usb.libusb_context = null;
+    var ctx: ?*usb.libusb_context = null;
     var ret: c_int = undefined;
-    ret = usb.libusb_init_context(&p_context, null, 0);
+    ret = usb.libusb_init_context(&ctx, null, 0);
     if (ret != 0) {
         return std.debug.panic("libusb_init_context failed: {}", .{ret});
     }
-    defer usb.libusb_exit(p_context);
+    defer usb.libusb_exit(ctx);
     const pc_version = usb.libusb_get_version();
     const p_version: ?*const usb.libusb_version = @ptrCast(pc_version);
-    logz.info().fmt("version", "{}.{}.{}.{}", .{ p_version.?.major, p_version.?.minor, p_version.?.micro, p_version.?.nano }).log();
+    logz.info().fmt("libusb version", "{}.{}.{}.{}", .{ p_version.?.major, p_version.?.minor, p_version.?.micro, p_version.?.nano }).log();
     var c_device_list: [*c]?*usb.libusb_device = undefined;
-    const sz = usb.libusb_get_device_list(p_context, &c_device_list);
+    const sz = usb.libusb_get_device_list(ctx, &c_device_list);
     var device_list = c_device_list[0..@intCast(sz)];
     device_list.len = @intCast(sz);
     logz.info().int("number of device", sz).log();
@@ -86,12 +98,17 @@ pub fn main() !void {
         ret = usb.libusb_open(device, &hdl);
         if (ret != 0) {
             logz.warn()
-                .string("what", "can't open device")
-                .int("code", ret)
                 .fmt("vid", "0x{x:0>4}", .{desc.idVendor})
-                .fmt("pid", "0x{x:0>4}", .{desc.idProduct}).log();
+                .fmt("pid", "0x{x:0>4}", .{desc.idProduct})
+                .int("code", ret)
+                .string("what", "can't open device")
+                .log();
             continue;
         }
+        logz.warn()
+            .fmt("vid", "0x{x:0>4}", .{desc.idVendor})
+            .fmt("pid", "0x{x:0>4}", .{desc.idProduct})
+            .string("speed", usb_speed_to_string(usb.libusb_get_device_speed(device))).log();
         defer usb.libusb_close(hdl);
 
         print_infos(hdl.?, &desc);

@@ -125,15 +125,15 @@ fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(Device)) v
     }
 }
 
-pub fn usb_endpoint_number(ep_addr: u8) u8 {
+pub inline fn usb_endpoint_number(ep_addr: u8) u8 {
     return ep_addr & 0x07;
 }
 
-pub fn usb_endpoint_transfer_type(ep_attr: u8) u8 {
+pub inline fn usb_endpoint_transfer_type(ep_attr: u8) u8 {
     return ep_attr & @as(u8, usb.LIBUSB_TRANSFER_TYPE_MASK);
 }
 
-pub fn unwarp_ifaces_desc(iface: *const usb.libusb_interface) []const usb.libusb_interface_descriptor {
+pub inline fn unwarp_ifaces_desc(iface: *const usb.libusb_interface) []const usb.libusb_interface_descriptor {
     return iface.altsetting[0..@intCast(iface.num_altsetting)];
 }
 
@@ -162,7 +162,7 @@ const Endpoint = struct {
 
     pub fn from_desc(iConfig: u8, iInterface: u8, ep: *const usb.libusb_endpoint_descriptor) Endpoint {
         const local = struct {
-            pub fn addr_to_dir(addr: u8) Direction {
+            pub inline fn addr_to_dir(addr: u8) Direction {
                 const dir = addr & usb.LIBUSB_ENDPOINT_DIR_MASK;
                 const r = switch (dir) {
                     usb.LIBUSB_ENDPOINT_IN => Direction.in,
@@ -171,7 +171,7 @@ const Endpoint = struct {
                 };
                 return r;
             }
-            pub fn attr_to_transfer_type(attr: u8) TransferType {
+            pub inline fn attr_to_transfer_type(attr: u8) TransferType {
                 const r = switch (usb_endpoint_transfer_type(attr)) {
                     usb.LIBUSB_TRANSFER_TYPE_CONTROL => TransferType.control,
                     usb.LIBUSB_TRANSFER_TYPE_ISOCHRONOUS => TransferType.isochronous,

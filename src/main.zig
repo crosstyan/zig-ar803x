@@ -61,6 +61,12 @@ fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(Device)) v
                 const core = &d.core;
                 const target_bus = usb.libusb_get_bus_number(core.self);
                 const target_port = usb.libusb_get_port_number(core.self);
+                const PORT_NUMBERS_MAX = 8;
+                var port_numbers_buf: [PORT_NUMBERS_MAX]u8 = undefined;
+                const lsz = usb.libusb_get_port_numbers(core.self, &port_numbers_buf, PORT_NUMBERS_MAX);
+                // I'm not sure if how we gonna do with the port number
+                // let's draw a Venn diagram
+                _ = port_numbers_buf[0..@intCast(lsz)];
                 if (bus == target_bus and
                     port == target_port and
                     desc.idVendor == core.desc.idVendor and

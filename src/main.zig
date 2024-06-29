@@ -113,7 +113,7 @@ fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(Device)) v
         }
     };
 
-    logz.debug().int("number of device", sz).log();
+    logz.debug().int("number of device attached", sz).log();
     for (device_list) |device| {
         if (device == null) {
             continue;
@@ -282,7 +282,10 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
     defer {
-        _ = gpa.deinit();
+        const chk = gpa.deinit();
+        if (chk != .ok) {
+            std.debug.print("GPA thinks there are memory leaks\n", .{});
+        }
     }
     try logz.setup(alloc, .{
         .level = .Debug,

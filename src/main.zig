@@ -9,9 +9,185 @@ const bb = @import("bb/c.zig");
 const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
 
+const Device = struct {
+    self: *usb.libusb_device,
+    hdl: *usb.libusb_device_handle,
+    desc: usb.libusb_device_descriptor,
+
+    pub fn dtor(self: *Device) void {
+        if (self.hdl != null) {
+            usb.libusb_close(self.hdl);
+        }
+    }
+};
+
+fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(Device)) void {
+    var c_device_list: [*c]?*usb.libusb_device = undefined;
+    const sz = usb.libusb_get_device_list(ctx, &c_device_list);
+    // See also
+    // Device discovery and reference counting
+    // in https://libusb.sourceforge.io/api-1.0/group__libusb__dev.html
+    //
+    // https://zig.news/kprotty/resource-efficient-thread-pools-with-zig-3291
+    //
+    // If the unref_devices parameter is set, the reference count of each device
+    // in the list is decremented by 1
+    defer usb.libusb_free_device_list(c_device_list, 1);
+    var device_list = c_device_list[0..@intCast(sz)];
+    device_list.len = @intCast(sz);
+
+    // https://www.reddit.com/r/Zig/comments/18p7w7v/making_a_struct_inside_a_function_makes_it_static/
+    // https://www.reddit.com/r/Zig/comments/ard50a/static_local_variables_in_zig/
+    const is_existed = struct {
+        list: *std.ArrayList(Device),
+        const Self = @This();
+
+        pub fn call(self: Self, dev: *usb.libusb_device, desc: *usb.libusb_device_descriptor) bool {
+            // Unless the OS does something funky, or you are hot-plugging USB
+            // extension cards, the port number returned by this call is usually
+            // guaranteed to be uniquely tied to a physical port, meaning that
+            // different devices plugged on the same physical port should return
+            // the same port number.
+            const bus = usb.libusb_get_bus_number(dev);
+            const port = usb.libusb_get_port_number(dev);
+            for (self.list.items) |d| {
+                const target_bus = usb.libusb_get_bus_number(d.self);
+                const target_port = usb.libusb_get_port_number(d.self);
+                if (bus == target_bus and
+                    port == target_port and
+                    desc.idVendor == d.desc.idVendor and
+                    desc.idProduct == d.desc.idProduct)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+    };
+
+    const handle_device = struct {
+        list: *std.ArrayList(Device),
+        const Self = @This();
+
+        pub fn call(self: Self, device: *usb.libusb_device, out: *Device) bool {
+            var lret: c_int = undefined;
+            var ldesc: usb.libusb_device_descriptor = undefined;
+            lret = usb.libusb_get_device_descriptor(device, &ldesc);
+            if (lret != 0) {
+                return false;
+            }
+            if (ldesc.idVendor == ARTO_RTOS_VID and ldesc.idProduct == ARTO_RTOS_PID) {
+                if ((is_existed{ .list = self.list }).call(device, &ldesc)) {
+                    return false;
+                }
+                var hdl: ?*usb.libusb_device_handle = null;
+                lret = usb.libusb_open(device, &hdl);
+                if (lret != 0) {
+                    logz.err()
+                        .fmt("vid", "0x{x:0>4}", .{ldesc.idVendor})
+                        .fmt("pid", "0x{x:0>4}", .{ldesc.idProduct})
+                        .int("code", lret)
+                        .string("what", "can't open device")
+                        .log();
+                    return false;
+                }
+                out.self = device;
+                out.hdl = hdl.?;
+                out.desc = ldesc;
+                return true;
+            }
+            return false;
+        }
+    };
+
+    logz.debug().int("number of device", sz).log();
+    for (device_list) |device| {
+        if (device == null) {
+            continue;
+        }
+        var dev: Device = undefined;
+        if ((handle_device{ .list = list }).call(device.?, &dev)) {
+            list.append(dev) catch @panic("OOM");
+        }
+    }
+}
+
+pub fn usb_endpoint_number(ep_addr: u8) u8 {
+    return ep_addr & 0x07;
+}
+
+pub fn usb_endpoint_transfer_type(ep_attr: u8) u8 {
+    return ep_attr & @as(u8, usb.LIBUSB_TRANSFER_TYPE_MASK);
+}
+
+pub fn unwarp_ifaces_desc(iface: *const usb.libusb_interface) []const usb.libusb_interface_descriptor {
+    return iface.altsetting[0..@intCast(iface.num_altsetting)];
+}
+
+/// print endpoint information for a device
+pub fn print_endpoints(device: *usb.libusb_device, ldesc: *const usb.libusb_device_descriptor) void {
+    var lret: c_int = undefined;
+    const n_config = ldesc.bNumConfigurations;
+    for (0..n_config) |i| {
+        var p_config_: ?*usb.libusb_config_descriptor = undefined;
+        lret = usb.libusb_get_config_descriptor(device, @intCast(i), &p_config_);
+        if (lret != 0 or p_config_ == null) {
+            return;
+        }
+        const p_config = p_config_.?;
+        const ifaces = p_config.interface[0..@intCast(p_config.bNumInterfaces)];
+        for (ifaces) |iface_| {
+            // I don't really care alternate setting
+            const iface = unwarp_ifaces_desc(&iface_)[0];
+            const endpoints = iface.endpoint[0..@intCast(iface.bNumEndpoints)];
+            for (endpoints) |ep| {
+                const local = struct {
+                    pub fn addr_to_dir(addr: u8) []const u8 {
+                        const dir = addr & usb.LIBUSB_ENDPOINT_DIR_MASK;
+                        if (dir == usb.LIBUSB_ENDPOINT_IN) {
+                            return "IN";
+                        } else if (dir == usb.LIBUSB_ENDPOINT_OUT) {
+                            return "OUT";
+                        } else {
+                            return "INVALID";
+                        }
+                    }
+                    pub fn attr_to_transfer_type(attr: u8) []const u8 {
+                        const r = switch (usb_endpoint_transfer_type(attr)) {
+                            usb.LIBUSB_TRANSFER_TYPE_CONTROL => "CONTROL",
+                            usb.LIBUSB_TRANSFER_TYPE_ISOCHRONOUS => "ISOCHRONOUS",
+                            usb.LIBUSB_TRANSFER_TYPE_BULK => "BULK",
+                            usb.LIBUSB_TRANSFER_TYPE_INTERRUPT => "INTERRUPT",
+                            else => "INVALID",
+                        };
+                        return r;
+                    }
+                };
+                const num = usb_endpoint_number(ep.bEndpointAddress);
+                const direction = local.addr_to_dir(ep.bEndpointAddress);
+                const transfer_type = local.attr_to_transfer_type(ep.bmAttributes);
+                // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/usbspec/ns-usbspec-_usb_endpoint_descriptor
+                // https://libusb.sourceforge.io/api-1.0/structlibusb__endpoint__descriptor.html
+                logz.info()
+                    .fmt("vid", "0x{x:0>4}", .{ldesc.idVendor})
+                    .fmt("pid", "0x{x:0>4}", .{ldesc.idProduct})
+                    .int("iConfig", i)
+                    .int("iInterface", iface.bInterfaceNumber)
+                    .int("NumEndpoints", iface.bNumEndpoints)
+                    .int("EndpointAddress", ep.bEndpointAddress)
+                    .int("EndpointNumber", num)
+                    .string("Direction", direction)
+                    .string("TransferType", transfer_type)
+                    .int("MaxPacketSize", ep.wMaxPacketSize)
+                    .log();
+            }
+        }
+    }
+}
+
 /// Print the manufacturer, product, serial number of a device.
 /// If a string descriptor is not available, 'N/A' will be display.
-fn print_dev_info(hdl: *usb.libusb_device_handle, desc: *usb.libusb_device_descriptor) void {
+fn print_str_desc(hdl: *usb.libusb_device_handle, desc: *const usb.libusb_device_descriptor) void {
     const local = struct {
         /// Get string descriptor or return a default value.
         /// Note that the caller must ensure the buffer is large enough.
@@ -75,81 +251,32 @@ pub fn main() !void {
     });
     defer logz.deinit();
 
-    var ctx: ?*usb.libusb_context = null;
+    var ctx_: ?*usb.libusb_context = null;
     var ret: c_int = undefined;
-    ret = usb.libusb_init_context(&ctx, null, 0);
+    ret = usb.libusb_init_context(&ctx_, null, 0);
     if (ret != 0) {
         return std.debug.panic("libusb_init_context failed: {}", .{ret});
     }
+    const ctx = ctx_.?;
     defer usb.libusb_exit(ctx);
     const pc_version = usb.libusb_get_version();
     const p_version: ?*const usb.libusb_version = @ptrCast(pc_version);
     logz.info().fmt("libusb version", "{}.{}.{}.{}", .{ p_version.?.major, p_version.?.minor, p_version.?.micro, p_version.?.nano }).log();
-    var c_device_list: [*c]?*usb.libusb_device = undefined;
-    const sz = usb.libusb_get_device_list(ctx, &c_device_list);
-    // See also
-    // Device discovery and reference counting
-    // in https://libusb.sourceforge.io/api-1.0/group__libusb__dev.html
-    //
-    // https://zig.news/kprotty/resource-efficient-thread-pools-with-zig-3291
-    //
-    // If the unref_devices parameter is set, the reference count of each device
-    // in the list is decremented by 1
-    defer usb.libusb_free_device_list(c_device_list, 1);
-    var device_list = c_device_list[0..@intCast(sz)];
-    device_list.len = @intCast(sz);
-    logz.info().int("number of device", sz).log();
-
-    // https://www.reddit.com/r/Zig/comments/18p7w7v/making_a_struct_inside_a_function_makes_it_static/
-    // https://www.reddit.com/r/Zig/comments/ard50a/static_local_variables_in_zig/
-    const handle_device = struct {
-        pub fn call(device: *usb.libusb_device) void {
-            var lret: c_int = undefined;
-            var ldesc: usb.libusb_device_descriptor = undefined;
-            lret = usb.libusb_get_device_descriptor(device, &ldesc);
-            if (lret != 0) {
-                return;
-            }
-            var hdl: ?*usb.libusb_device_handle = null;
-            // zig use a unique syntax for string formatting
-            // https://github.com/ziglang/zig/blob/master/lib/std/fmt.zig
-            lret = usb.libusb_open(device, &hdl);
-            if (lret != 0) {
-                logz.warn()
-                    .fmt("vid", "0x{x:0>4}", .{ldesc.idVendor})
-                    .fmt("pid", "0x{x:0>4}", .{ldesc.idProduct})
-                    .int("code", lret)
-                    .string("what", "can't open device")
-                    .log();
-                return;
-            }
-            defer usb.libusb_close(hdl);
-            logz.warn()
-                .fmt("vid", "0x{x:0>4}", .{ldesc.idVendor})
-                .fmt("pid", "0x{x:0>4}", .{ldesc.idProduct})
-                .string("speed", usb_speed_to_string(usb.libusb_get_device_speed(device))).log();
-
-            print_dev_info(hdl.?, &ldesc);
-            const n_config = ldesc.bNumConfigurations;
-            for (0..n_config) |i| {
-                var p_config_: ?*usb.libusb_config_descriptor = undefined;
-                lret = usb.libusb_get_config_descriptor(device, @intCast(i), &p_config_);
-                if (lret != 0 or p_config_ == null) {
-                    return;
-                }
-                const p_config = p_config_.?;
-                logz.info()
-                    .fmt("vid", "0x{x:0>4}", .{ldesc.idVendor})
-                    .fmt("pid", "0x{x:0>4}", .{ldesc.idProduct})
-                    .int("configIndex", i)
-                    .int("bNumInterfaces", p_config.bNumInterfaces)
-                    .int("bConfigurationValue", p_config.bConfigurationValue)
-                    .int("iConfiguration", p_config.iConfiguration).log();
-            }
-        }
-    };
-    for (device_list) |device| {
-        handle_device.call(device.?);
+    var device_list = std.ArrayList(Device).init(alloc);
+    defer device_list.deinit();
+    refresh_atro_device(ctx, &device_list);
+    for (device_list.items) |dev| {
+        const speed = usb.libusb_get_device_speed(dev.self);
+        const bus = usb.libusb_get_bus_number(dev.self);
+        const port = usb.libusb_get_port_number(dev.self);
+        logz.info()
+            .fmt("vid", "0x{x:0>4}", .{dev.desc.idVendor})
+            .fmt("pid", "0x{x:0>4}", .{dev.desc.idProduct})
+            .int("bus", bus)
+            .int("port", port)
+            .string("speed", usb_speed_to_string(speed)).log();
+        print_str_desc(dev.hdl, &dev.desc);
+        print_endpoints(dev.self, &dev.desc);
     }
 }
 

@@ -37,35 +37,34 @@ pub fn main() !void {
         // zig use a unique syntax for formatting
         log.info("device: vid=0x{x:0>4}, pid=0x{x:0>4}", .{ desc.idVendor, desc.idProduct });
 
+        const local = struct {
+            /// Get string descriptor or return a default value.
+            /// Note that the caller must ensure the buffer is large enough.
+            /// The return slice will be a slice of the buffer.
+            pub fn get_string_descriptor_or(lhdl: ?*usb.libusb_device_handle, idx: u8, buf: []u8, default: []const u8) []const u8 {
+                if (lhdl == null) {
+                    return default;
+                }
+                var lsz: c_int = undefined;
+                lsz = usb.libusb_get_string_descriptor_ascii(lhdl, idx, buf.ptr, @intCast(buf.len));
+                if (lsz > 0) {
+                    return buf[0..@intCast(lsz)];
+                } else {
+                    return default;
+                }
+            }
+        };
+
         // print manufacturer, product, serial number
-        var lsz: c_int = undefined;
-        const BUF_SIZE = 256;
+        const BUF_SIZE = 128;
         var manufacturer_buf: [BUF_SIZE]u8 = undefined;
-        lsz = usb.libusb_get_string_descriptor_ascii(hdl, desc.iManufacturer, &manufacturer_buf, BUF_SIZE);
-        var manufacturer: []u8 = undefined;
-        if (lsz > 0) {
-            manufacturer = manufacturer_buf[0..@intCast(lsz)];
-        } else {
-            manufacturer = @constCast("N/A");
-        }
+        const manufacturer = local.get_string_descriptor_or(hdl, desc.iManufacturer, &manufacturer_buf, "N/A");
 
         var product_buf: [BUF_SIZE]u8 = undefined;
-        lsz = usb.libusb_get_string_descriptor_ascii(hdl, desc.iProduct, &product_buf, BUF_SIZE);
-        var product: []u8 = undefined;
-        if (lsz > 0) {
-            product = product_buf[0..@intCast(lsz)];
-        } else {
-            product = @constCast("N/A");
-        }
+        const product = local.get_string_descriptor_or(hdl, desc.iProduct, &product_buf, "N/A");
 
         var serial_buf: [BUF_SIZE]u8 = undefined;
-        lsz = usb.libusb_get_string_descriptor_ascii(hdl, desc.iSerialNumber, &serial_buf, BUF_SIZE);
-        var serial: []u8 = undefined;
-        if (lsz > 0) {
-            serial = serial_buf[0..@intCast(lsz)];
-        } else {
-            serial = @constCast("N/A");
-        }
+        const serial = local.get_string_descriptor_or(hdl, desc.iSerialNumber, &serial_buf, "N/A");
         log.info("manufacturer: {s}, product: {s}, serial: {s}", .{ manufacturer, product, serial });
 
         const n_config = desc.bNumConfigurations;

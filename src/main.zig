@@ -124,8 +124,64 @@ pub fn unwarp_ifaces_desc(iface: *const usb.libusb_interface) []const usb.libusb
     return iface.altsetting[0..@intCast(iface.num_altsetting)];
 }
 
-/// print endpoint information for a device
-pub fn print_endpoints(device: *usb.libusb_device, ldesc: *const usb.libusb_device_descriptor) void {
+const Direction = enum {
+    in,
+    out,
+};
+
+const TransferType = enum {
+    control,
+    isochronous,
+    bulk,
+    interrupt,
+};
+
+const Endpoint = struct {
+    /// config index
+    iConfig: u8,
+    /// interface index
+    iInterface: u8,
+    addr: u8,
+    number: u8,
+    direction: Direction,
+    transferType: TransferType,
+    maxPacketSize: u16,
+
+    pub fn from_desc(iConfig: u8, iInterface: u8, ep: *const usb.libusb_endpoint_descriptor) Endpoint {
+        const local = struct {
+            pub fn addr_to_dir(addr: u8) Direction {
+                const dir = addr & usb.LIBUSB_ENDPOINT_DIR_MASK;
+                const r = switch (dir) {
+                    usb.LIBUSB_ENDPOINT_IN => Direction.in,
+                    usb.LIBUSB_ENDPOINT_OUT => Direction.out,
+                    else => @panic("invalid direction"),
+                };
+                return r;
+            }
+            pub fn attr_to_transfer_type(attr: u8) TransferType {
+                const r = switch (usb_endpoint_transfer_type(attr)) {
+                    usb.LIBUSB_TRANSFER_TYPE_CONTROL => TransferType.control,
+                    usb.LIBUSB_TRANSFER_TYPE_ISOCHRONOUS => TransferType.isochronous,
+                    usb.LIBUSB_TRANSFER_TYPE_BULK => TransferType.bulk,
+                    usb.LIBUSB_TRANSFER_TYPE_INTERRUPT => TransferType.interrupt,
+                    else => @panic("invalid transfer type"),
+                };
+                return r;
+            }
+        };
+        return Endpoint{
+            .iConfig = iConfig,
+            .iInterface = iInterface,
+            .addr = ep.bEndpointAddress,
+            .number = usb_endpoint_number(ep.bEndpointAddress),
+            .direction = local.addr_to_dir(ep.bEndpointAddress),
+            .transferType = local.attr_to_transfer_type(ep.bmAttributes),
+            .maxPacketSize = ep.wMaxPacketSize,
+        };
+    }
+};
+
+pub fn get_endpoints(device: *usb.libusb_device, ldesc: *const usb.libusb_device_descriptor, list: *std.ArrayList(Endpoint)) void {
     var lret: c_int = undefined;
     const n_config = ldesc.bNumConfigurations;
     for (0..n_config) |i| {
@@ -141,47 +197,22 @@ pub fn print_endpoints(device: *usb.libusb_device, ldesc: *const usb.libusb_devi
             const iface = unwarp_ifaces_desc(&iface_)[0];
             const endpoints = iface.endpoint[0..@intCast(iface.bNumEndpoints)];
             for (endpoints) |ep| {
-                const local = struct {
-                    pub fn addr_to_dir(addr: u8) []const u8 {
-                        const dir = addr & usb.LIBUSB_ENDPOINT_DIR_MASK;
-                        if (dir == usb.LIBUSB_ENDPOINT_IN) {
-                            return "IN";
-                        } else if (dir == usb.LIBUSB_ENDPOINT_OUT) {
-                            return "OUT";
-                        } else {
-                            return "INVALID";
-                        }
-                    }
-                    pub fn attr_to_transfer_type(attr: u8) []const u8 {
-                        const r = switch (usb_endpoint_transfer_type(attr)) {
-                            usb.LIBUSB_TRANSFER_TYPE_CONTROL => "CONTROL",
-                            usb.LIBUSB_TRANSFER_TYPE_ISOCHRONOUS => "ISOCHRONOUS",
-                            usb.LIBUSB_TRANSFER_TYPE_BULK => "BULK",
-                            usb.LIBUSB_TRANSFER_TYPE_INTERRUPT => "INTERRUPT",
-                            else => "INVALID",
-                        };
-                        return r;
-                    }
-                };
-                const num = usb_endpoint_number(ep.bEndpointAddress);
-                const direction = local.addr_to_dir(ep.bEndpointAddress);
-                const transfer_type = local.attr_to_transfer_type(ep.bmAttributes);
-                // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/usbspec/ns-usbspec-_usb_endpoint_descriptor
-                // https://libusb.sourceforge.io/api-1.0/structlibusb__endpoint__descriptor.html
-                logz.info()
-                    .fmt("vid", "0x{x:0>4}", .{ldesc.idVendor})
-                    .fmt("pid", "0x{x:0>4}", .{ldesc.idProduct})
-                    .int("iConfig", i)
-                    .int("iInterface", iface.bInterfaceNumber)
-                    .int("NumEndpoints", iface.bNumEndpoints)
-                    .int("EndpointAddress", ep.bEndpointAddress)
-                    .int("EndpointNumber", num)
-                    .string("Direction", direction)
-                    .string("TransferType", transfer_type)
-                    .int("MaxPacketSize", ep.wMaxPacketSize)
-                    .log();
+                list.append(Endpoint.from_desc(@intCast(i), iface.bInterfaceNumber, &ep)) catch @panic("OOM");
             }
         }
+    }
+}
+
+pub fn print_endpoints(vid: u16, pid: u16, endpoints: []const Endpoint) void {
+    logz.info().fmt("vid", "0x{x:0>4}", .{vid}).fmt("pid", "0x{x:0>4}", .{pid}).log();
+    for (endpoints) |ep| {
+        logz.info()
+            .int("config", ep.iConfig)
+            .int("interface", ep.iInterface)
+            .int("number", ep.number)
+            .fmt("direction", "{s}", .{@tagName(ep.direction)})
+            .fmt("transfer type", "{s}", .{@tagName(ep.transferType)})
+            .int("max packet size", ep.maxPacketSize).log();
     }
 }
 
@@ -276,7 +307,10 @@ pub fn main() !void {
             .int("port", port)
             .string("speed", usb_speed_to_string(speed)).log();
         print_str_desc(dev.hdl, &dev.desc);
-        print_endpoints(dev.self, &dev.desc);
+        var ep_list = std.ArrayList(Endpoint).init(alloc);
+        defer ep_list.deinit();
+        get_endpoints(dev.self, &dev.desc, &ep_list);
+        print_endpoints(dev.desc.idVendor, dev.desc.idProduct, ep_list.items);
     }
 }
 

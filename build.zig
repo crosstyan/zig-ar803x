@@ -43,12 +43,14 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+    const logz_module = b.dependency("logz", .{}).module("logz");
     const exe = b.addExecutable(.{
         .name = "ar8030",
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    exe.root_module.addImport("logz", logz_module);
     if (builtin.os.tag == .windows) {
         // See also
         //

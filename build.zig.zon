@@ -51,6 +51,9 @@
         //    // actually used.
         //    .lazy = false,
         //},
+        .logz = .{
+            .path = "lib/log.zig",
+        },
     },
 
     // Specifies the set of files and directories that are included in this package.

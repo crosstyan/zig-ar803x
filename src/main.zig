@@ -4,6 +4,7 @@ const log = std.log;
 const usb = @cImport({
     @cInclude("libusb.h");
 });
+const bb = @import("bb/c.zig");
 
 /// Print the manufacturer, product, serial number of a device.
 /// If a string descriptor is not available, 'N/A' will be display.

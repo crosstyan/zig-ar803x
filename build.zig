@@ -81,6 +81,9 @@ pub fn build(b: *std.Build) void {
         exe.linkSystemLibrary("libusb-1.0");
     }
 
+    // include ar8030 base band driver
+    exe.addIncludePath(bd.LazyPath{ .cwd_relative = "inc" });
+
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).

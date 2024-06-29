@@ -9,16 +9,23 @@ const bb = @import("bb/c.zig");
 const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
 
-const Device = struct {
+// the essential part of the USB device
+const DeviceCore = struct {
     self: *usb.libusb_device,
     hdl: *usb.libusb_device_handle,
     desc: usb.libusb_device_descriptor,
 
-    pub fn dtor(self: *Device) void {
+    const Self = @This();
+    pub fn dtor(self: Self) void {
         if (self.hdl != null) {
             usb.libusb_close(self.hdl);
         }
     }
+};
+
+const Device = struct {
+    core: DeviceCore,
+    endpoints: []Endpoint,
 };
 
 fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(Device)) void {
@@ -51,12 +58,13 @@ fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(Device)) v
             const bus = usb.libusb_get_bus_number(dev);
             const port = usb.libusb_get_port_number(dev);
             for (self.list.items) |d| {
-                const target_bus = usb.libusb_get_bus_number(d.self);
-                const target_port = usb.libusb_get_port_number(d.self);
+                const core = &d.core;
+                const target_bus = usb.libusb_get_bus_number(core.self);
+                const target_port = usb.libusb_get_port_number(core.self);
                 if (bus == target_bus and
                     port == target_port and
-                    desc.idVendor == d.desc.idVendor and
-                    desc.idProduct == d.desc.idProduct)
+                    desc.idVendor == core.desc.idVendor and
+                    desc.idProduct == core.desc.idProduct)
                 {
                     return true;
                 }
@@ -91,9 +99,14 @@ fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(Device)) v
                         .log();
                     return false;
                 }
-                out.self = device;
-                out.hdl = hdl.?;
-                out.desc = ldesc;
+                const alloc = self.list.allocator;
+                var ep_list = std.ArrayList(Endpoint).init(alloc);
+                defer ep_list.deinit();
+                get_endpoints(device, &ldesc, &ep_list);
+                out.core.self = device;
+                out.core.hdl = hdl.?;
+                out.core.desc = ldesc;
+                out.endpoints = ep_list.toOwnedSlice() catch @panic("OOM");
                 return true;
             }
             return false;
@@ -297,20 +310,17 @@ pub fn main() !void {
     defer device_list.deinit();
     refresh_atro_device(ctx, &device_list);
     for (device_list.items) |dev| {
-        const speed = usb.libusb_get_device_speed(dev.self);
-        const bus = usb.libusb_get_bus_number(dev.self);
-        const port = usb.libusb_get_port_number(dev.self);
+        const core = &dev.core;
+        const speed = usb.libusb_get_device_speed(core.self);
+        const bus = usb.libusb_get_bus_number(core.self);
+        const port = usb.libusb_get_port_number(core.self);
         logz.info()
-            .fmt("vid", "0x{x:0>4}", .{dev.desc.idVendor})
-            .fmt("pid", "0x{x:0>4}", .{dev.desc.idProduct})
+            .fmt("vid", "0x{x:0>4}", .{core.desc.idVendor})
+            .fmt("pid", "0x{x:0>4}", .{core.desc.idProduct})
             .int("bus", bus)
             .int("port", port)
             .string("speed", usb_speed_to_string(speed)).log();
-        print_str_desc(dev.hdl, &dev.desc);
-        var ep_list = std.ArrayList(Endpoint).init(alloc);
-        defer ep_list.deinit();
-        get_endpoints(dev.self, &dev.desc, &ep_list);
-        print_endpoints(dev.desc.idVendor, dev.desc.idProduct, ep_list.items);
+        print_str_desc(core.hdl, &core.desc);
     }
 }
 

@@ -37,6 +37,10 @@ const DeviceContext = struct {
     }
 };
 
+const AppError = error{
+    BadDescriptor,
+};
+
 fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(DeviceContext)) void {
     var c_device_list: [*c]?*usb.libusb_device = undefined;
     const sz = usb.libusb_get_device_list(ctx, &c_device_list);
@@ -61,6 +65,37 @@ fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(DeviceCont
         stay,
         /// error or non target
         none,
+    };
+
+    const DeviceLike = struct {
+        const MAX_PORTS = 8;
+        self: *usb.libusb_device,
+        vid: u16,
+        pid: u16,
+        bus: u8,
+        port: u8,
+        _ports_buf: [MAX_PORTS]u8,
+        ports: []const u8,
+
+        pub fn from_device(dev: *usb.libusb_device) AppError!@This() {
+            var ports_buf: [MAX_PORTS]u8 = undefined;
+            const lsz = usb.libusb_get_port_numbers(dev, &ports_buf, MAX_PORTS);
+            const ports = ports_buf[0..@intCast(lsz)];
+            var desc: usb.libusb_device_descriptor = undefined;
+            const llret = usb.libusb_get_device_descriptor(dev, &desc);
+            if (llret != 0) {
+                return AppError.BadDescriptor;
+            }
+            return @This(){
+                .self = dev,
+                .vid = desc.idVendor,
+                .pid = desc.idProduct,
+                .bus = usb.libusb_get_bus_number(dev),
+                .port = usb.libusb_get_port_number(dev),
+                ._ports_buf = ports_buf,
+                .ports = ports,
+            };
+        }
     };
 
     // https://www.reddit.com/r/Zig/comments/18p7w7v/making_a_struct_inside_a_function_makes_it_static/
@@ -94,12 +129,6 @@ fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(DeviceCont
         }
     };
 
-    // const is_non_existed_on_poll_list = struct {
-    //     list: []const *usb.libusb_device,
-    //     const Self = @This();
-    //     pub fn call() void {}
-    // };
-
     const handle_device = struct {
         list: []const DeviceContext,
         const Self = @This();
@@ -107,7 +136,25 @@ fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(DeviceCont
         pub fn call(self: Self, alloc: std.mem.Allocator, poll_list: []const ?*usb.libusb_device) struct { DeviceContext, Check } {
             var lret: c_int = undefined;
             var dev_ctx: DeviceContext = undefined;
-            _ = alloc;
+            var filtered = std.ArrayList(DeviceLike).init(alloc);
+            defer filtered.deinit();
+            for (poll_list) |device| {
+                if (device == null) {
+                    continue;
+                }
+                var ldesc: usb.libusb_device_descriptor = undefined;
+                lret = usb.libusb_get_device_descriptor(device, &ldesc);
+                if (lret != 0) {
+                    continue;
+                }
+                if (ldesc.idVendor == ARTO_RTOS_VID and ldesc.idProduct == ARTO_RTOS_PID) {
+                    const dev_like = DeviceLike.from_device(device.?) catch {
+                        continue;
+                    };
+                    filtered.append(dev_like) catch @panic("OOM");
+                }
+            }
+
             for (poll_list) |device| {
                 var ldesc: usb.libusb_device_descriptor = undefined;
                 lret = usb.libusb_get_device_descriptor(device, &ldesc);

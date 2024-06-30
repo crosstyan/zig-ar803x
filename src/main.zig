@@ -191,28 +191,28 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             defer intersec.deinit();
 
             // TODO: improve the performance by using a hash set or a hash map
-            for (self.ctx_list) |*d| {
+            for (self.ctx_list) |*dc| {
                 var found = false;
-                const lhash = d.xxhash();
-                for (filtered.items) |f| {
-                    const rhash = f.xxhash();
+                const lhash = dc.xxhash();
+                for (filtered.items) |dl| {
+                    const rhash = dl.xxhash();
                     if (lhash == rhash) {
                         found = true;
-                        intersec.append(f) catch @panic("OOM");
+                        intersec.append(dl) catch @panic("OOM");
                         break;
                     }
                 }
 
                 if (!found) {
-                    left.append(d) catch @panic("OOM");
+                    left.append(dc) catch @panic("OOM");
                 }
             }
 
-            for (filtered.items) |f| {
+            for (filtered.items) |fdl| {
                 var found = false;
-                const rhash = f.xxhash();
-                for (intersec.items) |i| {
-                    const lhash = i.xxhash();
+                const rhash = fdl.xxhash();
+                for (intersec.items) |idl| {
+                    const lhash = idl.xxhash();
                     if (lhash == rhash) {
                         found = true;
                         break;
@@ -220,7 +220,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
                 }
 
                 if (!found) {
-                    right.append(f) catch @panic("OOM");
+                    right.append(fdl) catch @panic("OOM");
                 }
             }
 

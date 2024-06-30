@@ -8,6 +8,7 @@ const bb = @import("bb/c.zig");
 
 const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
+const XXHASH_SEED: u32 = 0x9E3779B1;
 
 // the essential part of the USB device.
 // you could retrieve everything elese from this
@@ -19,21 +20,37 @@ const DevCore = struct {
 
     const Self = @This();
     pub fn dtor(self: Self) void {
-        if (self.hdl != null) {
-            usb.libusb_close(self.hdl);
-        }
+        usb.libusb_close(self.hdl);
     }
 };
+
+// cast any type to a slice of u8
+pub fn anytype2Slice(any: anytype) []const u8 {
+    const size = @sizeOf(@TypeOf(any));
+    const ptr: *const u8 = @ptrCast(&any);
+    return ptr[0..size];
+}
 
 const DeviceContext = struct {
     alloc: std.heap.ArenaAllocator,
     core: DevCore,
-    ports: []u8,
+    bus: u8,
+    port: u8,
+    ports: []const u8,
     endpoints: []Endpoint,
 
     pub fn dtor(self: DeviceContext) void {
         self.core.dtor();
         self.alloc.deinit();
+    }
+
+    // hash the device by bus, port, and ports
+    pub fn xxhash(self: DeviceContext) u32 {
+        var h = std.hash.XxHash32.init(XXHASH_SEED);
+        h.update(anytype2Slice(self.bus));
+        h.update(anytype2Slice(self.port));
+        h.update(self.ports);
+        return h.final();
     }
 };
 
@@ -41,7 +58,7 @@ const AppError = error{
     BadDescriptor,
 };
 
-fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(DeviceContext)) void {
+fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceContext)) void {
     var c_device_list: [*c]?*usb.libusb_device = undefined;
     const sz = usb.libusb_get_device_list(ctx, &c_device_list);
     // See also
@@ -55,17 +72,6 @@ fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(DeviceCont
     defer usb.libusb_free_device_list(c_device_list, 1);
     var device_list = c_device_list[0..@intCast(sz)];
     device_list.len = @intCast(sz);
-
-    const Check = enum {
-        /// can't find existing device, should create a new one
-        create,
-        /// found existing device, but it should be destroyed
-        destroy,
-        /// found existing device, and it should stay
-        stay,
-        /// error or non target
-        none,
-    };
 
     const DeviceLike = struct {
         const MAX_PORTS = 8;
@@ -96,46 +102,33 @@ fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(DeviceCont
                 .ports = ports,
             };
         }
+
+        // hash the device by bus, port, and ports
+        pub fn xxhash(self: @This()) u32 {
+            var h = std.hash.XxHash32.init(XXHASH_SEED);
+            h.update(anytype2Slice(self.bus));
+            h.update(anytype2Slice(self.port));
+            h.update(self.ports);
+            return h.final();
+        }
     };
 
     // https://www.reddit.com/r/Zig/comments/18p7w7v/making_a_struct_inside_a_function_makes_it_static/
     // https://www.reddit.com/r/Zig/comments/ard50a/static_local_variables_in_zig/
-    const is_existed_on_context = struct {
-        list: []const DeviceContext,
+
+    // TODO: if we're polling this we'd better avoid allocating memory repeatedly
+    // move shit into a context and preallocate them
+    const split_devices = struct {
+        ctx_list: []const DeviceContext,
         const Self = @This();
 
-        pub fn call(self: Self, dev: *usb.libusb_device, ports: []const u8) bool {
-            // Unless the OS does something funky, or you are hot-plugging USB
-            // extension cards, the port number returned by this call is usually
-            // guaranteed to be uniquely tied to a physical port, meaning that
-            // different devices plugged on the same physical port should return
-            // the same port number.
-            const bus = usb.libusb_get_bus_number(dev);
-            const port = usb.libusb_get_port_number(dev);
-            for (self.list) |d| {
-                const core = &d.core;
-                const target_bus = usb.libusb_get_bus_number(core.self);
-                const target_port = usb.libusb_get_port_number(core.self);
-                const is_same = bus == target_bus and port == target_port;
-                if (!is_same) {
-                    continue;
-                }
-                const ports_eq = std.mem.eql(u8, ports, d.ports);
-                if (ports_eq) {
-                    return true;
-                }
-            }
-            return false;
-        }
-    };
-
-    const handle_device = struct {
-        list: []const DeviceContext,
-        const Self = @This();
-
-        pub fn call(self: Self, alloc: std.mem.Allocator, poll_list: []const ?*usb.libusb_device) struct { DeviceContext, Check } {
+        /// note that the return array will be allocated with `alloc`
+        /// and the caller is responsible for freeing the memory.
+        ///
+        ///   - left: devices that should be removed from the context list
+        ///   - right: devices that should be added to the context list
+        pub fn call(self: Self, alloc: std.mem.Allocator, poll_list: []const ?*usb.libusb_device) struct { std.ArrayList(DeviceContext), std.ArrayList(DeviceLike) } {
             var lret: c_int = undefined;
-            var dev_ctx: DeviceContext = undefined;
             var filtered = std.ArrayList(DeviceLike).init(alloc);
             defer filtered.deinit();
             for (poll_list) |device| {
@@ -155,64 +148,133 @@ fn refresh_atro_device(ctx: *usb.libusb_context, list: *std.ArrayList(DeviceCont
                 }
             }
 
-            for (poll_list) |device| {
-                var ldesc: usb.libusb_device_descriptor = undefined;
-                lret = usb.libusb_get_device_descriptor(device, &ldesc);
-                if (lret != 0) {
-                    return .{ dev_ctx, Check.none };
+            const DEFAULT_CAP = 4;
+            var left = std.ArrayList(DeviceContext).init(alloc);
+            left.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
+            var right = std.ArrayList(DeviceLike).init(alloc);
+            right.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
+            var intersec = std.ArrayList(DeviceLike).init(alloc);
+            intersec.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
+            defer intersec.deinit();
+
+            // TODO: improve the performance by using a hash set or a hash map
+            for (self.ctx_list) |d| {
+                var found = false;
+                const lhash = d.xxhash();
+                for (filtered.items) |f| {
+                    const rhash = f.xxhash();
+                    if (lhash == rhash) {
+                        found = true;
+                        intersec.append(f) catch @panic("OOM");
+                        break;
+                    }
                 }
-                if (ldesc.idVendor == ARTO_RTOS_VID and ldesc.idProduct == ARTO_RTOS_PID) {
-                    const PORT_NUMBERS_MAX = 8;
-                    var port_numbers_buf: [PORT_NUMBERS_MAX]u8 = undefined;
-                    const lsz = usb.libusb_get_port_numbers(device, &port_numbers_buf, PORT_NUMBERS_MAX);
-                    // I'm not sure if how we gonna do with the port number
-                    // let's draw a Venn diagram
-                    const ports: []const u8 = port_numbers_buf[0..@intCast(lsz)];
-                    if ((is_existed_on_context{ .list = self.list }).call(device.?, ports)) {
-                        return .{ dev_ctx, Check.stay };
-                    }
-                    var hdl: ?*usb.libusb_device_handle = null;
-                    lret = usb.libusb_open(device, &hdl);
-                    if (lret != 0) {
-                        logz.err()
-                            .fmt("vid", "0x{x:0>4}", .{ldesc.idVendor})
-                            .fmt("pid", "0x{x:0>4}", .{ldesc.idProduct})
-                            .int("code", lret)
-                            .string("what", "can't open device")
-                            .log();
-                        return .{ dev_ctx, Check.none };
-                    }
-                    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-                    const lalloc = gpa.allocator();
-                    var arena = std.heap.ArenaAllocator.init(lalloc);
-                    var ep_list = std.ArrayList(Endpoint).init(arena.allocator());
-                    defer ep_list.deinit();
-                    get_endpoints(device.?, &ldesc, &ep_list);
-                    dev_ctx.alloc = arena;
-                    dev_ctx.core.self = device.?;
-                    dev_ctx.core.hdl = hdl.?;
-                    dev_ctx.core.desc = ldesc;
-                    dev_ctx.endpoints = ep_list.toOwnedSlice() catch @panic("OOM");
-                    const heap_ports: []u8 = lalloc.alloc(u8, ports.len) catch @panic("OOM");
-                    @memcpy(heap_ports, ports);
-                    dev_ctx.ports = heap_ports;
-                    return .{ dev_ctx, Check.create };
+
+                if (!found) {
+                    left.append(d) catch @panic("OOM");
                 }
             }
-            return .{ dev_ctx, Check.none };
+
+            for (filtered.items) |f| {
+                var found = false;
+                const rhash = f.xxhash();
+                for (intersec.items) |i| {
+                    const lhash = i.xxhash();
+                    if (lhash == rhash) {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found) {
+                    right.append(f) catch @panic("OOM");
+                }
+            }
+
+            return .{ left, right };
         }
     };
 
-    logz.debug().int("number of device attached", sz).log();
-    const chk = (handle_device{ .list = list.items }).call(list.allocator, device_list);
-    _ = chk;
+    const logShit = struct {
+        dev: *const DeviceLike,
+        pub fn attach(self: @This(), logger: logz.Logger) logz.Logger {
+            return logger
+                .fmt("vid", "0x{x:0>4}", .{self.dev.vid})
+                .fmt("pid", "0x{x:0>4}", .{self.dev.pid})
+                .int("bus", self.dev.bus)
+                .int("port", self.dev.port)
+                .string("ports", self.dev.ports);
+        }
+    };
+
+    const l, const r = (split_devices{ .ctx_list = ctx_list.items }).call(ctx_list.allocator, device_list);
+    defer l.deinit();
+    defer r.deinit();
+    for (l.items) |ldc| {
+        right: for (ctx_list.items, 0..) |rdc, index| {
+            if (ldc.xxhash() == rdc.xxhash()) {
+                logz.info()
+                    .string("action", "removed")
+                    .fmt("vid", "0x{x:0>4}", .{rdc.core.desc.idVendor})
+                    .fmt("pid", "0x{x:0>4}", .{rdc.core.desc.idProduct})
+                    .int("bus", rdc.bus)
+                    .int("port", rdc.port)
+                    .string("ports", rdc.ports)
+                    .log();
+                rdc.dtor();
+                _ = ctx_list.orderedRemove(index);
+                break :right;
+            }
+        }
+    }
+
+    for (r.items) |d| {
+        var ret: c_int = undefined;
+        var hdl: ?*usb.libusb_device_handle = null;
+        ret = usb.libusb_open(d.self, &hdl);
+        const lg = logShit{ .dev = &d };
+        if (ret != 0 or hdl == null) {
+            const tmp = logz.err().string("err", "failed to open device");
+            lg.attach(tmp).log();
+            continue;
+        }
+        var desc: usb.libusb_device_descriptor = undefined;
+        ret = usb.libusb_get_device_descriptor(d.self, &desc);
+        if (ret != 0) {
+            const tmp = logz.err().string("err", "failed to get device descriptor");
+            lg.attach(tmp).log();
+            continue;
+        }
+
+        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        const alloc = gpa.allocator();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        const heap_ports = arena.allocator().alloc(u8, d.ports.len) catch @panic("OOM");
+        const eps = getEndpoints(arena.allocator(), d.self, &desc);
+        @memcpy(heap_ports, d.ports);
+        const dc = DeviceContext{
+            .alloc = arena,
+            .core = DevCore{
+                .self = d.self,
+                .hdl = hdl.?,
+                .desc = desc,
+            },
+            .bus = d.bus,
+            .port = d.port,
+            .ports = heap_ports,
+            .endpoints = eps,
+        };
+        ctx_list.append(dc) catch @panic("OOM");
+        const tmp = logz.info().string("action", "added");
+        lg.attach(tmp).log();
+    }
 }
 
-pub inline fn usb_endpoint_number(ep_addr: u8) u8 {
+pub inline fn usbEndpointNum(ep_addr: u8) u8 {
     return ep_addr & 0x07;
 }
 
-pub inline fn usb_endpoint_transfer_type(ep_attr: u8) u8 {
+pub inline fn usbEndpointTransferType(ep_attr: u8) u8 {
     return ep_attr & @as(u8, usb.LIBUSB_TRANSFER_TYPE_MASK);
 }
 
@@ -255,7 +317,7 @@ const Endpoint = struct {
                 return r;
             }
             pub inline fn attr_to_transfer_type(attr: u8) TransferType {
-                const r = switch (usb_endpoint_transfer_type(attr)) {
+                const r = switch (usbEndpointTransferType(attr)) {
                     usb.LIBUSB_TRANSFER_TYPE_CONTROL => TransferType.control,
                     usb.LIBUSB_TRANSFER_TYPE_ISOCHRONOUS => TransferType.isochronous,
                     usb.LIBUSB_TRANSFER_TYPE_BULK => TransferType.bulk,
@@ -269,7 +331,7 @@ const Endpoint = struct {
             .iConfig = iConfig,
             .iInterface = iInterface,
             .addr = ep.bEndpointAddress,
-            .number = usb_endpoint_number(ep.bEndpointAddress),
+            .number = usbEndpointNum(ep.bEndpointAddress),
             .direction = local.addr_to_dir(ep.bEndpointAddress),
             .transferType = local.attr_to_transfer_type(ep.bmAttributes),
             .maxPacketSize = ep.wMaxPacketSize,
@@ -277,17 +339,19 @@ const Endpoint = struct {
     }
 };
 
-pub fn get_endpoints(device: *usb.libusb_device, ldesc: *const usb.libusb_device_descriptor, list: *std.ArrayList(Endpoint)) void {
+pub fn getEndpoints(alloc: std.mem.Allocator, device: *usb.libusb_device, ldesc: *const usb.libusb_device_descriptor) []Endpoint {
     var lret: c_int = undefined;
+    var list = std.ArrayList(Endpoint).init(alloc);
+    defer list.deinit();
     const n_config = ldesc.bNumConfigurations;
     for (0..n_config) |i| {
-        var p_config_: ?*usb.libusb_config_descriptor = undefined;
-        lret = usb.libusb_get_config_descriptor(device, @intCast(i), &p_config_);
-        if (lret != 0 or p_config_ == null) {
-            return;
+        var config_: ?*usb.libusb_config_descriptor = undefined;
+        lret = usb.libusb_get_config_descriptor(device, @intCast(i), &config_);
+        if (lret != 0 or config_ == null) {
+            continue;
         }
-        const p_config = p_config_.?;
-        const ifaces = p_config.interface[0..@intCast(p_config.bNumInterfaces)];
+        const config = config_.?;
+        const ifaces = config.interface[0..@intCast(config.bNumInterfaces)];
         for (ifaces) |iface_| {
             // I don't really care alternate setting
             const iface = unwarp_ifaces_desc(&iface_)[0];
@@ -297,9 +361,10 @@ pub fn get_endpoints(device: *usb.libusb_device, ldesc: *const usb.libusb_device
             }
         }
     }
+    return list.toOwnedSlice() catch @panic("OOM");
 }
 
-pub fn print_endpoints(vid: u16, pid: u16, endpoints: []const Endpoint) void {
+pub fn printEndpoints(vid: u16, pid: u16, endpoints: []const Endpoint) void {
     logz.info().fmt("vid", "0x{x:0>4}", .{vid}).fmt("pid", "0x{x:0>4}", .{pid}).log();
     for (endpoints) |ep| {
         logz.info()
@@ -314,7 +379,7 @@ pub fn print_endpoints(vid: u16, pid: u16, endpoints: []const Endpoint) void {
 
 /// Print the manufacturer, product, serial number of a device.
 /// If a string descriptor is not available, 'N/A' will be display.
-fn print_str_desc(hdl: *usb.libusb_device_handle, desc: *const usb.libusb_device_descriptor) void {
+fn printStrDesc(hdl: *usb.libusb_device_handle, desc: *const usb.libusb_device_descriptor) void {
     const local = struct {
         /// Get string descriptor or return a default value.
         /// Note that the caller must ensure the buffer is large enough.
@@ -347,7 +412,7 @@ fn print_str_desc(hdl: *usb.libusb_device_handle, desc: *const usb.libusb_device
         .string("serial", serial).log();
 }
 
-pub fn usb_speed_to_string(speed: c_int) []const u8 {
+pub fn usbSpeedToString(speed: c_int) []const u8 {
     const r = switch (speed) {
         usb.LIBUSB_SPEED_UNKNOWN => "UNKNOWN",
         usb.LIBUSB_SPEED_LOW => "LOW",
@@ -394,7 +459,7 @@ pub fn main() !void {
     logz.info().fmt("libusb version", "{}.{}.{}.{}", .{ p_version.?.major, p_version.?.minor, p_version.?.micro, p_version.?.nano }).log();
     var device_list = std.ArrayList(DeviceContext).init(alloc);
     defer device_list.deinit();
-    refresh_atro_device(ctx, &device_list);
+    refreshDevList(ctx, &device_list);
     for (device_list.items) |dev| {
         const core = &dev.core;
         const speed = usb.libusb_get_device_speed(core.self);
@@ -405,8 +470,8 @@ pub fn main() !void {
             .fmt("pid", "0x{x:0>4}", .{core.desc.idProduct})
             .int("bus", bus)
             .int("port", port)
-            .string("speed", usb_speed_to_string(speed)).log();
-        print_str_desc(core.hdl, &core.desc);
+            .string("speed", usbSpeedToString(speed)).log();
+        printStrDesc(core.hdl, &core.desc);
     }
 }
 

@@ -10,9 +10,9 @@ const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
 const XXHASH_SEED: u32 = 0x9E3779B1;
 
-// the essential part of the USB device.
-// you could retrieve everything elese from this
-// with libusb API
+/// the essential part of the USB device.
+/// you could retrieve everything elese from this
+/// with libusb API
 const DevCore = struct {
     self: *usb.libusb_device,
     hdl: *usb.libusb_device_handle,
@@ -24,7 +24,7 @@ const DevCore = struct {
     }
 };
 
-// cast any type to a slice of u8
+/// cast any type to a slice of u8
 pub fn anytype2Slice(any: anytype) []const u8 {
     const size = @sizeOf(@TypeOf(any));
     const ptr: *const u8 = @ptrCast(&any);
@@ -36,7 +36,9 @@ const DeviceContext = struct {
     core: DevCore,
     bus: u8,
     port: u8,
+    /// managed by `alloc`
     ports: []const u8,
+    /// managed by `alloc`
     endpoints: []Endpoint,
 
     pub fn dtor(self: DeviceContext) void {
@@ -44,7 +46,7 @@ const DeviceContext = struct {
         self.alloc.deinit();
     }
 
-    // attach the device information to the logger
+    /// attach the device information to the logger
     pub fn withLogger(self: DeviceContext, logger: logz.Logger) logz.Logger {
         return logger
             .fmt("vid", "0x{x:0>4}", .{self.core.desc.idVendor})
@@ -53,7 +55,7 @@ const DeviceContext = struct {
             .int("port", self.port);
     }
 
-    // hash the device by bus, port, and ports
+    /// hash the device by bus, port, and ports
     pub fn xxhash(self: DeviceContext) u32 {
         var h = std.hash.XxHash32.init(XXHASH_SEED);
         h.update(anytype2Slice(self.bus));
@@ -136,7 +138,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
                 .int("port", self.port);
         }
 
-        // hash the device by bus, port, and ports
+        /// hash the device by bus, port, and ports
         pub fn xxhash(self: @This()) u32 {
             var h = std.hash.XxHash32.init(XXHASH_SEED);
             h.update(anytype2Slice(self.bus));
@@ -151,16 +153,21 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
 
     // TODO: if we're polling this we'd better avoid allocating memory repeatedly
     // move shit into a context and preallocate them
-    const split_devices = struct {
+    const find_diff = struct {
         ctx_list: []const DeviceContext,
-        const Self = @This();
 
-        /// note that the return array will be allocated with `alloc`
+        /// Find the difference between `DeviceContext` the new polled device list from `libusb`.
+        ///
+        /// Note that the return array will be allocated with `alloc`
         /// and the caller is responsible for freeing the memory.
         ///
-        ///   - left: devices that should be removed from the context list
-        ///   - right: devices that should be added to the context list
-        pub fn call(self: Self, alloc: std.mem.Allocator, poll_list: []const ?*usb.libusb_device) struct { std.ArrayList(*const DeviceContext), std.ArrayList(DeviceLike) } {
+        ///   - left: devices that should be removed from the context list (`*const DeviceContext`)
+        ///   - right: devices that should be added to the context list (`DeviceLike` that could be used to initialite a device)
+        pub fn call(
+            self: @This(),
+            alloc: std.mem.Allocator,
+            poll_list: []const ?*usb.libusb_device,
+        ) struct { std.ArrayList(*const DeviceContext), std.ArrayList(DeviceLike) } {
             var lret: c_int = undefined;
             var filtered = std.ArrayList(DeviceLike).init(alloc);
             defer filtered.deinit();
@@ -194,12 +201,12 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             for (self.ctx_list) |*dc| {
                 var found = false;
                 const lhash = dc.xxhash();
-                for (filtered.items) |dl| {
+                inner: for (filtered.items) |dl| {
                     const rhash = dl.xxhash();
                     if (lhash == rhash) {
                         found = true;
                         intersec.append(dl) catch @panic("OOM");
-                        break;
+                        break :inner;
                     }
                 }
 
@@ -211,11 +218,11 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             for (filtered.items) |fdl| {
                 var found = false;
                 const rhash = fdl.xxhash();
-                for (intersec.items) |idl| {
+                inner: for (intersec.items) |idl| {
                     const lhash = idl.xxhash();
                     if (lhash == rhash) {
                         found = true;
-                        break;
+                        break :inner;
                     }
                 }
 
@@ -228,16 +235,16 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         }
     };
 
-    const l, const r = (split_devices{ .ctx_list = ctx_list.items }).call(ctx_list.allocator, device_list);
+    const l, const r = (find_diff{ .ctx_list = ctx_list.items }).call(ctx_list.allocator, device_list);
     defer l.deinit();
     defer r.deinit();
     for (l.items) |ldc| {
-        right: for (ctx_list.items, 0..) |*rdc, index| {
+        inner: for (ctx_list.items, 0..) |*rdc, index| {
             if (ldc == rdc) {
-                logWithDevice(logz.info(), rdc.core.self, &rdc.core.desc).string("action", "removed").log();
+                rdc.withLogger(logz.warn().string("action", "removed")).log();
                 rdc.dtor();
                 _ = ctx_list.orderedRemove(index);
-                break :right;
+                break :inner;
             }
         }
     }

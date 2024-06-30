@@ -1,10 +1,12 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const logz = @import("logz");
 const log = std.log;
 const usb = @cImport({
     @cInclude("libusb.h");
 });
 const bb = @import("bb/c.zig");
+const UsbPack = @import("bb/usbpack.zig").UsbPack;
 
 const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
@@ -96,6 +98,7 @@ const AppError = error{
     BadPortNumbers,
     BadEnum,
 };
+const BadEnum = error{BadEnum};
 
 fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceContext)) void {
     var c_device_list: [*c]?*usb.libusb_device = undefined;
@@ -182,7 +185,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             alloc: std.mem.Allocator,
             poll_list: []const ?*usb.libusb_device,
         ) struct { std.ArrayList(*const DeviceContext), std.ArrayList(DeviceLike) } {
-            var lret: c_int = undefined;
+            var ret: c_int = undefined;
             var filtered = std.ArrayList(DeviceLike).init(alloc);
             defer filtered.deinit();
             for (poll_list) |device| {
@@ -190,8 +193,8 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
                     continue;
                 }
                 var ldesc: usb.libusb_device_descriptor = undefined;
-                lret = usb.libusb_get_device_descriptor(device, &ldesc);
-                if (lret != 0) {
+                ret = usb.libusb_get_device_descriptor(device, &ldesc);
+                if (ret != 0) {
                     continue;
                 }
                 if (ldesc.idVendor == ARTO_RTOS_VID and ldesc.idProduct == ARTO_RTOS_PID) {
@@ -343,7 +346,7 @@ const Endpoint = struct {
 
     pub fn from_desc(iConfig: u8, iInterface: u8, ep: *const usb.libusb_endpoint_descriptor) AppError!Endpoint {
         const local = struct {
-            pub inline fn addr_to_dir(addr: u8) AppError!Direction {
+            pub inline fn addr_to_dir(addr: u8) BadEnum!Direction {
                 const dir = addr & usb.LIBUSB_ENDPOINT_DIR_MASK;
                 const r = switch (dir) {
                     usb.LIBUSB_ENDPOINT_IN => Direction.in,
@@ -352,7 +355,7 @@ const Endpoint = struct {
                 };
                 return r;
             }
-            pub inline fn attr_to_transfer_type(attr: u8) AppError!TransferType {
+            pub inline fn attr_to_transfer_type(attr: u8) BadEnum!TransferType {
                 const r = switch (usbEndpointTransferType(attr)) {
                     usb.LIBUSB_TRANSFER_TYPE_CONTROL => TransferType.control,
                     usb.LIBUSB_TRANSFER_TYPE_ISOCHRONOUS => TransferType.isochronous,
@@ -376,14 +379,14 @@ const Endpoint = struct {
 };
 
 pub fn getEndpoints(alloc: std.mem.Allocator, device: *usb.libusb_device, ldesc: *const usb.libusb_device_descriptor) []Endpoint {
-    var lret: c_int = undefined;
+    var ret: c_int = undefined;
     var list = std.ArrayList(Endpoint).init(alloc);
     defer list.deinit();
     const n_config = ldesc.bNumConfigurations;
     for (0..n_config) |i| {
         var config_: ?*usb.libusb_config_descriptor = undefined;
-        lret = usb.libusb_get_config_descriptor(device, @intCast(i), &config_);
-        if (lret != 0 or config_ == null) {
+        ret = usb.libusb_get_config_descriptor(device, @intCast(i), &config_);
+        if (ret != 0 or config_ == null) {
             continue;
         }
         const config = config_.?;
@@ -405,15 +408,17 @@ pub fn getEndpoints(alloc: std.mem.Allocator, device: *usb.libusb_device, ldesc:
 }
 
 pub fn printEndpoints(vid: u16, pid: u16, endpoints: []const Endpoint) void {
-    logz.info().fmt("vid", "0x{x:0>4}", .{vid}).fmt("pid", "0x{x:0>4}", .{pid}).log();
     for (endpoints) |ep| {
         logz.info()
+            .fmt("vid", "0x{x:0>4}", .{vid})
+            .fmt("pid", "0x{x:0>4}", .{pid})
             .int("config", ep.iConfig)
             .int("interface", ep.iInterface)
-            .int("number", ep.number)
-            .fmt("direction", "{s}", .{@tagName(ep.direction)})
-            .fmt("transfer type", "{s}", .{@tagName(ep.transferType)})
-            .int("max packet size", ep.maxPacketSize).log();
+            .int("endpoint", ep.number)
+            .fmt("address", "0x{x:0>2}", .{ep.addr})
+            .string("direction", @tagName(ep.direction))
+            .string("transfer_type", @tagName(ep.transferType))
+            .int("max_packet_size", ep.maxPacketSize).log();
     }
 }
 
@@ -465,9 +470,43 @@ pub fn usbSpeedToString(speed: c_int) []const u8 {
     return r;
 }
 
+// enum libusb_transfer_status {
+//     LIBUSB_TRANSFER_COMPLETED,
+//     LIBUSB_TRANSFER_ERROR,
+//     LIBUSB_TRANSFER_TIMED_OUT,
+//     LIBUSB_TRANSFER_CANCELLED,
+//     LIBUSB_TRANSFER_STALL,
+//     LIBUSB_TRANSFER_NO_DEVICE,
+//     LIBUSB_TRANSFER_OVERFLOW,
+// };
+const TransferStatus = enum {
+    completed,
+    err,
+    timed_out,
+    cancelled,
+    stall,
+    no_device,
+    overflow,
+};
+
+pub fn transferStatusFromInt(status: c_uint) BadEnum!TransferStatus {
+    return switch (status) {
+        usb.LIBUSB_TRANSFER_COMPLETED => TransferStatus.completed,
+        usb.LIBUSB_TRANSFER_ERROR => TransferStatus.err,
+        usb.LIBUSB_TRANSFER_TIMED_OUT => TransferStatus.timed_out,
+        usb.LIBUSB_TRANSFER_CANCELLED => TransferStatus.cancelled,
+        usb.LIBUSB_TRANSFER_STALL => TransferStatus.stall,
+        usb.LIBUSB_TRANSFER_NO_DEVICE => TransferStatus.no_device,
+        usb.LIBUSB_TRANSFER_OVERFLOW => TransferStatus.overflow,
+        else => return AppError.BadEnum,
+    };
+}
+
 pub fn main() !void {
     // https://libusb.sourceforge.io/api-1.0/libusb_contexts.html
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{
+        .thread_safe = true,
+    }){};
     const alloc = gpa.allocator();
     defer {
         const chk = gpa.deinit();
@@ -500,12 +539,116 @@ pub fn main() !void {
     var device_list = std.ArrayList(DeviceContext).init(alloc);
     defer device_list.deinit();
     refreshDevList(ctx, &device_list);
+
+    const transfer = usb.libusb_alloc_transfer(0);
+    if (transfer == null) {
+        return std.debug.panic("failed to allocate transfer", .{});
+    }
+    defer usb.libusb_free_transfer(transfer);
+
     for (device_list.items) |dev| {
         const speed = usb.libusb_get_device_speed(dev.dev());
         printStrDesc(dev.hdl(), dev.desc());
         printEndpoints(dev.desc().idVendor, dev.desc().idProduct, dev.endpoints);
         dev.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
+        if (builtin.os.tag != .windows) {
+            ret = usb.libusb_set_auto_detach_kernel_driver(dev.hdl(), 1);
+            if (ret != 0) {
+                dev.withLogger(logz.err())
+                    .string("err", "failed to set auto detach kernel driver")
+                    .log();
+            }
+        }
+        ret = usb.libusb_claim_interface(dev.hdl(), 0);
+        if (ret != 0) {
+            dev.withLogger(logz.err())
+                .string("err", "failed to claim interface")
+                .log();
+        }
+        for (dev.endpoints) |*ep| {
+            // libusb_fill_bulk_transfer
+            // https://libusb.sourceforge.io/api-1.0/group__libusb__asyncio.html
+            // https://libusb.sourceforge.io/api-1.0/libusb_io.html
+            //
+            // In the interest of being a lightweight library, libusb does not
+            // create threads and can only operate when your application is
+            // calling into it. Your application must call into libusb from it's
+            // main loop when events are ready to be handled, or you must use
+            // some other scheme to allow libusb to undertake whatever work
+            // needs to be done.
+            if (ep.direction == Direction.in and ep.transferType == TransferType.bulk) {
+                const bulk_transfer_callback = struct {
+                    alloc: std.mem.Allocator,
+                    dev: DeviceContext,
+                    tx_buffer: []u8,
+                    pub fn call(trans: [*c]usb.libusb_transfer) callconv(.C) void {
+                        if (trans == null) {
+                            return;
+                        }
+                        const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
+                        defer self.alloc.destroy(self);
+                        defer self.alloc.free(self.tx_buffer);
+                        logz.debug().fmt("ptr", "{*}", .{self.tx_buffer.ptr}).int("len", self.tx_buffer.len).log();
+                        const status = transferStatusFromInt(trans.*.status) catch unreachable;
+                        self.dev.withLogger(logz.info())
+                            .string("status", @tagName(status))
+                            .int("flags", trans.*.flags)
+                            .string("action", "bulk transfer completed")
+                            .log();
+                    }
+                };
+                const l_alloc = alloc;
+                var cb = l_alloc.create(bulk_transfer_callback) catch @panic("OOM");
+                cb.alloc = l_alloc;
+                cb.dev = dev;
+                const header = UsbPack{
+                    .msgid = 0x0,
+                    .reqid = bb.BB_GET_STATUS,
+                    .sta = 0x0,
+                    .data = null,
+                };
+                const tx_buffer = header.marshal(l_alloc) catch @panic("OOM");
+                logz.debug()
+                    .fmt("ptr", "{*}", .{tx_buffer})
+                    .int("len", tx_buffer.len)
+                    .log();
+                cb.tx_buffer = tx_buffer;
+                usb.libusb_fill_bulk_transfer(
+                    transfer,
+                    dev.hdl(),
+                    ep.addr,
+                    tx_buffer.ptr,
+                    @intCast(tx_buffer.len),
+                    bulk_transfer_callback.call,
+                    cb,
+                    1000,
+                );
+                dev.withLogger(logz.info())
+                    .int("interface", ep.iInterface)
+                    .fmt("address", "0x{x:0>2}", .{ep.addr})
+                    .string("action", "submitting bulk transfer")
+                    .log();
+                ret = usb.libusb_submit_transfer(transfer);
+                if (ret != 0) {
+                    dev.withLogger(logz.err())
+                        .int("code", ret)
+                        .string("err", "failed to submit transfer")
+                        .log();
+                }
+            }
+        }
+    }
+    // https://libusb.sourceforge.io/api-1.0/libusb_mtasync.html
+    // https://stackoverflow.com/questions/45672717/how-to-force-a-libusb-event-so-that-libusb-handle-events-returns
+    // https://libusb.sourceforge.io/api-1.0/group__libusb__poll.html
+    // https://www.reddit.com/r/Zig/comments/11mr0r8/defer_errdefer_and_sigint_ctrlc/
+    // https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/signal
+    // TODO: handle ctrl
+    while (true) {
+        ret = usb.libusb_handle_events(ctx);
+        if (ret != 0) {
+            logz.err().string("err", "failed to handle events").log();
+            break;
+        }
     }
 }
-
-test "simple test" {}

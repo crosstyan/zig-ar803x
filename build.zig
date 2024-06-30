@@ -3,12 +3,11 @@ const builtin = @import("builtin");
 const log = std.log;
 const bd = std.Build;
 const fs = std.fs;
-const str = []const u8;
 
 // only useful in Windows
-const VCPKG_ROOT_FALLBACK = "C:/tools/vcpkg/";
+const VCPKG_ROOT_FALLBACK = "C:/vcpkg/";
 
-fn getVcpkgRoot(allocator: std.mem.Allocator) str {
+fn getVcpkgRoot(allocator: std.mem.Allocator) []const u8 {
     var env_map = std.process.getEnvMap(allocator) catch {
         log.warn("Failed to get environment variables, fallback to '{s}'", .{VCPKG_ROOT_FALLBACK});
         return VCPKG_ROOT_FALLBACK;
@@ -16,11 +15,8 @@ fn getVcpkgRoot(allocator: std.mem.Allocator) str {
     defer env_map.deinit();
     const root_ = env_map.get("VCPKG_ROOT");
     if (root_) |r| {
-        const ret = allocator.alloc(u8, r.len) catch {
-            log.err("Failed to allocate memory for VCPKG_ROOT: {s}", .{r});
-            return VCPKG_ROOT_FALLBACK;
-        };
-        std.mem.copyForwards(u8, ret, r);
+        const ret = allocator.alloc(u8, r.len) catch @panic("OOM");
+        @memcpy(ret, r);
         log.info("use environment variable VCPKG_ROOT={s}", .{r});
         return ret;
     }

@@ -8,13 +8,13 @@ const bb = @import("bb/c.zig");
 
 const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
-const XXHASH_SEED: u32 = 0x9E3779B1;
+const XXHASH_SEED: u32 = 0x0;
 
 /// the essential part of the USB device.
 /// you could retrieve everything elese from this
 /// with libusb API
-const DevCore = struct {
-    self: *usb.libusb_device,
+const DeviceHandles = struct {
+    dev: *usb.libusb_device,
     hdl: *usb.libusb_device_handle,
     desc: usb.libusb_device_descriptor,
 
@@ -33,7 +33,7 @@ pub fn anytype2Slice(any: anytype) []const u8 {
 
 const DeviceContext = struct {
     alloc: std.heap.ArenaAllocator,
-    core: DevCore,
+    core: DeviceHandles,
     bus: u8,
     port: u8,
     /// managed by `alloc`
@@ -41,13 +41,27 @@ const DeviceContext = struct {
     /// managed by `alloc`
     endpoints: []Endpoint,
 
-    pub fn dtor(self: DeviceContext) void {
+    const Self = @This();
+
+    pub fn dev(self: Self) *usb.libusb_device {
+        return self.core.dev;
+    }
+
+    pub fn hdl(self: Self) *usb.libusb_device_handle {
+        return self.core.hdl;
+    }
+
+    pub fn desc(self: Self) *const usb.libusb_device_descriptor {
+        return &self.core.desc;
+    }
+
+    pub fn dtor(self: Self) void {
         self.core.dtor();
         self.alloc.deinit();
     }
 
     /// attach the device information to the logger
-    pub fn withLogger(self: DeviceContext, logger: logz.Logger) logz.Logger {
+    pub fn withLogger(self: Self, logger: logz.Logger) logz.Logger {
         return logger
             .fmt("vid", "0x{x:0>4}", .{self.core.desc.idVendor})
             .fmt("pid", "0x{x:0>4}", .{self.core.desc.idProduct})
@@ -56,7 +70,7 @@ const DeviceContext = struct {
     }
 
     /// hash the device by bus, port, and ports
-    pub fn xxhash(self: DeviceContext) u32 {
+    pub fn xxhash(self: Self) u32 {
         var h = std.hash.XxHash32.init(XXHASH_SEED);
         h.update(anytype2Slice(self.bus));
         h.update(anytype2Slice(self.port));
@@ -99,7 +113,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
 
     const DeviceLike = struct {
         const MAX_PORTS = 8;
-        self: *usb.libusb_device,
+        dev: *usb.libusb_device,
         vid: u16,
         pid: u16,
         bus: u8,
@@ -114,7 +128,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
                 return AppError.BadDescriptor;
             }
             var ret = @This(){
-                .self = dev,
+                .dev = dev,
                 .vid = desc.idVendor,
                 .pid = desc.idProduct,
                 .bus = usb.libusb_get_bus_number(dev),
@@ -252,31 +266,32 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
     for (r.items) |d| {
         var ret: c_int = undefined;
         var hdl: ?*usb.libusb_device_handle = null;
-        ret = usb.libusb_open(d.self, &hdl);
+        ret = usb.libusb_open(d.dev, &hdl);
         if (ret != 0 or hdl == null) {
             const tmp = logz.err().string("err", "failed to open device");
             d.withLogger(tmp).log();
-            // lg.attach(tmp).log();
             continue;
         }
         var desc: usb.libusb_device_descriptor = undefined;
-        ret = usb.libusb_get_device_descriptor(d.self, &desc);
+        ret = usb.libusb_get_device_descriptor(d.dev, &desc);
         if (ret != 0) {
             const tmp = logz.err().string("err", "failed to get device descriptor");
             d.withLogger(tmp).log();
             continue;
         }
 
-        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        var gpa = std.heap.GeneralPurposeAllocator(.{
+            .thread_safe = true,
+        }){};
         const alloc = gpa.allocator();
         var arena = std.heap.ArenaAllocator.init(alloc);
         const heap_ports = arena.allocator().alloc(u8, d.ports.len) catch @panic("OOM");
-        const eps = getEndpoints(arena.allocator(), d.self, &desc);
+        const eps = getEndpoints(arena.allocator(), d.dev, &desc);
         @memcpy(heap_ports, d.ports);
         const dc = DeviceContext{
             .alloc = arena,
-            .core = DevCore{
-                .self = d.self,
+            .core = DeviceHandles{
+                .dev = d.dev,
                 .hdl = hdl.?,
                 .desc = desc,
             },
@@ -486,10 +501,9 @@ pub fn main() !void {
     defer device_list.deinit();
     refreshDevList(ctx, &device_list);
     for (device_list.items) |dev| {
-        const core = &dev.core;
-        const speed = usb.libusb_get_device_speed(core.self);
-        printStrDesc(core.hdl, &core.desc);
-        printEndpoints(core.desc.idVendor, core.desc.idProduct, dev.endpoints);
+        const speed = usb.libusb_get_device_speed(dev.dev());
+        printStrDesc(dev.hdl(), dev.desc());
+        printEndpoints(dev.desc().idVendor, dev.desc().idProduct, dev.endpoints);
         dev.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
     }
 }

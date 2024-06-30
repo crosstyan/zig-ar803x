@@ -77,6 +77,7 @@ pub fn logWithDevice(logger: logz.Logger, device: *usb.libusb_device, desc: *con
 
 const AppError = error{
     BadDescriptor,
+    BadPortNumbers,
     BadEnum,
 };
 
@@ -105,23 +106,26 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         ports: []const u8,
 
         pub fn from_device(dev: *usb.libusb_device) AppError!@This() {
-            var ports_buf: [MAX_PORTS]u8 = undefined;
-            const lsz = usb.libusb_get_port_numbers(dev, &ports_buf, MAX_PORTS);
-            const ports = ports_buf[0..@intCast(lsz)];
             var desc: usb.libusb_device_descriptor = undefined;
-            const llret = usb.libusb_get_device_descriptor(dev, &desc);
-            if (llret != 0) {
+            const err = usb.libusb_get_device_descriptor(dev, &desc);
+            if (err != 0) {
                 return AppError.BadDescriptor;
             }
-            return @This(){
+            var ret = @This(){
                 .self = dev,
                 .vid = desc.idVendor,
                 .pid = desc.idProduct,
                 .bus = usb.libusb_get_bus_number(dev),
                 .port = usb.libusb_get_port_number(dev),
-                ._ports_buf = ports_buf,
-                .ports = ports,
+                ._ports_buf = undefined,
+                .ports = undefined,
             };
+            const lsz = usb.libusb_get_port_numbers(dev, &ret._ports_buf, MAX_PORTS);
+            if (lsz < 0) {
+                return AppError.BadPortNumbers;
+            }
+            ret.ports = ret._ports_buf[0..@intCast(lsz)];
+            return ret;
         }
 
         pub fn withLogger(self: @This(), logger: logz.Logger) logz.Logger {

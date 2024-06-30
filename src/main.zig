@@ -44,6 +44,15 @@ const DeviceContext = struct {
         self.alloc.deinit();
     }
 
+    // attach the device information to the logger
+    pub fn withLogger(self: DeviceContext, logger: logz.Logger) logz.Logger {
+        return logger
+            .fmt("vid", "0x{x:0>4}", .{self.core.desc.idVendor})
+            .fmt("pid", "0x{x:0>4}", .{self.core.desc.idProduct})
+            .int("bus", self.bus)
+            .int("port", self.port);
+    }
+
     // hash the device by bus, port, and ports
     pub fn xxhash(self: DeviceContext) u32 {
         var h = std.hash.XxHash32.init(XXHASH_SEED);
@@ -53,6 +62,18 @@ const DeviceContext = struct {
         return h.final();
     }
 };
+
+pub fn logWithDevice(logger: logz.Logger, device: *usb.libusb_device, desc: *const usb.libusb_device_descriptor) logz.Logger {
+    const vid = desc.idVendor;
+    const pid = desc.idProduct;
+    const bus = usb.libusb_get_bus_number(device);
+    const port = usb.libusb_get_port_number(device);
+    return logger
+        .fmt("vid", "0x{x:0>4}", .{vid})
+        .fmt("pid", "0x{x:0>4}", .{pid})
+        .int("bus", bus)
+        .int("port", port);
+}
 
 const AppError = error{
     BadDescriptor,
@@ -101,6 +122,14 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
                 ._ports_buf = ports_buf,
                 .ports = ports,
             };
+        }
+
+        pub fn withLogger(self: @This(), logger: logz.Logger) logz.Logger {
+            return logger
+                .fmt("vid", "0x{x:0>4}", .{self.vid})
+                .fmt("pid", "0x{x:0>4}", .{self.pid})
+                .int("bus", self.bus)
+                .int("port", self.port);
         }
 
         // hash the device by bus, port, and ports
@@ -195,24 +224,13 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         }
     };
 
-    const logShit = struct {
-        dev: *const DeviceLike,
-        pub fn attach(self: @This(), logger: logz.Logger) logz.Logger {
-            return logger
-                .fmt("vid", "0x{x:0>4}", .{self.dev.vid})
-                .fmt("pid", "0x{x:0>4}", .{self.dev.pid})
-                .int("bus", self.dev.bus)
-                .int("port", self.dev.port);
-        }
-    };
-
     const l, const r = (split_devices{ .ctx_list = ctx_list.items }).call(ctx_list.allocator, device_list);
     defer l.deinit();
     defer r.deinit();
     for (l.items) |ldc| {
         right: for (ctx_list.items, 0..) |rdc, index| {
             if (ldc.xxhash() == rdc.xxhash()) {
-                withDevice(logz.info(), rdc.core.self, &rdc.core.desc).string("action", "removed").log();
+                logWithDevice(logz.info(), rdc.core.self, &rdc.core.desc).string("action", "removed").log();
                 rdc.dtor();
                 _ = ctx_list.orderedRemove(index);
                 break :right;
@@ -224,17 +242,17 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         var ret: c_int = undefined;
         var hdl: ?*usb.libusb_device_handle = null;
         ret = usb.libusb_open(d.self, &hdl);
-        const lg = logShit{ .dev = &d };
         if (ret != 0 or hdl == null) {
             const tmp = logz.err().string("err", "failed to open device");
-            lg.attach(tmp).log();
+            d.withLogger(tmp).log();
+            // lg.attach(tmp).log();
             continue;
         }
         var desc: usb.libusb_device_descriptor = undefined;
         ret = usb.libusb_get_device_descriptor(d.self, &desc);
         if (ret != 0) {
             const tmp = logz.err().string("err", "failed to get device descriptor");
-            lg.attach(tmp).log();
+            d.withLogger(tmp).log();
             continue;
         }
 
@@ -258,7 +276,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         };
         ctx_list.append(dc) catch @panic("OOM");
         const tmp = logz.info().string("action", "added");
-        lg.attach(tmp).log();
+        dc.withLogger(tmp).log();
     }
 }
 
@@ -331,18 +349,6 @@ const Endpoint = struct {
     }
 };
 
-pub fn withDevice(logger: logz.Logger, device: *usb.libusb_device, desc: *const usb.libusb_device_descriptor) logz.Logger {
-    const vid = desc.idVendor;
-    const pid = desc.idProduct;
-    const bus = usb.libusb_get_bus_number(device);
-    const port = usb.libusb_get_port_number(device);
-    return logger
-        .fmt("vid", "0x{x:0>4}", .{vid})
-        .fmt("pid", "0x{x:0>4}", .{pid})
-        .int("bus", bus)
-        .int("port", port);
-}
-
 pub fn getEndpoints(alloc: std.mem.Allocator, device: *usb.libusb_device, ldesc: *const usb.libusb_device_descriptor) []Endpoint {
     var lret: c_int = undefined;
     var list = std.ArrayList(Endpoint).init(alloc);
@@ -362,7 +368,7 @@ pub fn getEndpoints(alloc: std.mem.Allocator, device: *usb.libusb_device, ldesc:
             const endpoints = iface.endpoint[0..@intCast(iface.bNumEndpoints)];
             for (endpoints) |ep| {
                 const app_ep = Endpoint.from_desc(@intCast(i), iface.bInterfaceNumber, &ep) catch |e| {
-                    withDevice(logz.err(), device, ldesc).err(e).log();
+                    logWithDevice(logz.err(), device, ldesc).err(e).log();
                     continue;
                 };
                 list.append(app_ep) catch @panic("OOM");
@@ -471,8 +477,9 @@ pub fn main() !void {
     for (device_list.items) |dev| {
         const core = &dev.core;
         const speed = usb.libusb_get_device_speed(core.self);
-        withDevice(logz.info(), core.self, &core.desc).string("speed", usbSpeedToString(speed)).log();
         printStrDesc(core.hdl, &core.desc);
+        printEndpoints(core.desc.idVendor, core.desc.idProduct, dev.endpoints);
+        dev.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
     }
 }
 

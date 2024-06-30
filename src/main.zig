@@ -189,19 +189,18 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             var filtered = std.ArrayList(DeviceLike).init(alloc);
             defer filtered.deinit();
             for (poll_list) |device| {
-                if (device == null) {
-                    continue;
-                }
-                var ldesc: usb.libusb_device_descriptor = undefined;
-                ret = usb.libusb_get_device_descriptor(device, &ldesc);
-                if (ret != 0) {
-                    continue;
-                }
-                if (ldesc.idVendor == ARTO_RTOS_VID and ldesc.idProduct == ARTO_RTOS_PID) {
-                    const dev_like = DeviceLike.from_device(device.?) catch {
+                if (device) |val| {
+                    var ldesc: usb.libusb_device_descriptor = undefined;
+                    ret = usb.libusb_get_device_descriptor(val, &ldesc);
+                    if (ret != 0) {
                         continue;
-                    };
-                    filtered.append(dev_like) catch @panic("OOM");
+                    }
+                    if (ldesc.idVendor == ARTO_RTOS_VID and ldesc.idProduct == ARTO_RTOS_PID) {
+                        const dev_like = DeviceLike.from_device(val) catch {
+                            continue;
+                        };
+                        filtered.append(dev_like) catch @panic("OOM");
+                    }
                 }
             }
 
@@ -386,21 +385,22 @@ pub fn getEndpoints(alloc: std.mem.Allocator, device: *usb.libusb_device, ldesc:
     for (0..n_config) |i| {
         var config_: ?*usb.libusb_config_descriptor = undefined;
         ret = usb.libusb_get_config_descriptor(device, @intCast(i), &config_);
-        if (ret != 0 or config_ == null) {
+        if (ret != 0) {
             continue;
         }
-        const config = config_.?;
-        const ifaces = config.interface[0..@intCast(config.bNumInterfaces)];
-        for (ifaces) |iface_| {
-            // I don't really care alternate setting
-            const iface = unwarp_ifaces_desc(&iface_)[0];
-            const endpoints = iface.endpoint[0..@intCast(iface.bNumEndpoints)];
-            for (endpoints) |ep| {
-                const app_ep = Endpoint.from_desc(@intCast(i), iface.bInterfaceNumber, &ep) catch |e| {
-                    logWithDevice(logz.err(), device, ldesc).err(e).log();
-                    continue;
-                };
-                list.append(app_ep) catch @panic("OOM");
+        if (config_) |config| {
+            const ifaces = config.interface[0..@intCast(config.bNumInterfaces)];
+            for (ifaces) |iface_| {
+                // I don't really care alternate setting
+                const iface = unwarp_ifaces_desc(&iface_)[0];
+                const endpoints = iface.endpoint[0..@intCast(iface.bNumEndpoints)];
+                for (endpoints) |ep| {
+                    const app_ep = Endpoint.from_desc(@intCast(i), iface.bInterfaceNumber, &ep) catch |e| {
+                        logWithDevice(logz.err(), device, ldesc).err(e).log();
+                        continue;
+                    };
+                    list.append(app_ep) catch @panic("OOM");
+                }
             }
         }
     }
@@ -535,7 +535,11 @@ pub fn main() !void {
     defer usb.libusb_exit(ctx);
     const pc_version = usb.libusb_get_version();
     const p_version: ?*const usb.libusb_version = @ptrCast(pc_version);
-    logz.info().fmt("libusb version", "{}.{}.{}.{}", .{ p_version.?.major, p_version.?.minor, p_version.?.micro, p_version.?.nano }).log();
+    if (p_version) |version| {
+        logz.info().fmt("libusb version", "{}.{}.{}.{}", .{ version.major, version.minor, version.micro, version.nano }).log();
+    } else {
+        @panic("failed to get libusb version");
+    }
     var device_list = std.ArrayList(DeviceContext).init(alloc);
     defer device_list.deinit();
     refreshDevList(ctx, &device_list);
@@ -609,12 +613,35 @@ pub fn main() !void {
                     const len: usize = @intCast(trans.*.actual_length);
                     const rx_buf: []const u8 = self.buffer[0..len];
                     self.dev.withLogger(logz.info())
-                        .int("len", len)
                         .int("flags", trans.*.flags)
                         .string("status", @tagName(status))
                         .string("action", "receive")
-                        .fmt("data", "{any}", .{rx_buf})
+                        .int("len", len)
                         .log();
+                    if (rx_buf.len > 0) {
+                        const pkt = UsbPack.unmarshal(self.alloc, rx_buf);
+                        if (pkt) |val| {
+                            var lg = logz.info()
+                                .int("reqid", val.reqid)
+                                .int("msgid", val.msgid)
+                                .int("sta", val.sta);
+                            if (val.data) |data| {
+                                lg = lg.int("len", data.len);
+                                if (val.reqid == bb.BB_GET_STATUS) {
+                                    const st: bb.bb_get_status_out_t = undefined;
+                                    _ = st;
+                                    // TODO
+                                }
+                            }
+                            lg.log();
+                        } else |err| {
+                            self.dev.withLogger(logz.err())
+                                .string("what", "failed to unmarshal")
+                                .fmt("data", "{any}", .{rx_buf})
+                                .err(err)
+                                .log();
+                        }
+                    }
                     const ok = usb.libusb_submit_transfer(trans);
                     if (ok != 0) {
                         self.dev.withLogger(logz.err())
@@ -629,6 +656,11 @@ pub fn main() !void {
                 var cb = l_alloc.create(bulk_transfer_callback) catch @panic("OOM");
                 cb.alloc = l_alloc;
                 cb.dev = dev;
+                const payload = bb.bb_get_status_in_t{
+                    .user_bmp = 0x3fff,
+                };
+                _ = payload;
+                // TODO
                 const header = UsbPack{
                     .msgid = 0x0,
                     .reqid = bb.BB_GET_STATUS,
@@ -670,6 +702,8 @@ pub fn main() !void {
                 cb.dev = dev;
                 const rx_buffer = l_alloc.alloc(u8, ep.maxPacketSize) catch @panic("OOM");
                 cb.buffer = rx_buffer;
+                // timeout 0
+                // callback won't be called because of timeout
                 usb.libusb_fill_bulk_transfer(
                     rx_transfer,
                     dev.hdl(),
@@ -678,7 +712,7 @@ pub fn main() !void {
                     @intCast(rx_buffer.len),
                     bulk_transfer_callback.rx,
                     cb,
-                    1000,
+                    0,
                 );
                 dev.withLogger(logz.info())
                     .int("interface", ep.iInterface)

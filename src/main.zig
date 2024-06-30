@@ -588,7 +588,6 @@ pub fn main() !void {
                         const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
                         defer self.alloc.destroy(self);
                         defer self.alloc.free(self.tx_buffer);
-                        logz.debug().fmt("ptr", "{*}", .{self.tx_buffer.ptr}).int("len", self.tx_buffer.len).log();
                         const status = transferStatusFromInt(trans.*.status) catch unreachable;
                         self.dev.withLogger(logz.info())
                             .string("status", @tagName(status))
@@ -608,10 +607,6 @@ pub fn main() !void {
                     .data = null,
                 };
                 const tx_buffer = header.marshal(l_alloc) catch @panic("OOM");
-                logz.debug()
-                    .fmt("ptr", "{*}", .{tx_buffer})
-                    .int("len", tx_buffer.len)
-                    .log();
                 cb.tx_buffer = tx_buffer;
                 usb.libusb_fill_bulk_transfer(
                     transfer,
@@ -643,7 +638,7 @@ pub fn main() !void {
     // https://libusb.sourceforge.io/api-1.0/group__libusb__poll.html
     // https://www.reddit.com/r/Zig/comments/11mr0r8/defer_errdefer_and_sigint_ctrlc/
     // https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/signal
-    // TODO: handle ctrl
+    // TODO: handle Ctrl+C (Unix is SIGINT, Windows is a different story)
     while (true) {
         ret = usb.libusb_handle_events(ctx);
         if (ret != 0) {

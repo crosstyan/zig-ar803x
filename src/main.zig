@@ -540,11 +540,17 @@ pub fn main() !void {
     defer device_list.deinit();
     refreshDevList(ctx, &device_list);
 
-    const transfer = usb.libusb_alloc_transfer(0);
-    if (transfer == null) {
-        return std.debug.panic("failed to allocate transfer", .{});
+    const tx_transfer = usb.libusb_alloc_transfer(0);
+    if (tx_transfer == null) {
+        return std.debug.panic("failed to allocate rx transfer", .{});
     }
-    defer usb.libusb_free_transfer(transfer);
+    defer usb.libusb_free_transfer(tx_transfer);
+
+    const rx_transfer = usb.libusb_alloc_transfer(0);
+    if (rx_transfer == null) {
+        return std.debug.panic("failed to allocate rx transfer", .{});
+    }
+    defer usb.libusb_free_transfer(rx_transfer);
 
     for (device_list.items) |dev| {
         const speed = usb.libusb_get_device_speed(dev.dev());
@@ -576,26 +582,49 @@ pub fn main() !void {
             // main loop when events are ready to be handled, or you must use
             // some other scheme to allow libusb to undertake whatever work
             // needs to be done.
-            if (ep.direction == Direction.in and ep.transferType == TransferType.bulk) {
-                const bulk_transfer_callback = struct {
-                    alloc: std.mem.Allocator,
-                    dev: DeviceContext,
-                    tx_buffer: []u8,
-                    pub fn call(trans: [*c]usb.libusb_transfer) callconv(.C) void {
-                        if (trans == null) {
-                            return;
-                        }
-                        const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
-                        defer self.alloc.destroy(self);
-                        defer self.alloc.free(self.tx_buffer);
-                        const status = transferStatusFromInt(trans.*.status) catch unreachable;
-                        self.dev.withLogger(logz.info())
-                            .string("status", @tagName(status))
-                            .int("flags", trans.*.flags)
-                            .string("action", "bulk transfer completed")
+            const bulk_transfer_callback = struct {
+                alloc: std.mem.Allocator,
+                dev: DeviceContext,
+                buffer: []u8,
+                pub fn tx(trans: [*c]usb.libusb_transfer) callconv(.C) void {
+                    if (trans == null) {
+                        return;
+                    }
+                    const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
+                    defer self.alloc.destroy(self);
+                    defer self.alloc.free(self.buffer);
+                    const status = transferStatusFromInt(trans.*.status) catch unreachable;
+                    self.dev.withLogger(logz.info())
+                        .string("status", @tagName(status))
+                        .int("flags", trans.*.flags)
+                        .string("action", "transfer completed")
+                        .log();
+                }
+                pub fn rx(trans: [*c]usb.libusb_transfer) callconv(.C) void {
+                    if (trans == null) {
+                        return;
+                    }
+                    const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
+                    const status = transferStatusFromInt(trans.*.status) catch unreachable;
+                    const len: usize = @intCast(trans.*.actual_length);
+                    const rx_buf: []const u8 = self.buffer[0..len];
+                    self.dev.withLogger(logz.info())
+                        .int("len", len)
+                        .int("flags", trans.*.flags)
+                        .string("status", @tagName(status))
+                        .string("action", "receive")
+                        .fmt("data", "{any}", .{rx_buf})
+                        .log();
+                    const ok = usb.libusb_submit_transfer(trans);
+                    if (ok != 0) {
+                        self.dev.withLogger(logz.err())
+                            .int("code", ok)
+                            .string("err", "failed to submit transfer")
                             .log();
                     }
-                };
+                }
+            };
+            if (ep.direction == Direction.out and ep.transferType == TransferType.bulk) {
                 const l_alloc = alloc;
                 var cb = l_alloc.create(bulk_transfer_callback) catch @panic("OOM");
                 cb.alloc = l_alloc;
@@ -607,25 +636,62 @@ pub fn main() !void {
                     .data = null,
                 };
                 const tx_buffer = header.marshal(l_alloc) catch @panic("OOM");
-                cb.tx_buffer = tx_buffer;
+                cb.buffer = tx_buffer;
                 usb.libusb_fill_bulk_transfer(
-                    transfer,
+                    tx_transfer,
                     dev.hdl(),
                     ep.addr,
                     tx_buffer.ptr,
                     @intCast(tx_buffer.len),
-                    bulk_transfer_callback.call,
+                    bulk_transfer_callback.tx,
                     cb,
                     1000,
                 );
                 dev.withLogger(logz.info())
                     .int("interface", ep.iInterface)
                     .fmt("address", "0x{x:0>2}", .{ep.addr})
-                    .string("action", "submitting bulk transfer")
+                    .string("direction", @tagName(ep.direction))
+                    .string("action", "submitting transfer")
                     .log();
-                ret = usb.libusb_submit_transfer(transfer);
+                ret = usb.libusb_submit_transfer(tx_transfer);
                 if (ret != 0) {
                     dev.withLogger(logz.err())
+                        .int("interface", ep.iInterface)
+                        .fmt("address", "0x{x:0>2}", .{ep.addr})
+                        .string("direction", @tagName(ep.direction))
+                        .int("code", ret)
+                        .string("err", "failed to submit transfer")
+                        .log();
+                }
+            } else if (ep.direction == Direction.in and ep.transferType == TransferType.bulk) {
+                const l_alloc = alloc;
+                var cb = l_alloc.create(bulk_transfer_callback) catch @panic("OOM");
+                cb.alloc = l_alloc;
+                cb.dev = dev;
+                const rx_buffer = l_alloc.alloc(u8, ep.maxPacketSize) catch @panic("OOM");
+                cb.buffer = rx_buffer;
+                usb.libusb_fill_bulk_transfer(
+                    rx_transfer,
+                    dev.hdl(),
+                    ep.addr,
+                    rx_buffer.ptr,
+                    @intCast(rx_buffer.len),
+                    bulk_transfer_callback.rx,
+                    cb,
+                    1000,
+                );
+                dev.withLogger(logz.info())
+                    .int("interface", ep.iInterface)
+                    .fmt("address", "0x{x:0>2}", .{ep.addr})
+                    .string("direction", @tagName(ep.direction))
+                    .string("action", "submitting transfer")
+                    .log();
+                ret = usb.libusb_submit_transfer(rx_transfer);
+                if (ret != 0) {
+                    dev.withLogger(logz.err())
+                        .int("interface", ep.iInterface)
+                        .fmt("address", "0x{x:0>2}", .{ep.addr})
+                        .string("direction", @tagName(ep.direction))
                         .int("code", ret)
                         .string("err", "failed to submit transfer")
                         .log();

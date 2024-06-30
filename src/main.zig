@@ -156,7 +156,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         ///
         ///   - left: devices that should be removed from the context list
         ///   - right: devices that should be added to the context list
-        pub fn call(self: Self, alloc: std.mem.Allocator, poll_list: []const ?*usb.libusb_device) struct { std.ArrayList(DeviceContext), std.ArrayList(DeviceLike) } {
+        pub fn call(self: Self, alloc: std.mem.Allocator, poll_list: []const ?*usb.libusb_device) struct { std.ArrayList(*const DeviceContext), std.ArrayList(DeviceLike) } {
             var lret: c_int = undefined;
             var filtered = std.ArrayList(DeviceLike).init(alloc);
             defer filtered.deinit();
@@ -178,7 +178,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             }
 
             const DEFAULT_CAP = 4;
-            var left = std.ArrayList(DeviceContext).init(alloc);
+            var left = std.ArrayList(*const DeviceContext).init(alloc);
             left.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
             var right = std.ArrayList(DeviceLike).init(alloc);
             right.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
@@ -187,7 +187,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             defer intersec.deinit();
 
             // TODO: improve the performance by using a hash set or a hash map
-            for (self.ctx_list) |d| {
+            for (self.ctx_list) |*d| {
                 var found = false;
                 const lhash = d.xxhash();
                 for (filtered.items) |f| {
@@ -228,8 +228,8 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
     defer l.deinit();
     defer r.deinit();
     for (l.items) |ldc| {
-        right: for (ctx_list.items, 0..) |rdc, index| {
-            if (ldc.xxhash() == rdc.xxhash()) {
+        right: for (ctx_list.items, 0..) |*rdc, index| {
+            if (ldc == rdc) {
                 logWithDevice(logz.info(), rdc.core.self, &rdc.core.desc).string("action", "removed").log();
                 rdc.dtor();
                 _ = ctx_list.orderedRemove(index);

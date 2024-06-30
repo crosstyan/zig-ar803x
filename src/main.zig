@@ -56,6 +56,7 @@ const DeviceContext = struct {
 
 const AppError = error{
     BadDescriptor,
+    BadEnum,
 };
 
 fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceContext)) void {
@@ -70,8 +71,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
     // If the unref_devices parameter is set, the reference count of each device
     // in the list is decremented by 1
     defer usb.libusb_free_device_list(c_device_list, 1);
-    var device_list = c_device_list[0..@intCast(sz)];
-    device_list.len = @intCast(sz);
+    const device_list = c_device_list[0..@intCast(sz)];
 
     const DeviceLike = struct {
         const MAX_PORTS = 8;
@@ -202,8 +202,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
                 .fmt("vid", "0x{x:0>4}", .{self.dev.vid})
                 .fmt("pid", "0x{x:0>4}", .{self.dev.pid})
                 .int("bus", self.dev.bus)
-                .int("port", self.dev.port)
-                .string("ports", self.dev.ports);
+                .int("port", self.dev.port);
         }
     };
 
@@ -213,14 +212,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
     for (l.items) |ldc| {
         right: for (ctx_list.items, 0..) |rdc, index| {
             if (ldc.xxhash() == rdc.xxhash()) {
-                logz.info()
-                    .string("action", "removed")
-                    .fmt("vid", "0x{x:0>4}", .{rdc.core.desc.idVendor})
-                    .fmt("pid", "0x{x:0>4}", .{rdc.core.desc.idProduct})
-                    .int("bus", rdc.bus)
-                    .int("port", rdc.port)
-                    .string("ports", rdc.ports)
-                    .log();
+                withDevice(logz.info(), rdc.core.self, &rdc.core.desc).string("action", "removed").log();
                 rdc.dtor();
                 _ = ctx_list.orderedRemove(index);
                 break :right;
@@ -305,24 +297,24 @@ const Endpoint = struct {
     transferType: TransferType,
     maxPacketSize: u16,
 
-    pub fn from_desc(iConfig: u8, iInterface: u8, ep: *const usb.libusb_endpoint_descriptor) Endpoint {
+    pub fn from_desc(iConfig: u8, iInterface: u8, ep: *const usb.libusb_endpoint_descriptor) AppError!Endpoint {
         const local = struct {
-            pub inline fn addr_to_dir(addr: u8) Direction {
+            pub inline fn addr_to_dir(addr: u8) AppError!Direction {
                 const dir = addr & usb.LIBUSB_ENDPOINT_DIR_MASK;
                 const r = switch (dir) {
                     usb.LIBUSB_ENDPOINT_IN => Direction.in,
                     usb.LIBUSB_ENDPOINT_OUT => Direction.out,
-                    else => @panic("invalid direction"),
+                    else => return AppError.BadEnum,
                 };
                 return r;
             }
-            pub inline fn attr_to_transfer_type(attr: u8) TransferType {
+            pub inline fn attr_to_transfer_type(attr: u8) AppError!TransferType {
                 const r = switch (usbEndpointTransferType(attr)) {
                     usb.LIBUSB_TRANSFER_TYPE_CONTROL => TransferType.control,
                     usb.LIBUSB_TRANSFER_TYPE_ISOCHRONOUS => TransferType.isochronous,
                     usb.LIBUSB_TRANSFER_TYPE_BULK => TransferType.bulk,
                     usb.LIBUSB_TRANSFER_TYPE_INTERRUPT => TransferType.interrupt,
-                    else => @panic("invalid transfer type"),
+                    else => return AppError.BadEnum,
                 };
                 return r;
             }
@@ -332,12 +324,24 @@ const Endpoint = struct {
             .iInterface = iInterface,
             .addr = ep.bEndpointAddress,
             .number = usbEndpointNum(ep.bEndpointAddress),
-            .direction = local.addr_to_dir(ep.bEndpointAddress),
-            .transferType = local.attr_to_transfer_type(ep.bmAttributes),
+            .direction = try local.addr_to_dir(ep.bEndpointAddress),
+            .transferType = try local.attr_to_transfer_type(ep.bmAttributes),
             .maxPacketSize = ep.wMaxPacketSize,
         };
     }
 };
+
+pub fn withDevice(logger: logz.Logger, device: *usb.libusb_device, desc: *const usb.libusb_device_descriptor) logz.Logger {
+    const vid = desc.idVendor;
+    const pid = desc.idProduct;
+    const bus = usb.libusb_get_bus_number(device);
+    const port = usb.libusb_get_port_number(device);
+    return logger
+        .fmt("vid", "0x{x:0>4}", .{vid})
+        .fmt("pid", "0x{x:0>4}", .{pid})
+        .int("bus", bus)
+        .int("port", port);
+}
 
 pub fn getEndpoints(alloc: std.mem.Allocator, device: *usb.libusb_device, ldesc: *const usb.libusb_device_descriptor) []Endpoint {
     var lret: c_int = undefined;
@@ -357,7 +361,11 @@ pub fn getEndpoints(alloc: std.mem.Allocator, device: *usb.libusb_device, ldesc:
             const iface = unwarp_ifaces_desc(&iface_)[0];
             const endpoints = iface.endpoint[0..@intCast(iface.bNumEndpoints)];
             for (endpoints) |ep| {
-                list.append(Endpoint.from_desc(@intCast(i), iface.bInterfaceNumber, &ep)) catch @panic("OOM");
+                const app_ep = Endpoint.from_desc(@intCast(i), iface.bInterfaceNumber, &ep) catch |e| {
+                    withDevice(logz.err(), device, ldesc).err(e).log();
+                    continue;
+                };
+                list.append(app_ep) catch @panic("OOM");
             }
         }
     }
@@ -463,14 +471,7 @@ pub fn main() !void {
     for (device_list.items) |dev| {
         const core = &dev.core;
         const speed = usb.libusb_get_device_speed(core.self);
-        const bus = usb.libusb_get_bus_number(core.self);
-        const port = usb.libusb_get_port_number(core.self);
-        logz.info()
-            .fmt("vid", "0x{x:0>4}", .{core.desc.idVendor})
-            .fmt("pid", "0x{x:0>4}", .{core.desc.idProduct})
-            .int("bus", bus)
-            .int("port", port)
-            .string("speed", usbSpeedToString(speed)).log();
+        withDevice(logz.info(), core.self, &core.desc).string("speed", usbSpeedToString(speed)).log();
         printStrDesc(core.hdl, &core.desc);
     }
 }

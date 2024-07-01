@@ -1,0 +1,20 @@
+{
+    "cSpell.enabled": true,
+    "cSpell.enableFiletypes": [
+        "zig"
+    ],
+    "cSpell.words": [
+        "alloc",
+        "anytype",
+        "callconv",
+        "deinit",
+        "libusb",
+        "logz",
+        "msgid",
+        "reqid",
+        "struct",
+        "unmarshal",
+        "usbpack",
+        "XXHASH"
+    ]
+}

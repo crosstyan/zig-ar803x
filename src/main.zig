@@ -612,6 +612,14 @@ pub fn main() !void {
         }
     }
 
+    const pc_version = usb.libusb_get_version();
+    const p_version: ?*const usb.libusb_version = @ptrCast(pc_version);
+    if (p_version) |version| {
+        logz.info().fmt("libusb version", "{}.{}.{}.{}", .{ version.major, version.minor, version.micro, version.nano }).log();
+    } else {
+        @panic("failed to get libusb version");
+    }
+
     var ctx_: ?*usb.libusb_context = null;
     var ret: c_int = undefined;
     // https://libusb.sourceforge.io/api-1.0/libusb_contexts.html
@@ -621,15 +629,15 @@ pub fn main() !void {
     }
     const ctx = ctx_.?;
     defer usb.libusb_exit(ctx);
-    const pc_version = usb.libusb_get_version();
-    const p_version: ?*const usb.libusb_version = @ptrCast(pc_version);
-    if (p_version) |version| {
-        logz.info().fmt("libusb version", "{}.{}.{}.{}", .{ version.major, version.minor, version.micro, version.nano }).log();
-    } else {
-        @panic("failed to get libusb version");
-    }
     var device_list = std.ArrayList(DeviceContext).init(alloc);
-    defer device_list.deinit();
+    defer {
+        for (device_list.items) |*dev| {
+            _ = dev;
+            // TODO: must release transfer first before closing the device
+            // TODO: dtor
+        }
+        device_list.deinit();
+    }
     refreshDevList(ctx, &device_list);
 
     const tx_transfer = usb.libusb_alloc_transfer(0);
@@ -884,7 +892,7 @@ pub fn main() !void {
 
     var tv = usb.timeval{
         .tv_sec = 0,
-        .tv_usec = 3_000 * std.time.us_per_ms,
+        .tv_usec = 0,
     };
 
     // https://libusb.sourceforge.io/api-1.0/libusb_mtasync.html

@@ -8,23 +8,34 @@ pub fn xorCheck(buf: []const u8) u8 {
     return xor;
 }
 
-pub const AllocError = std.mem.Allocator.Error;
 pub const UnmarshalError = error{
     InvalidStartMagic,
     InvalidEndMagic,
     OutOfRange,
 };
+const NoContent = error{NoContent};
 
 // Note that this struct is NOT owning `data`
 pub const UsbPack = packed struct {
     reqid: u32,
     msgid: u32,
     sta: i32,
-    data: ?*[]const u8,
+    ptr: ?[*]const u8,
+    len: u32,
 
     const Self = @This();
     // usbpack 的固定长度
     const fixedPackBase = 1 + 4 + 4 + 4 + 4 + 1 + 1;
+
+    /// data combines the `ptr` and `len` fields into a valid byte slice
+    ///
+    /// note that the actual ownership of the data is NOT transferred
+    pub fn data(self: Self) NoContent![]const u8 {
+        if (self.ptr == null or self.len == 0) {
+            return error.NoContent;
+        }
+        return self.ptr.?[0..self.len];
+    }
 
     /// marshal packs the struct into a byte slice
     ///
@@ -32,18 +43,15 @@ pub const UsbPack = packed struct {
     pub fn marshal(self: Self, alloc: std.mem.Allocator) ![]u8 {
         var list = std.ArrayList(u8).init(alloc);
         defer list.deinit();
-        if (self.data != null) {
-            try list.ensureTotalCapacity(self.data.?.len + Self.fixedPackBase);
+        if (self.ptr != null and self.len > 0) {
+            try list.ensureTotalCapacity(self.len + Self.fixedPackBase);
         } else {
             try list.ensureTotalCapacity(Self.fixedPackBase);
         }
         var writer = list.writer();
-        // buf[offset] = 0xaa;
-        // offset += 1;
         try writer.writeByte(0xaa);
-        if (self.data != null) {
-            const l: u32 = @intCast(self.data.?.len);
-            try writer.writeInt(u32, l, std.builtin.Endian.little);
+        if (self.ptr != null and self.len > 0) {
+            try writer.writeInt(u32, self.len, std.builtin.Endian.little);
         } else {
             try writer.writeInt(u32, 0, std.builtin.Endian.little);
         }
@@ -52,9 +60,9 @@ pub const UsbPack = packed struct {
         try writer.writeInt(i32, self.sta, std.builtin.Endian.big);
         const xor = xorCheck(list.items);
         try writer.writeByte(xor);
-        if (self.data != null) {
-            _ = try writer.write(self.data.?.*);
-        }
+        if (self.data()) |s| {
+            _ = try writer.write(s);
+        } else |_| {}
         try writer.writeByte(0xbb);
         return list.toOwnedSlice();
     }
@@ -80,26 +88,29 @@ pub const UsbPack = packed struct {
         // skip xor
         const xor = try reader.readByte();
         _ = xor;
-        var p_data: ?*[]u8 = null;
+        var ret: UsbPack = undefined;
+        ret.reqid = reqid;
+        ret.msgid = msgid;
+        ret.sta = sta;
         if (dataLen > 0) {
-            var ptr = try alloc.create([]u8);
             const out = try alloc.alloc(u8, dataLen);
             const sz = try reader.read(out);
-            ptr.* = out;
-            ptr.len = sz;
-            p_data = ptr;
+            ret.ptr = out.ptr;
+            ret.len = @intCast(sz);
+        } else {
+            ret.ptr = null;
+            ret.len = 0;
         }
         const end = try reader.readByte();
         if (end != 0xbb) {
             return UnmarshalError.InvalidEndMagic;
         }
-        return Self{ .reqid = reqid, .msgid = msgid, .sta = sta, .data = p_data };
+        return ret;
     }
 
     pub fn dtor(self: Self, alloc: std.mem.Allocator) void {
-        if (self.data) |data| {
-            alloc.free(data.*);
-            alloc.destroy(data);
-        }
+        if (self.data()) |s| {
+            alloc.free(s);
+        } else |_| {}
     }
 };

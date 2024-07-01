@@ -46,7 +46,7 @@ pub fn anytype2Slice(src: anytype) []const u8 {
             const ptr: [*]const u8 = @ptrCast(src);
             return ptr[0..size];
         },
-        else => @compileError("`src` must be a pointer type, get `" ++ @typeName(T) ++ "`"),
+        else => @compileError("`src` must be a pointer type, found `" ++ @typeName(T) ++ "`"),
     }
 }
 
@@ -57,7 +57,7 @@ pub fn fillWithBytes(dst: anytype, src: []const u8) LengthNotEqual!void {
         .Pointer => {
             const is_const = @typeInfo(T).Pointer.is_const;
             if (is_const) {
-                @compileError("`dst` must be a mutable pointer type, get `" ++ @typeName(T) ++ "`");
+                @compileError("`dst` must be a mutable pointer type, found `" ++ @typeName(T) ++ "`");
             }
             const sdst: []u8 = @constCast(anytype2Slice(dst));
             if (sdst.len != src.len) {
@@ -65,7 +65,7 @@ pub fn fillWithBytes(dst: anytype, src: []const u8) LengthNotEqual!void {
             }
             @memcpy(sdst, src);
         },
-        else => @compileError("`dst` must be a pointer type, get `" ++ @typeName(T) ++ "`"),
+        else => @compileError("`dst` must be a pointer type, found `" ++ @typeName(T) ++ "`"),
     }
 }
 
@@ -681,11 +681,11 @@ pub fn main() !void {
                             lg = lg.int("reqid", val.reqid)
                                 .int("msgid", val.msgid)
                                 .int("sta", val.sta);
-                            if (val.data) |data| {
+                            if (val.data()) |data| {
                                 lg = lg.int("len", data.len);
                                 if (val.reqid == bb.BB_GET_STATUS) {
                                     var st: bb.bb_get_status_out_t = undefined;
-                                    if (fillWithBytes(&st, data.*)) |_| {
+                                    if (fillWithBytes(&st, data)) |_| {
                                         lg = self.dev.withLogger(logz.info());
                                         lg.fmt("status", "{any}", .{st}).log();
                                     } else |e| {
@@ -696,7 +696,7 @@ pub fn main() !void {
                                             .log();
                                     }
                                 }
-                            }
+                            } else |_| {}
                             lg.log();
                         } else |err| {
                             lg = self.dev.withLogger(logz.err());
@@ -726,17 +726,16 @@ pub fn main() !void {
                 const payload = bb.bb_get_status_in_t{
                     .user_bmp = 0x3fff,
                 };
-                const p_data = alloc.create([]u8) catch @panic("OOM");
                 const data_buf = alloc.alloc(u8, @sizeOf(@TypeOf(payload))) catch @panic("OOM");
                 fillBytesWithStruct(data_buf, &payload) catch unreachable;
-                p_data.* = data_buf;
                 const header = UsbPack{
                     .msgid = 0x0,
                     .reqid = bb.BB_GET_STATUS,
                     .sta = 0x0,
-                    .data = p_data,
+                    .ptr = data_buf.ptr,
+                    .len = @intCast(data_buf.len),
                 };
-                defer header.dtor();
+                defer header.dtor(l_alloc);
                 const tx_buffer = header.marshal(l_alloc) catch @panic("OOM");
                 cb.buffer = tx_buffer;
                 usb.libusb_fill_bulk_transfer(

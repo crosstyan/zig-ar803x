@@ -100,37 +100,6 @@ pub fn fillBytesWith(dst: []u8, src: anytype) LengthNotEqual!void {
 
 const is_windows = builtin.os.tag == .windows;
 
-// borrowed from
-// https://git.sr.ht/~delitako/nyoomcat/tree/main/item/src/main.zig#L28
-//
-// https://www.reddit.com/r/Zig/comments/wviq36/how_to_catch_signals_at_least_sigint/
-// https://www.reddit.com/r/Zig/comments/11mr0r8/defer_errdefer_and_sigint_ctrlc/
-const win = if (is_windows) struct {
-    const k32 = std.os.windows.kernel32;
-
-    const HANDLE = std.os.windows.HANDLE;
-    const WINAPI = std.os.windows.WINAPI;
-    const DWORD = std.os.windows.DWORD;
-    const BufInfo = std.os.windows.CONSOLE_SCREEN_BUFFER_INFO;
-    /// ENABLE_VIRTUAL_TERMINAL_PROCESSING
-    const vt_flag = 0x0004;
-    /// ENABLE_ECHO_INPUT
-    /// typed so that its bitwise complement can be found
-    /// (bit operations are not allowed on comptime_int values)
-    const echo_input_flag: DWORD = 0x0004;
-    const stdin_handle_id = std.os.windows.STD_INPUT_HANDLE;
-    const stderr_handle_id = std.os.windows.STD_ERROR_HANDLE;
-
-    // https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/signal
-    extern "c" fn signal(sig: c_int, func: *const fn (c_int, c_int) callconv(WINAPI) void) callconv(.C) *anyopaque;
-
-    // Missing from std.os.windows.kernel32 for some reason
-    extern "kernel32" fn SetConsoleMode(
-        console: HANDLE,
-        mode: DWORD,
-    ) callconv(WINAPI) std.os.windows.BOOL;
-} else void;
-
 const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
     .thread_safe = true,
 });
@@ -864,20 +833,31 @@ pub fn main() !void {
         }
     }
 
+    // https://www.reddit.com/r/Zig/comments/wviq36/how_to_catch_signals_at_least_sigint/
+    // https://www.reddit.com/r/Zig/comments/11mr0r8/defer_errdefer_and_sigint_ctrlc/
     const Sig = struct {
         var flag = std.atomic.Value(bool).init(true);
 
-        pub fn int_handle_win(sig: c_int, sub: c_int) callconv(win.WINAPI) void {
-            logz.info()
-                .int("signal", sig)
-                .int("sub code", sub)
-                .string("action", "received signal").log();
-            flag.store(false, std.builtin.AtomicOrder.unordered);
+        const w = std.os.windows;
+        pub fn ctrl_c_handler(dwCtrlType: w.DWORD) callconv(w.WINAPI) w.BOOL {
+            if (dwCtrlType == w.CTRL_C_EVENT) {
+                logz.info()
+                    .string("action", "Ctrl-C received")
+                    .log();
+                flag.store(false, std.builtin.AtomicOrder.unordered);
+                return 1;
+            }
+            return 0;
         }
 
         pub fn int_handle(sig: c_int) callconv(.C) void {
-            logz.info().int("signal", sig).string("action", "received signal").log();
-            flag.store(false, std.builtin.AtomicOrder.unordered);
+            if (sig == std.c.SIG.INT) {
+                logz.info()
+                    .int("signal", sig)
+                    .string("action", "SIGINT received")
+                    .log();
+                flag.store(false, std.builtin.AtomicOrder.unordered);
+            }
         }
 
         pub inline fn is_run() bool {
@@ -886,7 +866,7 @@ pub fn main() !void {
     };
 
     if (is_windows) {
-        _ = win.signal(std.c.SIG.INT, Sig.int_handle_win);
+        std.os.windows.SetConsoleCtrlHandler(Sig.ctrl_c_handler, true) catch unreachable;
     } else {
         // borrowed from
         // https://git.sr.ht/~delitako/nyoomcat/tree/main/item/src/main.zig#L109
@@ -903,6 +883,7 @@ pub fn main() !void {
         .tv_sec = 0,
         .tv_usec = 3_000 * std.time.us_per_ms,
     };
+
     // https://libusb.sourceforge.io/api-1.0/libusb_mtasync.html
     // https://stackoverflow.com/questions/45672717/how-to-force-a-libusb-event-so-that-libusb-handle-events-returns
     // https://libusb.sourceforge.io/api-1.0/group__libusb__poll.html

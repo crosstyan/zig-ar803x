@@ -11,7 +11,7 @@ pub fn xorCheck(buf: []const u8) u8 {
 pub const UnmarshalError = error{
     InvalidStartMagic,
     InvalidEndMagic,
-    OutOfRange,
+    LengthTooShort,
 };
 const NoContent = error{NoContent};
 
@@ -72,7 +72,7 @@ pub const UsbPack = packed struct {
     /// note that the `data` field is owned by the `alloc` allocator
     pub fn unmarshal(alloc: std.mem.Allocator, buf: []const u8) !Self {
         if (buf.len < Self.fixedPackBase) {
-            return UnmarshalError.OutOfRange;
+            return UnmarshalError.LengthTooShort;
         }
         var stream = std.io.fixedBufferStream(buf);
         var reader = stream.reader();

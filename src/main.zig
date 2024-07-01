@@ -21,7 +21,7 @@ const BadEnum = error{BadEnum};
 const LengthNotEqual = error{LengthNotEqual};
 
 /// the essential part of the USB device.
-/// you could retrieve everything elese from this
+/// you could retrieve everything else from this
 /// with libusb API
 const DeviceHandles = struct {
     dev: *usb.libusb_device,
@@ -29,7 +29,7 @@ const DeviceHandles = struct {
     desc: usb.libusb_device_descriptor,
 
     const Self = @This();
-    pub fn dtor(self: Self) void {
+    pub fn dtor(self: *Self) void {
         usb.libusb_close(self.hdl);
     }
 };
@@ -98,8 +98,12 @@ pub fn fillBytesWith(dst: []u8, src: anytype) LengthNotEqual!void {
     }
 }
 
+const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
+    .thread_safe = true,
+});
+
 const DeviceContext = struct {
-    alloc: std.heap.ArenaAllocator,
+    gpa: DeviceGPA,
     core: DeviceHandles,
     bus: u8,
     port: u8,
@@ -110,25 +114,40 @@ const DeviceContext = struct {
 
     const Self = @This();
 
-    pub fn dev(self: Self) *usb.libusb_device {
+    pub fn allocator(self: *Self) std.mem.Allocator {
+        return self.gpa.allocator();
+    }
+
+    pub fn dev(self: *const Self) *const usb.libusb_device {
         return self.core.dev;
     }
 
-    pub fn hdl(self: Self) *usb.libusb_device_handle {
+    pub fn mutDev(self: *Self) *usb.libusb_device {
+        return self.core.dev;
+    }
+
+    pub fn hdl(self: *const Self) *const usb.libusb_device_handle {
         return self.core.hdl;
     }
 
-    pub fn desc(self: Self) *const usb.libusb_device_descriptor {
+    pub fn mutHdl(self: *Self) *usb.libusb_device_handle {
+        return self.core.hdl;
+    }
+
+    pub fn desc(self: *const Self) *const usb.libusb_device_descriptor {
         return &self.core.desc;
     }
 
-    pub fn dtor(self: Self) void {
+    pub fn dtor(self: *Self) void {
         self.core.dtor();
-        self.alloc.deinit();
+        const chk = self.gpa.deinit();
+        if (chk != .ok) {
+            std.debug.print("GPA thinks there are memory leaks when destroying device bus {} port {}\n", .{ self.bus, self.port });
+        }
     }
 
     /// attach the device information to the logger
-    pub fn withLogger(self: Self, logger: logz.Logger) logz.Logger {
+    pub fn withLogger(self: *const Self, logger: logz.Logger) logz.Logger {
         return logger
             .fmt("vid", "0x{x:0>4}", .{self.core.desc.idVendor})
             .fmt("pid", "0x{x:0>4}", .{self.core.desc.idProduct})
@@ -137,7 +156,7 @@ const DeviceContext = struct {
     }
 
     /// hash the device by bus, port, and ports
-    pub fn xxhash(self: Self) u32 {
+    pub fn xxhash(self: *const Self) u32 {
         var h = std.hash.XxHash32.init(XXHASH_SEED);
         h.update(anytype2Slice(&self.bus));
         h.update(anytype2Slice(&self.port));
@@ -205,7 +224,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             return ret;
         }
 
-        pub fn withLogger(self: @This(), logger: logz.Logger) logz.Logger {
+        pub fn withLogger(self: *const @This(), logger: logz.Logger) logz.Logger {
             return logger
                 .fmt("vid", "0x{x:0>4}", .{self.vid})
                 .fmt("pid", "0x{x:0>4}", .{self.pid})
@@ -214,7 +233,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         }
 
         /// hash the device by bus, port, and ports
-        pub fn xxhash(self: @This()) u32 {
+        pub fn xxhash(self: *const @This()) u32 {
             var h = std.hash.XxHash32.init(XXHASH_SEED);
             h.update(anytype2Slice(&self.bus));
             h.update(anytype2Slice(&self.port));
@@ -237,9 +256,9 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         /// and the caller is responsible for freeing the memory.
         ///
         ///   - left: devices that should be removed from the context list (`*const DeviceContext`)
-        ///   - right: devices that should be added to the context list (`DeviceLike` that could be used to initialite a device)
+        ///   - right: devices that should be added to the context list (`DeviceLike` that could be used to init a device)
         pub fn call(
-            self: @This(),
+            self: *const @This(),
             alloc: std.mem.Allocator,
             poll_list: []const ?*usb.libusb_device,
         ) struct { std.ArrayList(*const DeviceContext), std.ArrayList(DeviceLike) } {
@@ -248,12 +267,12 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             defer filtered.deinit();
             for (poll_list) |device| {
                 if (device) |val| {
-                    var ldesc: usb.libusb_device_descriptor = undefined;
-                    ret = usb.libusb_get_device_descriptor(val, &ldesc);
+                    var l_desc: usb.libusb_device_descriptor = undefined;
+                    ret = usb.libusb_get_device_descriptor(val, &l_desc);
                     if (ret != 0) {
                         continue;
                     }
-                    if (ldesc.idVendor == ARTO_RTOS_VID and ldesc.idProduct == ARTO_RTOS_PID) {
+                    if (l_desc.idVendor == ARTO_RTOS_VID and l_desc.idProduct == ARTO_RTOS_PID) {
                         const dev_like = DeviceLike.from_device(val) catch {
                             continue;
                         };
@@ -267,19 +286,19 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             left.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
             var right = std.ArrayList(DeviceLike).init(alloc);
             right.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
-            var intersec = std.ArrayList(DeviceLike).init(alloc);
-            intersec.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
-            defer intersec.deinit();
+            var inter = std.ArrayList(DeviceLike).init(alloc);
+            inter.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
+            defer inter.deinit();
 
             // TODO: improve the performance by using a hash set or a hash map
             for (self.ctx_list) |*dc| {
                 var found = false;
-                const lhash = dc.xxhash();
+                const l_hash = dc.xxhash();
                 inner: for (filtered.items) |dl| {
-                    const rhash = dl.xxhash();
-                    if (lhash == rhash) {
+                    const r_hash = dl.xxhash();
+                    if (l_hash == r_hash) {
                         found = true;
-                        intersec.append(dl) catch @panic("OOM");
+                        inter.append(dl) catch @panic("OOM");
                         break :inner;
                     }
                 }
@@ -291,10 +310,10 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
 
             for (filtered.items) |fdl| {
                 var found = false;
-                const rhash = fdl.xxhash();
-                inner: for (intersec.items) |idl| {
-                    const lhash = idl.xxhash();
-                    if (lhash == rhash) {
+                const r_hash = fdl.xxhash();
+                inner: for (inter.items) |idl| {
+                    const l_hash = idl.xxhash();
+                    if (l_hash == r_hash) {
                         found = true;
                         break :inner;
                     }
@@ -326,6 +345,9 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
     for (r.items) |d| {
         var ret: c_int = undefined;
         var hdl: ?*usb.libusb_device_handle = null;
+        // Internally, this function adds a reference to the device and makes it
+        // available to you through `libusb_get_device()`. This reference is
+        // removed during `libusb_close()`.
         ret = usb.libusb_open(d.dev, &hdl);
         if (ret != 0 or hdl == null) {
             const tmp = logz.err().string("err", "failed to open device");
@@ -340,16 +362,13 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             continue;
         }
 
-        var gpa = std.heap.GeneralPurposeAllocator(.{
-            .thread_safe = true,
-        }){};
+        var gpa = DeviceGPA{};
         const alloc = gpa.allocator();
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        const heap_ports = arena.allocator().alloc(u8, d.ports.len) catch @panic("OOM");
-        const eps = getEndpoints(arena.allocator(), d.dev, &desc);
+        const heap_ports = alloc.alloc(u8, d.ports.len) catch @panic("OOM");
+        const eps = getEndpoints(alloc, d.dev, &desc);
         @memcpy(heap_ports, d.ports);
         const dc = DeviceContext{
-            .alloc = arena,
+            .gpa = gpa,
             .core = DeviceHandles{
                 .dev = d.dev,
                 .hdl = hdl.?,
@@ -434,7 +453,7 @@ const Endpoint = struct {
         };
     }
 
-    pub fn withLogger(self: Endpoint, logger: logz.Logger) logz.Logger {
+    pub fn withLogger(self: *const Endpoint, logger: logz.Logger) logz.Logger {
         return logger
             .int("interface", self.iInterface)
             .int("endpoint", self.number)
@@ -537,15 +556,6 @@ pub fn usbSpeedToString(speed: c_int) []const u8 {
     return r;
 }
 
-// enum libusb_transfer_status {
-//     LIBUSB_TRANSFER_COMPLETED,
-//     LIBUSB_TRANSFER_ERROR,
-//     LIBUSB_TRANSFER_TIMED_OUT,
-//     LIBUSB_TRANSFER_CANCELLED,
-//     LIBUSB_TRANSFER_STALL,
-//     LIBUSB_TRANSFER_NO_DEVICE,
-//     LIBUSB_TRANSFER_OVERFLOW,
-// };
 const TransferStatus = enum {
     completed,
     err,
@@ -623,9 +633,9 @@ pub fn main() !void {
     }
     defer usb.libusb_free_transfer(rx_transfer);
 
-    for (device_list.items) |dev| {
-        const speed = usb.libusb_get_device_speed(dev.dev());
-        printStrDesc(dev.hdl(), dev.desc());
+    for (device_list.items) |*dev| {
+        const speed = usb.libusb_get_device_speed(dev.mutDev());
+        printStrDesc(dev.mutHdl(), dev.desc());
         printEndpoints(dev.desc().idVendor, dev.desc().idProduct, dev.endpoints);
         dev.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
         if (builtin.os.tag != .windows) {
@@ -636,7 +646,7 @@ pub fn main() !void {
                     .log();
             }
         }
-        ret = usb.libusb_claim_interface(dev.hdl(), 0);
+        ret = usb.libusb_claim_interface(dev.mutHdl(), 0);
         if (ret != 0) {
             dev.withLogger(logz.err())
                 .string("err", "failed to claim interface")
@@ -653,11 +663,15 @@ pub fn main() !void {
             // main loop when events are ready to be handled, or you must use
             // some other scheme to allow libusb to undertake whatever work
             // needs to be done.
-            const bulk_transfer_callback = struct {
+            const transfer_callback = struct {
                 alloc: std.mem.Allocator,
-                dev: DeviceContext,
+                /// the lambda DOES NOT own the context,
+                /// only as a reference
+                dev: *const DeviceContext,
+                /// owned by `alloc`
                 buffer: []u8,
                 endpoint: Endpoint,
+
                 pub fn tx(trans: [*c]usb.libusb_transfer) callconv(.C) void {
                     if (trans == null) {
                         return;
@@ -673,6 +687,7 @@ pub fn main() !void {
                         .string("action", "transfer completed")
                         .log();
                 }
+
                 pub fn rx(trans: [*c]usb.libusb_transfer) callconv(.C) void {
                     if (trans == null) {
                         return;
@@ -713,6 +728,7 @@ pub fn main() !void {
                             } else |_| {}
                             lg.log();
                         } else |err| {
+                            // failed to unmarshal
                             lg = self.dev.withLogger(logz.err());
                             lg = self.endpoint.withLogger(lg);
                             lg.string("what", "failed to unmarshal")
@@ -721,6 +737,7 @@ pub fn main() !void {
                                 .log();
                         }
                     }
+                    // keeps receiving
                     const err = usb.libusb_submit_transfer(trans);
                     if (err != 0) {
                         lg = self.dev.withLogger(logz.err());
@@ -733,7 +750,7 @@ pub fn main() !void {
             };
             if (ep.direction == Direction.out and ep.transferType == TransferType.bulk) {
                 const l_alloc = alloc;
-                var cb = l_alloc.create(bulk_transfer_callback) catch @panic("OOM");
+                var cb = l_alloc.create(transfer_callback) catch @panic("OOM");
                 cb.alloc = l_alloc;
                 cb.dev = dev;
                 cb.endpoint = ep.*;
@@ -754,11 +771,11 @@ pub fn main() !void {
                 cb.buffer = tx_buffer;
                 usb.libusb_fill_bulk_transfer(
                     tx_transfer,
-                    dev.hdl(),
+                    dev.mutHdl(),
                     ep.addr,
                     tx_buffer.ptr,
                     @intCast(tx_buffer.len),
-                    bulk_transfer_callback.tx,
+                    transfer_callback.tx,
                     cb,
                     1_000,
                 );
@@ -773,7 +790,7 @@ pub fn main() !void {
                 }
             } else if (ep.direction == Direction.in and ep.transferType == TransferType.bulk) {
                 const l_alloc = alloc;
-                var cb = l_alloc.create(bulk_transfer_callback) catch @panic("OOM");
+                var cb = l_alloc.create(transfer_callback) catch @panic("OOM");
                 cb.alloc = l_alloc;
                 cb.dev = dev;
                 cb.endpoint = ep.*;
@@ -783,11 +800,11 @@ pub fn main() !void {
                 // callback won't be called because of timeout
                 usb.libusb_fill_bulk_transfer(
                     rx_transfer,
-                    dev.hdl(),
+                    dev.mutHdl(),
                     ep.addr,
                     rx_buffer.ptr,
                     @intCast(rx_buffer.len),
-                    bulk_transfer_callback.rx,
+                    transfer_callback.rx,
                     cb,
                     0,
                 );

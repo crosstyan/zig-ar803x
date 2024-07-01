@@ -9,6 +9,7 @@
         "callconv",
         "deinit",
         "libusb",
+        "logfmt",
         "logz",
         "memcpy",
         "msgid",
@@ -17,6 +18,7 @@
         "struct",
         "unmarshal",
         "usbpack",
+        "usize",
         "XXHASH"
     ]
 }

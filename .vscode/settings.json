@@ -12,6 +12,7 @@
         "logz",
         "memcpy",
         "msgid",
+        "pointee",
         "reqid",
         "struct",
         "unmarshal",

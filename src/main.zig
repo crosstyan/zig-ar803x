@@ -34,9 +34,11 @@ const DeviceHandles = struct {
     }
 };
 
-/// cast any type to a slice of u8
+/// cast any type to a slice of bytes (`u8`)
 ///
-///   - `any`: any type that you want to cast
+///   - `src`: a reference of type `U`
+///
+/// returns a slice of bytes, whose length is equal to the size of `U`
 pub fn anytype2Slice(src: anytype) []const u8 {
     const T = @TypeOf(src);
     switch (@typeInfo(T)) {
@@ -50,7 +52,13 @@ pub fn anytype2Slice(src: anytype) []const u8 {
     }
 }
 
-/// fill a struct with a slice of u8
+/// fill a reference of type `U` as `dst` with with content of `src`
+///
+/// Note that the length of `src` slice must be equal to the size of `U`,
+/// otherwise, it will return `LengthNotEqual`
+///
+///   - `dst`: a *mutable* reference of type `U`
+///   - `src`: a slice of bytes, whose length must be equal to the size of `U`
 pub fn fillWithBytes(dst: anytype, src: []const u8) LengthNotEqual!void {
     const T = @TypeOf(dst);
     switch (@typeInfo(T)) {
@@ -69,8 +77,14 @@ pub fn fillWithBytes(dst: anytype, src: []const u8) LengthNotEqual!void {
     }
 }
 
-/// fill a slice of u8 with something
-pub fn fillBytesWithStruct(dst: []u8, src: anytype) LengthNotEqual!void {
+/// fill a slice of bytes (`u8`) with a reference of type `U` as `src`
+///
+/// Note that the length of `dst` must be equal to the size of `U`,
+/// otherwise, it will return `LengthNotEqual`
+///
+///   - `dst`: a slice of bytes, whose length must be equal to the size of `U`
+///   - `src`: a reference of type `U`
+pub fn fillBytesWith(dst: []u8, src: anytype) LengthNotEqual!void {
     const T = @TypeOf(src);
     switch (@typeInfo(T)) {
         .Pointer => {
@@ -727,7 +741,7 @@ pub fn main() !void {
                     .user_bmp = 0x3fff,
                 };
                 const data_buf = alloc.alloc(u8, @sizeOf(@TypeOf(payload))) catch @panic("OOM");
-                fillBytesWithStruct(data_buf, &payload) catch unreachable;
+                fillBytesWith(data_buf, &payload) catch unreachable;
                 const header = UsbPack{
                     .msgid = 0x0,
                     .reqid = bb.BB_GET_STATUS,

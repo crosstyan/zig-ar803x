@@ -650,9 +650,11 @@ pub fn main() !void {
         printEndpoints(dev.desc().idVendor, dev.desc().idProduct, dev.endpoints);
         dev.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
         if (!is_windows) {
-            ret = usb.libusb_set_auto_detach_kernel_driver(dev.hdl(), 1);
+            // https://libusb.sourceforge.io/api-1.0/group__libusb__dev.html#gac35b26fef01271eba65c60b2b3ce1cbf
+            ret = usb.libusb_set_auto_detach_kernel_driver(dev.mutHdl(), 1);
             if (ret != 0) {
                 dev.withLogger(logz.err())
+                    .int("code", ret)
                     .string("err", "failed to set auto detach kernel driver")
                     .log();
             }
@@ -660,6 +662,7 @@ pub fn main() !void {
         ret = usb.libusb_claim_interface(dev.mutHdl(), 0);
         if (ret != 0) {
             dev.withLogger(logz.err())
+                .int("code", ret)
                 .string("err", "failed to claim interface")
                 .log();
         }

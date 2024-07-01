@@ -16,6 +16,7 @@
         "pointee",
         "reqid",
         "struct",
+        "timeval",
         "unmarshal",
         "usbpack",
         "usize",

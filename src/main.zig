@@ -98,6 +98,39 @@ pub fn fillBytesWith(dst: []u8, src: anytype) LengthNotEqual!void {
     }
 }
 
+const is_windows = builtin.os.tag == .windows;
+
+// borrowed from
+// https://git.sr.ht/~delitako/nyoomcat/tree/main/item/src/main.zig#L28
+//
+// https://www.reddit.com/r/Zig/comments/wviq36/how_to_catch_signals_at_least_sigint/
+// https://www.reddit.com/r/Zig/comments/11mr0r8/defer_errdefer_and_sigint_ctrlc/
+const win = if (is_windows) struct {
+    const k32 = std.os.windows.kernel32;
+
+    const HANDLE = std.os.windows.HANDLE;
+    const WINAPI = std.os.windows.WINAPI;
+    const DWORD = std.os.windows.DWORD;
+    const BufInfo = std.os.windows.CONSOLE_SCREEN_BUFFER_INFO;
+    /// ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    const vt_flag = 0x0004;
+    /// ENABLE_ECHO_INPUT
+    /// typed so that its bitwise complement can be found
+    /// (bit operations are not allowed on comptime_int values)
+    const echo_input_flag: DWORD = 0x0004;
+    const stdin_handle_id = std.os.windows.STD_INPUT_HANDLE;
+    const stderr_handle_id = std.os.windows.STD_ERROR_HANDLE;
+
+    // https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/signal
+    extern "c" fn signal(sig: c_int, func: *const fn (c_int, c_int) callconv(WINAPI) void) callconv(.C) *anyopaque;
+
+    // Missing from std.os.windows.kernel32 for some reason
+    extern "kernel32" fn SetConsoleMode(
+        console: HANDLE,
+        mode: DWORD,
+    ) callconv(WINAPI) std.os.windows.BOOL;
+} else void;
+
 const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
     .thread_safe = true,
 });
@@ -580,18 +613,15 @@ pub fn transferStatusFromInt(status: c_uint) BadEnum!TransferStatus {
 }
 
 pub fn main() !void {
-    // https://libusb.sourceforge.io/api-1.0/libusb_contexts.html
-    var gpa = std.heap.GeneralPurposeAllocator(.{
-        .thread_safe = true,
+    // Use a separate allocator for logz
+    var logz_gpa = std.heap.GeneralPurposeAllocator(.{
+        .thread_safe = false,
+        .safety = false,
     }){};
-    const alloc = gpa.allocator();
     defer {
-        const chk = gpa.deinit();
-        if (chk != .ok) {
-            std.debug.print("GPA thinks there are memory leaks\n", .{});
-        }
+        _ = logz_gpa.deinit();
     }
-    try logz.setup(alloc, .{
+    try logz.setup(logz_gpa.allocator(), .{
         .level = .Debug,
         .pool_size = 96,
         .buffer_size = 4096,
@@ -602,8 +632,20 @@ pub fn main() !void {
     });
     defer logz.deinit();
 
+    var gpa = std.heap.GeneralPurposeAllocator(.{
+        .thread_safe = true,
+    }){};
+    const alloc = gpa.allocator();
+    defer {
+        const chk = gpa.deinit();
+        if (chk != .ok) {
+            std.debug.print("GPA thinks there are memory leaks\n", .{});
+        }
+    }
+
     var ctx_: ?*usb.libusb_context = null;
     var ret: c_int = undefined;
+    // https://libusb.sourceforge.io/api-1.0/libusb_contexts.html
     ret = usb.libusb_init_context(&ctx_, null, 0);
     if (ret != 0) {
         return std.debug.panic("libusb_init_context failed: {}", .{ret});
@@ -638,7 +680,7 @@ pub fn main() !void {
         printStrDesc(dev.mutHdl(), dev.desc());
         printEndpoints(dev.desc().idVendor, dev.desc().idProduct, dev.endpoints);
         dev.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
-        if (builtin.os.tag != .windows) {
+        if (!is_windows) {
             ret = usb.libusb_set_auto_detach_kernel_driver(dev.hdl(), 1);
             if (ret != 0) {
                 dev.withLogger(logz.err())
@@ -822,17 +864,49 @@ pub fn main() !void {
         }
     }
 
+    const Sig = struct {
+        var flag = std.atomic.Value(bool).init(true);
+
+        pub fn int_handle_win(sig: c_int, sub: c_int) callconv(win.WINAPI) void {
+            logz.info()
+                .int("signal", sig)
+                .int("sub code", sub)
+                .string("action", "received signal").log();
+            flag.store(false, std.builtin.AtomicOrder.unordered);
+        }
+
+        pub fn int_handle(sig: c_int) callconv(.C) void {
+            logz.info().int("signal", sig).string("action", "received signal").log();
+            flag.store(false, std.builtin.AtomicOrder.unordered);
+        }
+
+        pub inline fn is_run() bool {
+            return flag.load(std.builtin.AtomicOrder.unordered);
+        }
+    };
+
+    if (is_windows) {
+        _ = win.signal(std.c.SIG.INT, Sig.int_handle_win);
+    } else {
+        // borrowed from
+        // https://git.sr.ht/~delitako/nyoomcat/tree/main/item/src/main.zig#L109
+        const act = std.posix.Sigaction{
+            .handler = Sig.int_handle,
+            .mask = std.posix.empty_sigset,
+            .flags = 0,
+            .restorer = null,
+        };
+        std.posix.sigaction(std.c.SIG.INT, &act, null) catch unreachable;
+    }
+
+    var tv = usb.timeval{
+        .tv_sec = 0,
+        .tv_usec = 3_000 * std.time.us_per_ms,
+    };
     // https://libusb.sourceforge.io/api-1.0/libusb_mtasync.html
     // https://stackoverflow.com/questions/45672717/how-to-force-a-libusb-event-so-that-libusb-handle-events-returns
     // https://libusb.sourceforge.io/api-1.0/group__libusb__poll.html
-    // https://www.reddit.com/r/Zig/comments/11mr0r8/defer_errdefer_and_sigint_ctrlc/
-    // https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/signal
-    // TODO: handle Ctrl+C (Unix is SIGINT, Windows is a different story)
-    while (true) {
-        ret = usb.libusb_handle_events(ctx);
-        if (ret != 0) {
-            logz.err().string("err", "failed to handle events").log();
-            break;
-        }
+    while (Sig.is_run()) {
+        _ = usb.libusb_handle_events_timeout_completed(ctx, &tv, null);
     }
 }

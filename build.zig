@@ -5,7 +5,9 @@ const bd = std.Build;
 const fs = std.fs;
 
 // only useful in Windows
-const VCPKG_ROOT_FALLBACK = "C:/vcpkg/";
+// If zls is not working, modify this to the correct path
+// since zls might not be able to get the correct environment variables
+const VCPKG_ROOT_FALLBACK = "C:/tool/vcpkg/";
 
 fn getVcpkgRoot(allocator: std.mem.Allocator) []const u8 {
     var env_map = std.process.getEnvMap(allocator) catch {

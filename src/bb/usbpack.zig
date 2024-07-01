@@ -30,7 +30,7 @@ pub const UsbPack = packed struct {
     /// data combines the `ptr` and `len` fields into a valid byte slice
     ///
     /// note that the actual ownership of the data is NOT transferred
-    pub fn data(self: Self) NoContent![]const u8 {
+    pub fn data(self: *const Self) NoContent![]const u8 {
         if (self.ptr == null or self.len == 0) {
             return error.NoContent;
         }
@@ -40,7 +40,7 @@ pub const UsbPack = packed struct {
     /// marshal packs the struct into a byte slice
     ///
     /// Please note that the returned slice is owned by the `alloc` allocator
-    pub fn marshal(self: Self, alloc: std.mem.Allocator) ![]u8 {
+    pub fn marshal(self: *const Self, alloc: std.mem.Allocator) ![]u8 {
         var list = std.ArrayList(u8).init(alloc);
         defer list.deinit();
         if (self.ptr != null and self.len > 0) {
@@ -108,7 +108,7 @@ pub const UsbPack = packed struct {
         return ret;
     }
 
-    pub fn dtor(self: Self, alloc: std.mem.Allocator) void {
+    pub fn dtor(self: *Self, alloc: std.mem.Allocator) void {
         if (self.data()) |s| {
             alloc.free(s);
         } else |_| {}

@@ -758,6 +758,7 @@ pub fn main() !void {
                     .user_bmp = 0x3fff,
                 };
                 const data_buf = alloc.alloc(u8, @sizeOf(@TypeOf(payload))) catch @panic("OOM");
+                defer alloc.free(data_buf);
                 fillBytesWith(data_buf, &payload) catch unreachable;
                 const header = UsbPack{
                     .msgid = 0x0,
@@ -766,7 +767,6 @@ pub fn main() !void {
                     .ptr = data_buf.ptr,
                     .len = @intCast(data_buf.len),
                 };
-                defer header.dtor(l_alloc);
                 const tx_buffer = header.marshal(l_alloc) catch @panic("OOM");
                 cb.buffer = tx_buffer;
                 usb.libusb_fill_bulk_transfer(

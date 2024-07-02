@@ -861,7 +861,7 @@ pub fn main() !void {
             return 0;
         }
 
-        pub fn int_handle(sig: c_int) callconv(.C) void {
+        pub fn int_handle(sig: i32) callconv(.C) void {
             if (sig == std.c.SIG.INT) {
                 logz.info()
                     .int("signal", sig)
@@ -882,10 +882,9 @@ pub fn main() !void {
         // borrowed from
         // https://git.sr.ht/~delitako/nyoomcat/tree/main/item/src/main.zig#L109
         const act = std.posix.Sigaction{
-            .handler = Sig.int_handle,
+            .handler = .{ .handler = Sig.int_handle },
             .mask = std.posix.empty_sigset,
             .flags = 0,
-            .restorer = null,
         };
         std.posix.sigaction(std.c.SIG.INT, &act, null) catch unreachable;
     }

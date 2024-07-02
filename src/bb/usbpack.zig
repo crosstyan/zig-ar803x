@@ -37,7 +37,7 @@ pub const UsbPack = packed struct {
     /// note that the actual ownership of the data is NOT transferred
     pub fn data(self: *const Self) NoContent![]const u8 {
         if (self.ptr == null or self.len == 0) {
-            return error.NoContent;
+            return NoContent.NoContent;
         }
         return self.ptr.?[0..self.len];
     }

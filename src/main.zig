@@ -69,7 +69,7 @@ pub fn fillWithBytes(dst: anytype, src: []const u8) LengthNotEqual!void {
             }
             const sdst: []u8 = @constCast(anytype2Slice(dst));
             if (sdst.len != src.len) {
-                return error.LengthNotEqual;
+                return LengthNotEqual.LengthNotEqual;
             }
             @memcpy(sdst, src);
         },
@@ -90,7 +90,7 @@ pub fn fillBytesWith(dst: []u8, src: anytype) LengthNotEqual!void {
         .Pointer => {
             const s = anytype2Slice(src);
             if (dst.len != s.len) {
-                return error.LengthNotEqual;
+                return LengthNotEqual.LengthNotEqual;
             }
             @memcpy(dst, s);
         },
@@ -484,7 +484,7 @@ const Endpoint = struct {
                 const r = switch (dir) {
                     usb.LIBUSB_ENDPOINT_IN => Direction.in,
                     usb.LIBUSB_ENDPOINT_OUT => Direction.out,
-                    else => return AppError.BadEnum,
+                    else => return BadEnum.BadEnum,
                 };
                 return r;
             }
@@ -494,7 +494,7 @@ const Endpoint = struct {
                     usb.LIBUSB_TRANSFER_TYPE_ISOCHRONOUS => TransferType.isochronous,
                     usb.LIBUSB_TRANSFER_TYPE_BULK => TransferType.bulk,
                     usb.LIBUSB_TRANSFER_TYPE_INTERRUPT => TransferType.interrupt,
-                    else => return AppError.BadEnum,
+                    else => return BadEnum.BadEnum,
                 };
                 return r;
             }
@@ -632,7 +632,7 @@ pub fn transferStatusFromInt(status: c_uint) BadEnum!TransferStatus {
         usb.LIBUSB_TRANSFER_STALL => TransferStatus.stall,
         usb.LIBUSB_TRANSFER_NO_DEVICE => TransferStatus.no_device,
         usb.LIBUSB_TRANSFER_OVERFLOW => TransferStatus.overflow,
-        else => return AppError.BadEnum,
+        else => return BadEnum.BadEnum,
     };
 }
 

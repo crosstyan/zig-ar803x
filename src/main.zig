@@ -104,15 +104,32 @@ const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
     .thread_safe = true,
 });
 
+/// Transfer is a wrapper of `libusb_transfer`
+/// but with a closure and a closure destructor
+const Transfer = struct {
+    self: *usb.libusb_transfer,
+    closure: ?*anyopaque,
+    closure_dtor: ?*const fn (*anyopaque) void,
+
+    pub fn dtor(self: *@This()) void {
+        if (self.closure_dtor) |free| {
+            if (self.closure) |ptr| {
+                free(ptr);
+            }
+        }
+        usb.libusb_free_transfer(self.self);
+    }
+};
+
 // arto specific context
 // like network, transfer, etc.
 const ArtoContext = struct {
-    tx_transfer: *usb.libusb_transfer,
-    rx_transfer: *usb.libusb_transfer,
+    tx_transfer: Transfer,
+    rx_transfer: Transfer,
 
     pub fn dtor(self: *@This()) void {
-        usb.libusb_free_transfer(self.rx_transfer);
-        usb.libusb_free_transfer(self.tx_transfer);
+        self.tx_transfer.dtor();
+        self.rx_transfer.dtor();
     }
 };
 
@@ -155,6 +172,9 @@ const DeviceContext = struct {
 
     pub fn dtor(self: *Self) void {
         self.core.dtor();
+        self.allocator().free(self.ports);
+        self.allocator().free(self.endpoints);
+        self.arto.dtor();
         const chk = self.gpa.deinit();
         if (chk != .ok) {
             std.debug.print("GPA thinks there are memory leaks when destroying device bus {} port {}\n", .{ self.bus, self.port });
@@ -379,9 +399,8 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         }
 
         var gpa = DeviceGPA{};
-        const alloc = gpa.allocator();
-        const heap_ports = alloc.alloc(u8, d.ports.len) catch @panic("OOM");
-        const eps = getEndpoints(alloc, d.dev, &desc);
+        const heap_ports = gpa.allocator().alloc(u8, d.ports.len) catch @panic("OOM");
+        const eps = getEndpoints(gpa.allocator(), d.dev, &desc);
         @memcpy(heap_ports, d.ports);
         var dc = DeviceContext{
             .gpa = gpa,
@@ -397,13 +416,21 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             .arto = undefined,
         };
         const tx_transfer = usb.libusb_alloc_transfer(0);
-        dc.arto.tx_transfer = tx_transfer;
         const rx_transfer = usb.libusb_alloc_transfer(0);
-        dc.arto.rx_transfer = rx_transfer;
         if (tx_transfer == null or rx_transfer == null) {
             dc.withLogger(logz.err()).string("err", "failed to allocate transfer").log();
             continue;
         }
+        dc.arto.tx_transfer = Transfer{
+            .self = tx_transfer,
+            .closure = null,
+            .closure_dtor = null,
+        };
+        dc.arto.rx_transfer = Transfer{
+            .self = rx_transfer,
+            .closure = null,
+            .closure_dtor = null,
+        };
         ctx_list.append(dc) catch @panic("OOM");
         dc.withLogger(logz.info()).string("action", "added").log();
     }
@@ -702,13 +729,21 @@ pub fn main() !void {
                 buffer: []u8,
                 endpoint: Endpoint,
 
+                pub fn dtor(self: *@This()) void {
+                    self.alloc.free(self.buffer);
+                    self.alloc.destroy(self);
+                }
+
+                /// return a function pointer to the destructor
+                pub fn void_dtor() *const fn (*anyopaque) void {
+                    return @ptrCast(&@This().dtor);
+                }
+
                 pub fn tx(trans: [*c]usb.libusb_transfer) callconv(.C) void {
                     if (trans == null) {
                         return;
                     }
                     const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
-                    defer self.alloc.destroy(self);
-                    defer self.alloc.free(self.buffer);
                     const status = transferStatusFromInt(trans.*.status) catch unreachable;
                     var lg = self.dev.withLogger(logz.info());
                     lg = self.endpoint.withLogger(lg);
@@ -741,6 +776,7 @@ pub fn main() !void {
                                 .int("msgid", val.msgid)
                                 .int("sta", val.sta);
                             if (val.data()) |data| {
+                                defer self.alloc.free(data);
                                 lg = lg.int("len", data.len);
                                 if (val.reqid == bb.BB_GET_STATUS) {
                                     var st: bb.bb_get_status_out_t = undefined;
@@ -800,7 +836,7 @@ pub fn main() !void {
                 const tx_buffer = header.marshal(l_alloc) catch @panic("OOM");
                 cb.buffer = tx_buffer;
                 usb.libusb_fill_bulk_transfer(
-                    dev.arto.tx_transfer,
+                    dev.arto.tx_transfer.self,
                     dev.mutHdl(),
                     ep.addr,
                     tx_buffer.ptr,
@@ -812,7 +848,9 @@ pub fn main() !void {
                 var lg = dev.withLogger(logz.info());
                 lg = ep.withLogger(lg).string("action", "submitting transfer");
                 lg.log();
-                ret = usb.libusb_submit_transfer(dev.arto.tx_transfer);
+                dev.arto.tx_transfer.closure = cb;
+                dev.arto.tx_transfer.closure_dtor = transfer_callback.void_dtor();
+                ret = usb.libusb_submit_transfer(dev.arto.tx_transfer.self);
                 if (ret != 0) {
                     lg = dev.withLogger(logz.err());
                     lg = ep.withLogger(lg).int("code", ret).string("what", "failed to submit transfer");
@@ -829,7 +867,7 @@ pub fn main() !void {
                 // timeout 0
                 // callback won't be called because of timeout
                 usb.libusb_fill_bulk_transfer(
-                    dev.arto.rx_transfer,
+                    dev.arto.rx_transfer.self,
                     dev.mutHdl(),
                     ep.addr,
                     rx_buffer.ptr,
@@ -841,8 +879,10 @@ pub fn main() !void {
                 var lg = dev.withLogger(logz.info());
                 lg = ep.withLogger(lg).string("action", "submitting transfer");
                 lg.log();
+                dev.arto.rx_transfer.closure = cb;
+                dev.arto.rx_transfer.closure_dtor = transfer_callback.void_dtor();
 
-                ret = usb.libusb_submit_transfer(dev.arto.rx_transfer);
+                ret = usb.libusb_submit_transfer(dev.arto.rx_transfer.self);
                 if (ret != 0) {
                     lg = dev.withLogger(logz.err());
                     lg = ep.withLogger(lg).int("code", ret).string("what", "failed to submit transfer");

@@ -5,6 +5,7 @@
     ],
     "cSpell.words": [
         "alloc",
+        "anyopaque",
         "anytype",
         "callconv",
         "deinit",

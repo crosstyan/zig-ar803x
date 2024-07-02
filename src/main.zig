@@ -106,6 +106,7 @@ const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
 
 /// Transfer is a wrapper of `libusb_transfer`
 /// but with a closure and a closure destructor
+/// TODO: give a lock to transfer to indicate it's in use
 const Transfer = struct {
     self: *usb.libusb_transfer,
     closure: ?*anyopaque,
@@ -768,20 +769,20 @@ pub fn main() !void {
                         .string("action", "receive")
                         .log();
                     if (rx_buf.len > 0) {
-                        const pkt = UsbPack.unmarshal(self.alloc, rx_buf);
-                        if (pkt) |val| {
+                        var pkt_ = UsbPack.unmarshal(self.alloc, rx_buf);
+                        if (pkt_) |*pkt| {
+                            defer pkt.dtor(self.alloc);
                             lg = self.dev.withLogger(logz.info());
                             lg = self.endpoint.withLogger(lg);
-                            lg = lg.int("reqid", val.reqid)
-                                .int("msgid", val.msgid)
-                                .int("sta", val.sta);
-                            if (val.data()) |data| {
-                                defer self.alloc.free(data);
+                            lg = pkt.withLogger(lg);
+                            lg.log();
+                            if (pkt.data()) |data| {
+                                lg = pkt.withLogger(logz.info());
                                 lg = lg.int("len", data.len);
-                                if (val.reqid == bb.BB_GET_STATUS) {
+                                // unmarshal it as `bb_get_status_out_t`
+                                if (pkt.reqid == bb.BB_GET_STATUS) {
                                     var st: bb.bb_get_status_out_t = undefined;
                                     if (fillWithBytes(&st, data)) |_| {
-                                        lg = self.dev.withLogger(logz.info());
                                         lg.fmt("status", "{any}", .{st}).log();
                                     } else |e| {
                                         lg = self.dev.withLogger(logz.err());
@@ -792,7 +793,6 @@ pub fn main() !void {
                                     }
                                 }
                             } else |_| {}
-                            lg.log();
                         } else |err| {
                             // failed to unmarshal
                             lg = self.dev.withLogger(logz.err());

@@ -1,4 +1,5 @@
 const std = @import("std");
+const logz = @import("logz");
 
 pub fn xorCheck(buf: []const u8) u8 {
     var xor: u8 = 0xff;
@@ -26,6 +27,10 @@ pub const UsbPack = packed struct {
     const Self = @This();
     // usbpack 的固定长度
     const fixedPackBase = 1 + 4 + 4 + 4 + 4 + 1 + 1;
+
+    pub fn withLogger(self: *const Self, log: logz.Logger) logz.Logger {
+        return log.int("reqid", self.reqid).int("msgid", self.msgid).int("sta", self.sta);
+    }
 
     /// data combines the `ptr` and `len` fields into a valid byte slice
     ///

@@ -1,12 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const logz = @import("logz");
-const log = std.log;
 const usb = @cImport({
     @cInclude("libusb.h");
 });
 const bb = @import("bb/c.zig");
 const UsbPack = @import("bb/usbpack.zig").UsbPack;
+const utils = @import("utils.zig");
+const BadEnum = utils.BadEnum;
+const Mutex = std.Thread.Mutex;
 
 const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
@@ -17,8 +19,6 @@ const AppError = error{
     BadPortNumbers,
     BadEnum,
 };
-const BadEnum = error{BadEnum};
-const LengthNotEqual = error{LengthNotEqual};
 
 /// the essential part of the USB device.
 /// you could retrieve everything else from this
@@ -34,70 +34,6 @@ const DeviceHandles = struct {
     }
 };
 
-/// cast a reference of type `T` to a slice of bytes (`u8`)
-///
-///   - `src`: a reference of type `T`
-///
-/// returns a slice of bytes, whose length is equal to the size of `T`
-pub fn anytype2Slice(src: anytype) []const u8 {
-    const P = @TypeOf(src);
-    switch (@typeInfo(P)) {
-        .Pointer => {
-            const T = @typeInfo(P).Pointer.child;
-            const size = @sizeOf(T);
-            const ptr: [*]const u8 = @ptrCast(src);
-            return ptr[0..size];
-        },
-        else => @compileError("`src` must be a pointer type, found `" ++ @typeName(P) ++ "`"),
-    }
-}
-
-/// fill a reference of type `T` as `dst` with with content of `src`
-///
-/// Note that the length of `src` slice must be equal to the size of `T`,
-/// otherwise, it will return `LengthNotEqual`
-///
-///   - `dst`: a *mutable* reference of type `T`
-///   - `src`: a slice of bytes, whose length must be equal to the size of `T`
-pub fn fillWithBytes(dst: anytype, src: []const u8) LengthNotEqual!void {
-    const P = @TypeOf(dst);
-    switch (@typeInfo(P)) {
-        .Pointer => {
-            const is_const = @typeInfo(P).Pointer.is_const;
-            if (is_const) {
-                @compileError("`dst` must be a mutable pointer type, found `" ++ @typeName(P) ++ "`");
-            }
-            const sdst: []u8 = @constCast(anytype2Slice(dst));
-            if (sdst.len != src.len) {
-                return LengthNotEqual.LengthNotEqual;
-            }
-            @memcpy(sdst, src);
-        },
-        else => @compileError("`dst` must be a pointer type, found `" ++ @typeName(P) ++ "`"),
-    }
-}
-
-/// fill a slice of bytes (`u8`) with a reference of type `T` as `src`
-///
-/// Note that the length of `dst` must be equal to the size of `T`,
-/// otherwise, it will return `LengthNotEqual`
-///
-///   - `dst`: a slice of bytes, whose length must be equal to the size of `T`
-///   - `src`: a reference of type `T`
-pub fn fillBytesWith(dst: []u8, src: anytype) LengthNotEqual!void {
-    const P = @TypeOf(src);
-    switch (@typeInfo(P)) {
-        .Pointer => {
-            const s = anytype2Slice(src);
-            if (dst.len != s.len) {
-                return LengthNotEqual.LengthNotEqual;
-            }
-            @memcpy(dst, s);
-        },
-        else => @compileError("`src` must be a pointer type, get `" ++ @typeName(P) ++ "`"),
-    }
-}
-
 /// Select every possible slot (14 slot?).
 /// Anyway it's magic a number.
 ///
@@ -111,11 +47,13 @@ const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
 
 /// Transfer is a wrapper of `libusb_transfer`
 /// but with a closure and a closure destructor
-/// TODO: give a lock to transfer to indicate it's in use
 const Transfer = struct {
     self: *usb.libusb_transfer,
-    closure: ?*anyopaque,
-    closure_dtor: ?*const fn (*anyopaque) void,
+    closure: ?*anyopaque = null,
+    closure_dtor: ?*const fn (*anyopaque) void = null,
+    /// lock when `libusb_submit_transfer` is called.
+    /// callback SHOULD be responsible for unlocking it.
+    mutex: Mutex = Mutex{},
 
     pub fn dtor(self: *@This()) void {
         if (self.closure_dtor) |free| {
@@ -199,8 +137,8 @@ const DeviceContext = struct {
     /// hash the device by bus, port, and ports
     pub fn xxhash(self: *const Self) u32 {
         var h = std.hash.XxHash32.init(XXHASH_SEED);
-        h.update(anytype2Slice(&self.bus));
-        h.update(anytype2Slice(&self.port));
+        h.update(utils.anytype2Slice(&self.bus));
+        h.update(utils.anytype2Slice(&self.port));
         h.update(self.ports);
         return h.final();
     }
@@ -276,8 +214,8 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         /// hash the device by bus, port, and ports
         pub fn xxhash(self: *const @This()) u32 {
             var h = std.hash.XxHash32.init(XXHASH_SEED);
-            h.update(anytype2Slice(&self.bus));
-            h.update(anytype2Slice(&self.port));
+            h.update(utils.anytype2Slice(&self.bus));
+            h.update(utils.anytype2Slice(&self.port));
             h.update(self.ports);
             return h.final();
         }
@@ -429,13 +367,9 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         }
         dc.arto.tx_transfer = Transfer{
             .self = tx_transfer,
-            .closure = null,
-            .closure_dtor = null,
         };
         dc.arto.rx_transfer = Transfer{
             .self = rx_transfer,
-            .closure = null,
-            .closure_dtor = null,
         };
         ctx_list.append(dc) catch @panic("OOM");
         dc.withLogger(logz.info()).string("action", "added").log();
@@ -728,9 +662,10 @@ pub fn main() !void {
             // needs to be done.
             const transfer_callback = struct {
                 alloc: std.mem.Allocator,
-                /// the lambda DOES NOT own the context,
-                /// only as a reference
+                /// reference, not OWNED
                 dev: *const DeviceContext,
+                /// reference, not OWNED
+                transfer: *Transfer,
                 /// owned by `alloc`
                 buffer: []u8,
                 endpoint: Endpoint,
@@ -750,6 +685,7 @@ pub fn main() !void {
                         return;
                     }
                     const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
+                    self.transfer.mutex.unlock();
                     const status = transferStatusFromInt(trans.*.status) catch unreachable;
                     var lg = self.dev.withLogger(logz.info());
                     lg = self.endpoint.withLogger(lg);
@@ -767,6 +703,7 @@ pub fn main() !void {
                     const status = transferStatusFromInt(trans.*.status) catch unreachable;
                     const len: usize = @intCast(trans.*.actual_length);
                     const rx_buf: []const u8 = self.buffer[0..len];
+                    self.transfer.mutex.unlock();
                     var lg = self.dev.withLogger(logz.info());
                     lg = self.endpoint.withLogger(lg);
                     lg.string("status", @tagName(status))
@@ -787,7 +724,7 @@ pub fn main() !void {
                                 // unmarshal it as `bb_get_status_out_t`
                                 if (pkt.reqid == bb.BB_GET_STATUS) {
                                     var st: bb.bb_get_status_out_t = undefined;
-                                    if (fillWithBytes(&st, data)) |_| {
+                                    if (utils.fillWithBytes(&st, data)) |_| {
                                         lg.fmt("status", "{any}", .{st}).log();
                                     } else |e| {
                                         lg = self.dev.withLogger(logz.err());
@@ -817,20 +754,23 @@ pub fn main() !void {
                             .string("err", "failed to submit transfer")
                             .log();
                     }
+                    self.transfer.mutex.lock();
                 }
             };
             if (ep.direction == Direction.out and ep.transferType == TransferType.bulk) {
                 const l_alloc = alloc;
                 var cb = l_alloc.create(transfer_callback) catch @panic("OOM");
+                var transfer: *Transfer = &dev.arto.tx_transfer;
                 cb.alloc = l_alloc;
                 cb.dev = dev;
+                cb.transfer = transfer;
                 cb.endpoint = ep.*;
                 const payload = bb.bb_get_status_in_t{
                     .user_bmp = SLOT_BIT_MAP_MAX,
                 };
                 const data_buf = alloc.alloc(u8, @sizeOf(@TypeOf(payload))) catch @panic("OOM");
                 defer alloc.free(data_buf);
-                fillBytesWith(data_buf, &payload) catch unreachable;
+                utils.fillBytesWith(data_buf, &payload) catch unreachable;
                 const header = UsbPack{
                     .msgid = 0x0,
                     .reqid = bb.BB_GET_STATUS,
@@ -841,7 +781,7 @@ pub fn main() !void {
                 const tx_buffer = header.marshal(l_alloc) catch @panic("OOM");
                 cb.buffer = tx_buffer;
                 usb.libusb_fill_bulk_transfer(
-                    dev.arto.tx_transfer.self,
+                    transfer.self,
                     dev.mutHdl(),
                     ep.addr,
                     tx_buffer.ptr,
@@ -853,26 +793,29 @@ pub fn main() !void {
                 var lg = dev.withLogger(logz.info());
                 lg = ep.withLogger(lg).string("action", "submitting transfer");
                 lg.log();
-                dev.arto.tx_transfer.closure = cb;
-                dev.arto.tx_transfer.closure_dtor = transfer_callback.void_dtor();
-                ret = usb.libusb_submit_transfer(dev.arto.tx_transfer.self);
+                transfer.closure = cb;
+                transfer.closure_dtor = transfer_callback.void_dtor();
+                ret = usb.libusb_submit_transfer(transfer.self);
                 if (ret != 0) {
                     lg = dev.withLogger(logz.err());
                     lg = ep.withLogger(lg).int("code", ret).string("what", "failed to submit transfer");
                     lg.log();
                 }
+                transfer.mutex.lock();
             } else if (ep.direction == Direction.in and ep.transferType == TransferType.bulk) {
                 const l_alloc = alloc;
                 var cb = l_alloc.create(transfer_callback) catch @panic("OOM");
+                var transfer: *Transfer = &dev.arto.rx_transfer;
                 cb.alloc = l_alloc;
                 cb.dev = dev;
+                cb.transfer = transfer;
                 cb.endpoint = ep.*;
                 const rx_buffer = l_alloc.alloc(u8, ep.maxPacketSize) catch @panic("OOM");
                 cb.buffer = rx_buffer;
                 // timeout 0
                 // callback won't be called because of timeout
                 usb.libusb_fill_bulk_transfer(
-                    dev.arto.rx_transfer.self,
+                    transfer.self,
                     dev.mutHdl(),
                     ep.addr,
                     rx_buffer.ptr,
@@ -884,15 +827,16 @@ pub fn main() !void {
                 var lg = dev.withLogger(logz.info());
                 lg = ep.withLogger(lg).string("action", "submitting transfer");
                 lg.log();
-                dev.arto.rx_transfer.closure = cb;
-                dev.arto.rx_transfer.closure_dtor = transfer_callback.void_dtor();
+                transfer.closure = cb;
+                transfer.closure_dtor = transfer_callback.void_dtor();
 
-                ret = usb.libusb_submit_transfer(dev.arto.rx_transfer.self);
+                ret = usb.libusb_submit_transfer(transfer.self);
                 if (ret != 0) {
                     lg = dev.withLogger(logz.err());
                     lg = ep.withLogger(lg).int("code", ret).string("what", "failed to submit transfer");
                     lg.log();
                 }
+                transfer.mutex.lock();
             }
         }
     }

@@ -53,6 +53,10 @@ const Transfer = struct {
     closure_dtor: ?*const fn (*anyopaque) void = null,
     /// lock when `libusb_submit_transfer` is called.
     /// callback SHOULD be responsible for unlocking it.
+    ///
+    /// This mutex is mainly used in TX transfer.
+    /// For RX transfer, the event loop is always polling and
+    /// the transfer will be restarted after the callback is called.
     mutex: Mutex = Mutex{},
 
     pub fn dtor(self: *@This()) void {
@@ -682,7 +686,7 @@ pub fn main() !void {
 
                 pub fn tx(trans: [*c]usb.libusb_transfer) callconv(.C) void {
                     if (trans == null) {
-                        return;
+                        @panic("null transfer");
                     }
                     const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
                     self.transfer.mutex.unlock();
@@ -691,13 +695,13 @@ pub fn main() !void {
                     lg = self.endpoint.withLogger(lg);
                     lg.string("status", @tagName(status))
                         .int("flags", trans.*.flags)
-                        .string("action", "transfer completed")
+                        .string("action", "transmit")
                         .log();
                 }
 
                 pub fn rx(trans: [*c]usb.libusb_transfer) callconv(.C) void {
                     if (trans == null) {
-                        return;
+                        @panic("null transfer");
                     }
                     const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
                     const status = transferStatusFromInt(trans.*.status) catch unreachable;
@@ -747,14 +751,26 @@ pub fn main() !void {
                     }
                     // keeps receiving
                     const err = usb.libusb_submit_transfer(trans);
-                    if (err != 0) {
-                        lg = self.dev.withLogger(logz.err());
-                        lg = self.endpoint.withLogger(lg);
-                        lg.int("code", err)
-                            .string("err", "failed to submit transfer")
-                            .log();
+                    lg = self.dev.withLogger(logz.err());
+                    lg = self.endpoint.withLogger(lg);
+                    switch (err) {
+                        0 => self.transfer.mutex.lock(),
+                        usb.LIBUSB_ERROR_NO_DEVICE => {
+                            // upstream should monitor the device list
+                            // and handle the device removal
+                            lg.string("err", "no device").log();
+                        },
+                        usb.LIBUSB_ERROR_BUSY => {
+                            // should not happen, unless the transfer is be reused,
+                            // which should NOT happen with lock
+                            lg.string("err", "transfer is busy").log();
+                            @panic("transfer is busy");
+                        },
+                        else => {
+                            lg.int("code", err).string("err", "failed to submit transfer").log();
+                            @panic("failed to submit transfer");
+                        },
                     }
-                    self.transfer.mutex.lock();
                 }
             };
             if (ep.direction == Direction.out and ep.transferType == TransferType.bulk) {
@@ -796,12 +812,15 @@ pub fn main() !void {
                 transfer.closure = cb;
                 transfer.closure_dtor = transfer_callback.void_dtor();
                 ret = usb.libusb_submit_transfer(transfer.self);
-                if (ret != 0) {
-                    lg = dev.withLogger(logz.err());
-                    lg = ep.withLogger(lg).int("code", ret).string("what", "failed to submit transfer");
-                    lg.log();
+                switch (ret) {
+                    0 => transfer.mutex.lock(),
+                    else => {
+                        lg = dev.withLogger(logz.err());
+                        lg = ep.withLogger(lg);
+                        lg.int("code", ret).string("what", "failed to submit transfer").log();
+                        @panic("failed to submit transfer");
+                    },
                 }
-                transfer.mutex.lock();
             } else if (ep.direction == Direction.in and ep.transferType == TransferType.bulk) {
                 const l_alloc = alloc;
                 var cb = l_alloc.create(transfer_callback) catch @panic("OOM");
@@ -831,12 +850,15 @@ pub fn main() !void {
                 transfer.closure_dtor = transfer_callback.void_dtor();
 
                 ret = usb.libusb_submit_transfer(transfer.self);
-                if (ret != 0) {
-                    lg = dev.withLogger(logz.err());
-                    lg = ep.withLogger(lg).int("code", ret).string("what", "failed to submit transfer");
-                    lg.log();
+                switch (ret) {
+                    0 => transfer.mutex.lock(),
+                    else => {
+                        lg = dev.withLogger(logz.err());
+                        lg = ep.withLogger(lg);
+                        lg.int("code", ret).string("what", "failed to submit transfer").log();
+                        @panic("failed to submit transfer");
+                    },
                 }
-                transfer.mutex.lock();
             }
         }
     }

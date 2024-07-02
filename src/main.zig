@@ -359,8 +359,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         var desc: usb.libusb_device_descriptor = undefined;
         ret = usb.libusb_get_device_descriptor(d.dev, &desc);
         if (ret != 0) {
-            const tmp = logz.err().string("err", "failed to get device descriptor");
-            d.withLogger(tmp).log();
+            d.withLogger(logz.err()).string("err", "failed to get device descriptor").log();
             continue;
         }
 
@@ -382,8 +381,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             .endpoints = eps,
         };
         ctx_list.append(dc) catch @panic("OOM");
-        const tmp = logz.info().string("action", "added");
-        dc.withLogger(tmp).log();
+        dc.withLogger(logz.info()).string("action", "added").log();
     }
 }
 

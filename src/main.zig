@@ -98,6 +98,11 @@ pub fn fillBytesWith(dst: []u8, src: anytype) LengthNotEqual!void {
     }
 }
 
+/// Select every possible slot (14 slot?).
+/// Anyway it's magic a number.
+///
+/// `0b0011_1111_1111_1111`
+const SLOT_BIT_MAP_MAX = 0x3fff;
 const is_windows = builtin.os.tag == .windows;
 
 const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
@@ -821,7 +826,7 @@ pub fn main() !void {
                 cb.dev = dev;
                 cb.endpoint = ep.*;
                 const payload = bb.bb_get_status_in_t{
-                    .user_bmp = 0x3fff,
+                    .user_bmp = SLOT_BIT_MAP_MAX,
                 };
                 const data_buf = alloc.alloc(u8, @sizeOf(@TypeOf(payload))) catch @panic("OOM");
                 defer alloc.free(data_buf);

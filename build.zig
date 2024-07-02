@@ -64,7 +64,6 @@ pub fn build(b: *std.Build) void {
         // where the `.dll` file is located
         const usb_bin_dir = b.pathJoin(&.{ libusb_prefix, "bin/" });
         const usb_include_dir = b.pathJoin(&.{ libusb_prefix, "include/libusb-1.0" });
-        // const usb_pkgconfig_dir = usb_lib_prefix ++ "pkgconfig/";
         exe.addLibraryPath(bd.LazyPath{ .cwd_relative = usb_lib_dir });
         exe.addIncludePath(bd.LazyPath{ .cwd_relative = usb_include_dir });
         exe.linkSystemLibrary("c");

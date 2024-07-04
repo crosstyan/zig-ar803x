@@ -8,7 +8,7 @@ const bb = @import("bb/c.zig");
 const UsbPack = @import("bb/usbpack.zig").UsbPack;
 const utils = @import("utils.zig");
 const BadEnum = utils.BadEnum;
-const Mutex = std.Thread.Mutex;
+const RwLock = std.Thread.RwLock;
 const PriorityQueue = std.PriorityQueue;
 
 const ARTO_RTOS_VID: u16 = 0x1d6b;
@@ -146,7 +146,7 @@ const Transfer = struct {
     /// This mutex is mainly used in TX transfer.
     /// For RX transfer, the event loop is always polling and
     /// the transfer will be restarted after the callback is called.
-    mutex: Mutex,
+    lk: RwLock,
 
     pub fn dtor(self: *@This()) void {
         if (self.closure_dtor) |free| {
@@ -254,11 +254,11 @@ const DeviceContext = struct {
         }
         dc.arto.tx_transfer = Transfer{
             .self = tx_transfer,
-            .mutex = Mutex{},
+            .lk = RwLock{},
         };
         dc.arto.rx_transfer = Transfer{
             .self = rx_transfer,
-            .mutex = Mutex{},
+            .lk = RwLock{},
         };
         return dc;
     }
@@ -333,7 +333,7 @@ const DeviceContext = struct {
         transfer.closure_dtor = transfer_callback.void_dtor();
         ret = usb.libusb_submit_transfer(transfer.self);
         switch (ret) {
-            0 => transfer.mutex.lock(),
+            0 => transfer.lk.lockShared(),
             else => {
                 lg = self.withLogger(logz.err());
                 lg = ep.withLogger(lg);
@@ -374,7 +374,7 @@ const DeviceContext = struct {
 
         ret = usb.libusb_submit_transfer(transfer.self);
         switch (ret) {
-            0 => transfer.mutex.lock(),
+            0 => transfer.lk.lockShared(),
             else => {
                 lg = self.withLogger(logz.err());
                 lg = ep.withLogger(lg);
@@ -556,7 +556,6 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             d.withLogger(logz.err()).err(e).log();
             continue;
         };
-        errdefer dc.dtor();
         ctx_list.append(dc) catch @panic("OOM");
         dc.withLogger(logz.info()).string("action", "added").log();
     }
@@ -720,7 +719,7 @@ const transfer_callback = struct {
             @panic("null transfer");
         }
         const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
-        self.transfer.mutex.unlock();
+        self.transfer.lk.unlockShared();
         const status = transferStatusFromInt(trans.*.status) catch unreachable;
         var lg = self.dev.withLogger(logz.info());
         lg = self.endpoint.withLogger(lg);
@@ -738,7 +737,7 @@ const transfer_callback = struct {
         const status = transferStatusFromInt(trans.*.status) catch unreachable;
         const len: usize = @intCast(trans.*.actual_length);
         const rx_buf: []const u8 = self.buffer[0..len];
-        self.transfer.mutex.unlock();
+        self.transfer.lk.unlockShared();
         var lg = self.dev.withLogger(logz.info());
         lg = self.endpoint.withLogger(lg);
         lg.string("status", @tagName(status))
@@ -785,7 +784,7 @@ const transfer_callback = struct {
         lg = self.dev.withLogger(logz.err());
         lg = self.endpoint.withLogger(lg);
         switch (err) {
-            0 => self.transfer.mutex.lock(),
+            0 => self.transfer.lk.unlockShared(),
             usb.LIBUSB_ERROR_NO_DEVICE => {
                 // upstream should monitor the device list
                 // and handle the device removal

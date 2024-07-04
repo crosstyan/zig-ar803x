@@ -7,6 +7,7 @@
         "alloc",
         "anyopaque",
         "anytype",
+        "ARTO",
         "callconv",
         "deinit",
         "libusb",

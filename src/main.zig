@@ -18,7 +18,44 @@ const AppError = error{
     BadDescriptor,
     BadPortNumbers,
     BadEnum,
+    Unknown,
 };
+
+const LibUsbError = error{
+    IO,
+    InvalidParam,
+    Access,
+    NoDevice,
+    NotFound,
+    Busy,
+    Timeout,
+    Overflow,
+    Pipe,
+    Interrupted,
+    NoMem,
+    NotSupported,
+    Other,
+    Unknown,
+};
+
+pub fn libusb_error_2_set(err: c_int) LibUsbError {
+    return switch (err) {
+        usb.LIBUSB_ERROR_IO => LibUsbError.IO,
+        usb.LIBUSB_ERROR_INVALID_PARAM => LibUsbError.InvalidParam,
+        usb.LIBUSB_ERROR_ACCESS => LibUsbError.Access,
+        usb.LIBUSB_ERROR_NO_DEVICE => LibUsbError.NoDevice,
+        usb.LIBUSB_ERROR_NOT_FOUND => LibUsbError.NotFound,
+        usb.LIBUSB_ERROR_BUSY => LibUsbError.Busy,
+        usb.LIBUSB_ERROR_TIMEOUT => LibUsbError.Timeout,
+        usb.LIBUSB_ERROR_OVERFLOW => LibUsbError.Overflow,
+        usb.LIBUSB_ERROR_PIPE => LibUsbError.Pipe,
+        usb.LIBUSB_ERROR_INTERRUPTED => LibUsbError.Interrupted,
+        usb.LIBUSB_ERROR_NO_MEM => LibUsbError.NoMem,
+        usb.LIBUSB_ERROR_NOT_SUPPORTED => LibUsbError.NotSupported,
+        usb.LIBUSB_ERROR_OTHER => LibUsbError.Other,
+        else => LibUsbError.Unknown,
+    };
+}
 
 /// the essential part of the USB device.
 /// you could retrieve everything else from this
@@ -145,6 +182,134 @@ const DeviceContext = struct {
         h.update(utils.anytype2Slice(&self.port));
         h.update(self.ports);
         return h.final();
+    }
+
+    fn init_transfer_tx(self: *@This(), ep: *Endpoint) void {
+        var ret: c_int = undefined;
+        const alloc = self.allocator();
+        var cb = alloc.create(transfer_callback) catch @panic("OOM");
+        var transfer: *Transfer = &self.arto.tx_transfer;
+        cb.alloc = alloc;
+        cb.dev = self;
+        cb.transfer = transfer;
+        cb.endpoint = ep.*;
+        const payload = bb.bb_get_status_in_t{
+            .user_bmp = SLOT_BIT_MAP_MAX,
+        };
+        const data_buf = alloc.alloc(u8, @sizeOf(@TypeOf(payload))) catch @panic("OOM");
+        defer alloc.free(data_buf);
+        utils.fillBytesWith(data_buf, &payload) catch unreachable;
+        const header = UsbPack{
+            .msgid = 0x0,
+            .reqid = bb.BB_GET_STATUS,
+            .sta = 0x0,
+            .ptr = data_buf.ptr,
+            .len = @intCast(data_buf.len),
+        };
+        const tx_buffer = header.marshal(alloc) catch @panic("OOM");
+        cb.buffer = tx_buffer;
+        usb.libusb_fill_bulk_transfer(
+            transfer.self,
+            self.mutHdl(),
+            ep.addr,
+            tx_buffer.ptr,
+            @intCast(tx_buffer.len),
+            transfer_callback.tx,
+            cb,
+            1_000,
+        );
+        var lg = self.withLogger(logz.info());
+        lg = ep.withLogger(lg).string("action", "submitting transfer");
+        lg.log();
+        transfer.closure = cb;
+        transfer.closure_dtor = transfer_callback.void_dtor();
+        ret = usb.libusb_submit_transfer(transfer.self);
+        switch (ret) {
+            0 => transfer.mutex.lock(),
+            else => {
+                lg = self.withLogger(logz.err());
+                lg = ep.withLogger(lg);
+                lg.int("code", ret).string("what", "failed to submit transfer").log();
+                @panic("failed to submit transfer");
+            },
+        }
+    }
+
+    fn init_transfer_rx(self: *DeviceContext, ep: *Endpoint) void {
+        var ret: c_int = undefined;
+        const l_alloc = self.allocator();
+        var cb = l_alloc.create(transfer_callback) catch @panic("OOM");
+        var transfer: *Transfer = &self.arto.rx_transfer;
+        cb.alloc = l_alloc;
+        cb.dev = self;
+        cb.transfer = transfer;
+        cb.endpoint = ep.*;
+        const rx_buffer = l_alloc.alloc(u8, ep.maxPacketSize) catch @panic("OOM");
+        cb.buffer = rx_buffer;
+        // timeout 0
+        // callback won't be called because of timeout
+        usb.libusb_fill_bulk_transfer(
+            transfer.self,
+            self.mutHdl(),
+            ep.addr,
+            rx_buffer.ptr,
+            @intCast(rx_buffer.len),
+            transfer_callback.rx,
+            cb,
+            0,
+        );
+        var lg = self.withLogger(logz.info());
+        lg = ep.withLogger(lg).string("action", "submitting transfer");
+        lg.log();
+        transfer.closure = cb;
+        transfer.closure_dtor = transfer_callback.void_dtor();
+
+        ret = usb.libusb_submit_transfer(transfer.self);
+        switch (ret) {
+            0 => transfer.mutex.lock(),
+            else => {
+                lg = self.withLogger(logz.err());
+                lg = ep.withLogger(lg);
+                lg.int("code", ret).string("what", "failed to submit transfer").log();
+                @panic("failed to submit transfer");
+            },
+        }
+    }
+
+    fn init_endpoints(self: *@This()) void {
+        for (self.endpoints) |*ep| {
+            if (ep.direction == Direction.out and ep.transferType == TransferType.bulk) {
+                self.init_transfer_tx(ep);
+            } else if (ep.direction == Direction.in and ep.transferType == TransferType.bulk) {
+                self.init_transfer_rx(ep);
+            }
+        }
+    }
+
+    pub fn init(self: *@This()) !void {
+        const speed = usb.libusb_get_device_speed(self.mutDev());
+        var ret: c_int = undefined;
+        printStrDesc(self.mutHdl(), self.desc());
+        printEndpoints(self.desc().idVendor, self.desc().idProduct, self.endpoints);
+        self.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
+        if (!is_windows) {
+            // https://libusb.sourceforge.io/api-1.0/group__libusb__self.html#gac35b26fef01271eba65c60b2b3ce1cbf
+            ret = usb.libusb_set_auto_detach_kernel_driver(self.mutHdl(), 1);
+            if (ret != 0) {
+                self.withLogger(logz.err())
+                    .int("code", ret)
+                    .string("err", "failed to set auto detach kernel driver")
+                    .log();
+            }
+        }
+        ret = usb.libusb_claim_interface(self.mutHdl(), 0);
+        if (ret != 0) {
+            self.withLogger(logz.err())
+                .int("code", ret)
+                .string("err", "failed to claim interface")
+                .log();
+        }
+        self.init_endpoints();
     }
 };
 
@@ -503,6 +668,126 @@ pub fn printEndpoints(vid: u16, pid: u16, endpoints: []const Endpoint) void {
     }
 }
 
+// libusb_fill_bulk_transfer
+// https://libusb.sourceforge.io/api-1.0/group__libusb__asyncio.html
+// https://libusb.sourceforge.io/api-1.0/libusb_io.html
+//
+// In the interest of being a lightweight library, libusb does not
+// create threads and can only operate when your application is
+// calling into it. Your application must call into libusb from it's
+// main loop when events are ready to be handled, or you must use
+// some other scheme to allow libusb to undertake whatever work
+// needs to be done.
+const transfer_callback = struct {
+    alloc: std.mem.Allocator,
+    /// reference, not OWNED
+    dev: *const DeviceContext,
+    /// reference, not OWNED
+    transfer: *Transfer,
+    /// owned by `alloc`
+    buffer: []u8,
+    endpoint: Endpoint,
+
+    pub fn dtor(self: *@This()) void {
+        self.alloc.free(self.buffer);
+        self.alloc.destroy(self);
+    }
+
+    /// return a function pointer to the destructor
+    pub fn void_dtor() *const fn (*anyopaque) void {
+        return @ptrCast(&@This().dtor);
+    }
+
+    pub fn tx(trans: [*c]usb.libusb_transfer) callconv(.C) void {
+        if (trans == null) {
+            @panic("null transfer");
+        }
+        const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
+        self.transfer.mutex.unlock();
+        const status = transferStatusFromInt(trans.*.status) catch unreachable;
+        var lg = self.dev.withLogger(logz.info());
+        lg = self.endpoint.withLogger(lg);
+        lg.string("status", @tagName(status))
+            .int("flags", trans.*.flags)
+            .string("action", "transmit")
+            .log();
+    }
+
+    pub fn rx(trans: [*c]usb.libusb_transfer) callconv(.C) void {
+        if (trans == null) {
+            @panic("null transfer");
+        }
+        const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
+        const status = transferStatusFromInt(trans.*.status) catch unreachable;
+        const len: usize = @intCast(trans.*.actual_length);
+        const rx_buf: []const u8 = self.buffer[0..len];
+        self.transfer.mutex.unlock();
+        var lg = self.dev.withLogger(logz.info());
+        lg = self.endpoint.withLogger(lg);
+        lg.string("status", @tagName(status))
+            .int("flags", trans.*.flags)
+            .string("action", "receive")
+            .log();
+        if (rx_buf.len > 0) {
+            var pkt_ = UsbPack.unmarshal(self.alloc, rx_buf);
+            if (pkt_) |*pkt| {
+                defer pkt.dtor(self.alloc);
+                lg = self.dev.withLogger(logz.info());
+                lg = self.endpoint.withLogger(lg);
+                lg = pkt.withLogger(lg);
+                lg.log();
+                if (pkt.data()) |data| {
+                    lg = pkt.withLogger(logz.info());
+                    lg = lg.int("len", data.len);
+                    // unmarshal it as `bb_get_status_out_t`
+                    if (pkt.reqid == bb.BB_GET_STATUS) {
+                        var st: bb.bb_get_status_out_t = undefined;
+                        if (utils.fillWithBytes(&st, data)) |_| {
+                            lg.fmt("status", "{any}", .{st}).log();
+                        } else |e| {
+                            lg = self.dev.withLogger(logz.err());
+                            lg = self.endpoint.withLogger(lg);
+                            lg.string("what", "failed to fill struct")
+                                .err(e)
+                                .log();
+                        }
+                    }
+                } else |_| {}
+            } else |err| {
+                // failed to unmarshal
+                lg = self.dev.withLogger(logz.err());
+                lg = self.endpoint.withLogger(lg);
+                lg.string("what", "failed to unmarshal")
+                    .fmt("data", "{any}", .{rx_buf})
+                    .err(err)
+                    .log();
+            }
+        }
+        // keeps receiving
+        const err = usb.libusb_submit_transfer(trans);
+        lg = self.dev.withLogger(logz.err());
+        lg = self.endpoint.withLogger(lg);
+        switch (err) {
+            0 => self.transfer.mutex.lock(),
+            usb.LIBUSB_ERROR_NO_DEVICE => {
+                // upstream should monitor the device list
+                // and handle the device removal
+                lg.string("err", "no device").log();
+            },
+            usb.LIBUSB_ERROR_BUSY => {
+                // should not happen, unless the transfer is be reused,
+                // which should NOT happen with lock
+                lg.string("err", "transfer is busy").log();
+                @panic("transfer is busy");
+            },
+            else => {
+                lg.int("code", err).string("err", "failed to submit transfer").log();
+                @panic("failed to submit transfer");
+            },
+        }
+    }
+};
+
 /// Print the manufacturer, product, serial number of a device.
 /// If a string descriptor is not available, 'N/A' will be display.
 fn printStrDesc(hdl: *usb.libusb_device_handle, desc: *const usb.libusb_device_descriptor) void {
@@ -632,236 +917,9 @@ pub fn main() !void {
     refreshDevList(ctx, &device_list);
 
     for (device_list.items) |*dev| {
-        const speed = usb.libusb_get_device_speed(dev.mutDev());
-        printStrDesc(dev.mutHdl(), dev.desc());
-        printEndpoints(dev.desc().idVendor, dev.desc().idProduct, dev.endpoints);
-        dev.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
-        if (!is_windows) {
-            // https://libusb.sourceforge.io/api-1.0/group__libusb__dev.html#gac35b26fef01271eba65c60b2b3ce1cbf
-            ret = usb.libusb_set_auto_detach_kernel_driver(dev.mutHdl(), 1);
-            if (ret != 0) {
-                dev.withLogger(logz.err())
-                    .int("code", ret)
-                    .string("err", "failed to set auto detach kernel driver")
-                    .log();
-            }
-        }
-        ret = usb.libusb_claim_interface(dev.mutHdl(), 0);
-        if (ret != 0) {
-            dev.withLogger(logz.err())
-                .int("code", ret)
-                .string("err", "failed to claim interface")
-                .log();
-        }
-        for (dev.endpoints) |*ep| {
-            // libusb_fill_bulk_transfer
-            // https://libusb.sourceforge.io/api-1.0/group__libusb__asyncio.html
-            // https://libusb.sourceforge.io/api-1.0/libusb_io.html
-            //
-            // In the interest of being a lightweight library, libusb does not
-            // create threads and can only operate when your application is
-            // calling into it. Your application must call into libusb from it's
-            // main loop when events are ready to be handled, or you must use
-            // some other scheme to allow libusb to undertake whatever work
-            // needs to be done.
-            const transfer_callback = struct {
-                alloc: std.mem.Allocator,
-                /// reference, not OWNED
-                dev: *const DeviceContext,
-                /// reference, not OWNED
-                transfer: *Transfer,
-                /// owned by `alloc`
-                buffer: []u8,
-                endpoint: Endpoint,
-
-                pub fn dtor(self: *@This()) void {
-                    self.alloc.free(self.buffer);
-                    self.alloc.destroy(self);
-                }
-
-                /// return a function pointer to the destructor
-                pub fn void_dtor() *const fn (*anyopaque) void {
-                    return @ptrCast(&@This().dtor);
-                }
-
-                pub fn tx(trans: [*c]usb.libusb_transfer) callconv(.C) void {
-                    if (trans == null) {
-                        @panic("null transfer");
-                    }
-                    const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
-                    self.transfer.mutex.unlock();
-                    const status = transferStatusFromInt(trans.*.status) catch unreachable;
-                    var lg = self.dev.withLogger(logz.info());
-                    lg = self.endpoint.withLogger(lg);
-                    lg.string("status", @tagName(status))
-                        .int("flags", trans.*.flags)
-                        .string("action", "transmit")
-                        .log();
-                }
-
-                pub fn rx(trans: [*c]usb.libusb_transfer) callconv(.C) void {
-                    if (trans == null) {
-                        @panic("null transfer");
-                    }
-                    const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
-                    const status = transferStatusFromInt(trans.*.status) catch unreachable;
-                    const len: usize = @intCast(trans.*.actual_length);
-                    const rx_buf: []const u8 = self.buffer[0..len];
-                    self.transfer.mutex.unlock();
-                    var lg = self.dev.withLogger(logz.info());
-                    lg = self.endpoint.withLogger(lg);
-                    lg.string("status", @tagName(status))
-                        .int("flags", trans.*.flags)
-                        .string("action", "receive")
-                        .log();
-                    if (rx_buf.len > 0) {
-                        var pkt_ = UsbPack.unmarshal(self.alloc, rx_buf);
-                        if (pkt_) |*pkt| {
-                            defer pkt.dtor(self.alloc);
-                            lg = self.dev.withLogger(logz.info());
-                            lg = self.endpoint.withLogger(lg);
-                            lg = pkt.withLogger(lg);
-                            lg.log();
-                            if (pkt.data()) |data| {
-                                lg = pkt.withLogger(logz.info());
-                                lg = lg.int("len", data.len);
-                                // unmarshal it as `bb_get_status_out_t`
-                                if (pkt.reqid == bb.BB_GET_STATUS) {
-                                    var st: bb.bb_get_status_out_t = undefined;
-                                    if (utils.fillWithBytes(&st, data)) |_| {
-                                        lg.fmt("status", "{any}", .{st}).log();
-                                    } else |e| {
-                                        lg = self.dev.withLogger(logz.err());
-                                        lg = self.endpoint.withLogger(lg);
-                                        lg.string("what", "failed to fill struct")
-                                            .err(e)
-                                            .log();
-                                    }
-                                }
-                            } else |_| {}
-                        } else |err| {
-                            // failed to unmarshal
-                            lg = self.dev.withLogger(logz.err());
-                            lg = self.endpoint.withLogger(lg);
-                            lg.string("what", "failed to unmarshal")
-                                .fmt("data", "{any}", .{rx_buf})
-                                .err(err)
-                                .log();
-                        }
-                    }
-                    // keeps receiving
-                    const err = usb.libusb_submit_transfer(trans);
-                    lg = self.dev.withLogger(logz.err());
-                    lg = self.endpoint.withLogger(lg);
-                    switch (err) {
-                        0 => self.transfer.mutex.lock(),
-                        usb.LIBUSB_ERROR_NO_DEVICE => {
-                            // upstream should monitor the device list
-                            // and handle the device removal
-                            lg.string("err", "no device").log();
-                        },
-                        usb.LIBUSB_ERROR_BUSY => {
-                            // should not happen, unless the transfer is be reused,
-                            // which should NOT happen with lock
-                            lg.string("err", "transfer is busy").log();
-                            @panic("transfer is busy");
-                        },
-                        else => {
-                            lg.int("code", err).string("err", "failed to submit transfer").log();
-                            @panic("failed to submit transfer");
-                        },
-                    }
-                }
-            };
-            if (ep.direction == Direction.out and ep.transferType == TransferType.bulk) {
-                const l_alloc = alloc;
-                var cb = l_alloc.create(transfer_callback) catch @panic("OOM");
-                var transfer: *Transfer = &dev.arto.tx_transfer;
-                cb.alloc = l_alloc;
-                cb.dev = dev;
-                cb.transfer = transfer;
-                cb.endpoint = ep.*;
-                const payload = bb.bb_get_status_in_t{
-                    .user_bmp = SLOT_BIT_MAP_MAX,
-                };
-                const data_buf = alloc.alloc(u8, @sizeOf(@TypeOf(payload))) catch @panic("OOM");
-                defer alloc.free(data_buf);
-                utils.fillBytesWith(data_buf, &payload) catch unreachable;
-                const header = UsbPack{
-                    .msgid = 0x0,
-                    .reqid = bb.BB_GET_STATUS,
-                    .sta = 0x0,
-                    .ptr = data_buf.ptr,
-                    .len = @intCast(data_buf.len),
-                };
-                const tx_buffer = header.marshal(l_alloc) catch @panic("OOM");
-                cb.buffer = tx_buffer;
-                usb.libusb_fill_bulk_transfer(
-                    transfer.self,
-                    dev.mutHdl(),
-                    ep.addr,
-                    tx_buffer.ptr,
-                    @intCast(tx_buffer.len),
-                    transfer_callback.tx,
-                    cb,
-                    1_000,
-                );
-                var lg = dev.withLogger(logz.info());
-                lg = ep.withLogger(lg).string("action", "submitting transfer");
-                lg.log();
-                transfer.closure = cb;
-                transfer.closure_dtor = transfer_callback.void_dtor();
-                ret = usb.libusb_submit_transfer(transfer.self);
-                switch (ret) {
-                    0 => transfer.mutex.lock(),
-                    else => {
-                        lg = dev.withLogger(logz.err());
-                        lg = ep.withLogger(lg);
-                        lg.int("code", ret).string("what", "failed to submit transfer").log();
-                        @panic("failed to submit transfer");
-                    },
-                }
-            } else if (ep.direction == Direction.in and ep.transferType == TransferType.bulk) {
-                const l_alloc = alloc;
-                var cb = l_alloc.create(transfer_callback) catch @panic("OOM");
-                var transfer: *Transfer = &dev.arto.rx_transfer;
-                cb.alloc = l_alloc;
-                cb.dev = dev;
-                cb.transfer = transfer;
-                cb.endpoint = ep.*;
-                const rx_buffer = l_alloc.alloc(u8, ep.maxPacketSize) catch @panic("OOM");
-                cb.buffer = rx_buffer;
-                // timeout 0
-                // callback won't be called because of timeout
-                usb.libusb_fill_bulk_transfer(
-                    transfer.self,
-                    dev.mutHdl(),
-                    ep.addr,
-                    rx_buffer.ptr,
-                    @intCast(rx_buffer.len),
-                    transfer_callback.rx,
-                    cb,
-                    0,
-                );
-                var lg = dev.withLogger(logz.info());
-                lg = ep.withLogger(lg).string("action", "submitting transfer");
-                lg.log();
-                transfer.closure = cb;
-                transfer.closure_dtor = transfer_callback.void_dtor();
-
-                ret = usb.libusb_submit_transfer(transfer.self);
-                switch (ret) {
-                    0 => transfer.mutex.lock(),
-                    else => {
-                        lg = dev.withLogger(logz.err());
-                        lg = ep.withLogger(lg);
-                        lg.int("code", ret).string("what", "failed to submit transfer").log();
-                        @panic("failed to submit transfer");
-                    },
-                }
-            }
-        }
+        dev.init();
     }
+    logz.info().string("action", "start event loop").log();
 
     // https://www.reddit.com/r/Zig/comments/wviq36/how_to_catch_signals_at_least_sigint/
     // https://www.reddit.com/r/Zig/comments/11mr0r8/defer_errdefer_and_sigint_ctrlc/

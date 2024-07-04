@@ -8,8 +8,8 @@ const bb = @import("bb/c.zig");
 const UsbPack = @import("bb/usbpack.zig").UsbPack;
 const utils = @import("utils.zig");
 const BadEnum = utils.BadEnum;
+const Mutex = std.Thread.Mutex;
 const RwLock = std.Thread.RwLock;
-const PriorityQueue = std.PriorityQueue;
 
 const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
@@ -57,6 +57,59 @@ pub fn libusb_error_2_set(err: c_int) LibUsbError {
         else => LibUsbError.Unknown,
     };
 }
+
+const LockedQueue = struct {
+    const MAX_SIZE = 3;
+    const T = UsbPack;
+    q: std.ArrayList(T),
+    /// read-write lock
+    lock: RwLock = RwLock{},
+
+    /// used with `cv` to signal the queue is not empty
+    mutex: Mutex = Mutex{},
+    cv: std.Thread.Condition = std.Thread.Condition{},
+
+    pub fn init(alloc: std.mem.Allocator) LockedQueue {
+        return LockedQueue{
+            .q = std.ArrayList(UsbPack).init(alloc),
+        };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.q.deinit();
+    }
+
+    pub fn enqueue(self: *@This(), pkt: T) void {
+        self.lock.lockShared();
+        while (self.q.items.len >= MAX_SIZE) {
+            _ = self.q.orderedRemove(0);
+        }
+        self.q.append(pkt) catch @panic("OOM");
+        self.lock.unlockShared();
+        self.cv.signal();
+    }
+
+    pub fn peek(self: *@This()) ?T {
+        self.lock.lock();
+        if (self.q.len == 0) {
+            self.lock.unlock();
+            return null;
+        } else {
+            const ret = self.q.items[0];
+            self.lock.unlock();
+            return ret;
+        }
+    }
+
+    pub fn dequeue(self: *@This()) T {
+        self.cv.wait(&self.mutex);
+        self.lock.lockShared();
+        const ret = self.q.items[0];
+        _ = self.q.orderedRemove(0);
+        self.lock.unlockShared();
+        return ret;
+    }
+};
 
 const DeviceLike = struct {
     const MAX_PORTS = 8;
@@ -163,10 +216,12 @@ const Transfer = struct {
 const ArtoContext = struct {
     tx_transfer: Transfer,
     rx_transfer: Transfer,
+    ctrl_queue: LockedQueue,
 
     pub fn dtor(self: *@This()) void {
         self.tx_transfer.dtor();
         self.rx_transfer.dtor();
+        self.ctrl_queue.deinit();
     }
 };
 
@@ -260,6 +315,7 @@ const DeviceContext = struct {
             .self = rx_transfer,
             .lk = RwLock{},
         };
+        dc.arto.ctrl_queue = LockedQueue.init(gpa.allocator());
         return dc;
     }
 
@@ -697,7 +753,7 @@ pub fn printEndpoints(vid: u16, pid: u16, endpoints: []const Endpoint) void {
 const transfer_callback = struct {
     alloc: std.mem.Allocator,
     /// reference, not OWNED
-    dev: *const DeviceContext,
+    dev: *DeviceContext,
     /// reference, not OWNED
     transfer: *Transfer,
     /// owned by `alloc`
@@ -747,28 +803,8 @@ const transfer_callback = struct {
         if (rx_buf.len > 0) {
             var pkt_ = UsbPack.unmarshal(self.alloc, rx_buf);
             if (pkt_) |*pkt| {
-                defer pkt.dtor(self.alloc);
-                lg = self.dev.withLogger(logz.info());
-                lg = self.endpoint.withLogger(lg);
-                lg = pkt.withLogger(lg);
-                lg.log();
-                if (pkt.data()) |data| {
-                    lg = pkt.withLogger(logz.info());
-                    lg = lg.int("len", data.len);
-                    // unmarshal it as `bb_get_status_out_t`
-                    if (pkt.reqid == bb.BB_GET_STATUS) {
-                        var st: bb.bb_get_status_out_t = undefined;
-                        if (utils.fillWithBytes(&st, data)) |_| {
-                            lg.fmt("status", "{any}", .{st}).log();
-                        } else |e| {
-                            lg = self.dev.withLogger(logz.err());
-                            lg = self.endpoint.withLogger(lg);
-                            lg.string("what", "failed to fill struct")
-                                .err(e)
-                                .log();
-                        }
-                    }
-                } else |_| {}
+                pkt.withLogger(lg).log();
+                self.dev.arto.ctrl_queue.enqueue(pkt.*);
             } else |err| {
                 // failed to unmarshal
                 lg = self.dev.withLogger(logz.err());

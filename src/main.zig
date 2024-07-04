@@ -127,6 +127,8 @@ const DeviceContext = struct {
     ports: []const u8,
     /// managed by `alloc`
     endpoints: []Endpoint,
+    /// managed by `alloc`
+    serial: []const u8,
     arto: ArtoContext,
 
     const Self = @This();
@@ -159,6 +161,7 @@ const DeviceContext = struct {
         self.core.dtor();
         self.allocator().free(self.ports);
         self.allocator().free(self.endpoints);
+        self.allocator().free(self.serial);
         self.arto.dtor();
         const chk = self.gpa.deinit();
         if (chk != .ok) {
@@ -169,8 +172,7 @@ const DeviceContext = struct {
     /// attach the device information to the logger
     pub fn withLogger(self: *const Self, logger: logz.Logger) logz.Logger {
         return logger
-            .fmt("vid", "0x{x:0>4}", .{self.core.desc.idVendor})
-            .fmt("pid", "0x{x:0>4}", .{self.core.desc.idProduct})
+            .string("serial_number", self.serial)
             .int("bus", self.bus)
             .int("port", self.port);
     }
@@ -286,7 +288,7 @@ const DeviceContext = struct {
         }
     }
 
-    pub fn init(self: *@This()) !void {
+    pub fn init(self: *@This()) LibUsbError!void {
         const speed = usb.libusb_get_device_speed(self.mutDev());
         var ret: c_int = undefined;
         printStrDesc(self.mutHdl(), self.desc());
@@ -300,6 +302,7 @@ const DeviceContext = struct {
                     .int("code", ret)
                     .string("err", "failed to set auto detach kernel driver")
                     .log();
+                return libusb_error_2_set(ret);
             }
         }
         ret = usb.libusb_claim_interface(self.mutHdl(), 0);
@@ -308,6 +311,7 @@ const DeviceContext = struct {
                 .int("code", ret)
                 .string("err", "failed to claim interface")
                 .log();
+            return libusb_error_2_set(ret);
         }
         self.init_endpoints();
     }
@@ -512,9 +516,10 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         }
 
         var gpa = DeviceGPA{};
-        const heap_ports = gpa.allocator().alloc(u8, d.ports.len) catch @panic("OOM");
+        const dyn_ports = gpa.allocator().alloc(u8, d.ports.len) catch @panic("OOM");
         const eps = getEndpoints(gpa.allocator(), d.dev, &desc);
-        @memcpy(heap_ports, d.ports);
+        const serial = dynStringDescriptorOr(gpa.allocator(), hdl.?, desc.iSerialNumber, "");
+        @memcpy(dyn_ports, d.ports);
         var dc = DeviceContext{
             .gpa = gpa,
             .core = DeviceHandles{
@@ -524,7 +529,8 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             },
             .bus = d.bus,
             .port = d.port,
-            .ports = heap_ports,
+            .ports = dyn_ports,
+            .serial = serial,
             .endpoints = eps,
             .arto = undefined,
         };
@@ -532,7 +538,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         const rx_transfer = usb.libusb_alloc_transfer(0);
         if (tx_transfer == null or rx_transfer == null) {
             dc.withLogger(logz.err()).string("err", "failed to allocate transfer").log();
-            continue;
+            @panic("failed to allocate transfer, might be OOM");
         }
         dc.arto.tx_transfer = Transfer{
             .self = tx_transfer,
@@ -788,6 +794,24 @@ const transfer_callback = struct {
     }
 };
 
+/// Get a string descriptor or return a default value
+pub fn dynStringDescriptorOr(alloc: std.mem.Allocator, hdl: *usb.libusb_device_handle, idx: u8, default: []const u8) []const u8 {
+    const BUF_SIZE = 128;
+    var buf: [BUF_SIZE]u8 = undefined;
+    const sz: c_int = usb.libusb_get_string_descriptor_ascii(hdl, idx, &buf, @intCast(buf.len));
+    if (sz > 0) {
+        var dyn_str = alloc.alloc(u8, @intCast(sz)) catch @panic("OOM");
+        @memcpy(dyn_str, buf[0..@intCast(sz)]);
+        dyn_str.len = @intCast(sz);
+        return dyn_str;
+    } else {
+        var dyn_str = alloc.alloc(u8, default.len) catch @panic("OOM");
+        @memcpy(dyn_str, default);
+        dyn_str.len = default.len;
+        return dyn_str;
+    }
+}
+
 /// Print the manufacturer, product, serial number of a device.
 /// If a string descriptor is not available, 'N/A' will be display.
 fn printStrDesc(hdl: *usb.libusb_device_handle, desc: *const usb.libusb_device_descriptor) void {
@@ -917,7 +941,9 @@ pub fn main() !void {
     refreshDevList(ctx, &device_list);
 
     for (device_list.items) |*dev| {
-        dev.init();
+        dev.init() catch |e| {
+            dev.withLogger(logz.err()).err(e).log();
+        };
     }
     logz.info().string("action", "start event loop").log();
 

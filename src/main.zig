@@ -9,6 +9,7 @@ const UsbPack = @import("bb/usbpack.zig").UsbPack;
 const utils = @import("utils.zig");
 const BadEnum = utils.BadEnum;
 const Mutex = std.Thread.Mutex;
+const PriorityQueue = std.PriorityQueue;
 
 const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
@@ -57,6 +58,57 @@ pub fn libusb_error_2_set(err: c_int) LibUsbError {
     };
 }
 
+const DeviceLike = struct {
+    const MAX_PORTS = 8;
+    dev: *usb.libusb_device,
+    vid: u16,
+    pid: u16,
+    bus: u8,
+    port: u8,
+    _ports_buf: [MAX_PORTS]u8,
+    ports: []const u8,
+
+    pub fn from_device(dev: *usb.libusb_device) AppError!@This() {
+        var desc: usb.libusb_device_descriptor = undefined;
+        const err = usb.libusb_get_device_descriptor(dev, &desc);
+        if (err != 0) {
+            return AppError.BadDescriptor;
+        }
+        var ret = @This(){
+            .dev = dev,
+            .vid = desc.idVendor,
+            .pid = desc.idProduct,
+            .bus = usb.libusb_get_bus_number(dev),
+            .port = usb.libusb_get_port_number(dev),
+            ._ports_buf = undefined,
+            .ports = undefined,
+        };
+        const lsz = usb.libusb_get_port_numbers(dev, &ret._ports_buf, MAX_PORTS);
+        if (lsz < 0) {
+            return AppError.BadPortNumbers;
+        }
+        ret.ports = ret._ports_buf[0..@intCast(lsz)];
+        return ret;
+    }
+
+    pub fn withLogger(self: *const @This(), logger: logz.Logger) logz.Logger {
+        return logger
+            .fmt("vid", "0x{x:0>4}", .{self.vid})
+            .fmt("pid", "0x{x:0>4}", .{self.pid})
+            .int("bus", self.bus)
+            .int("port", self.port);
+    }
+
+    /// hash the device by bus, port, and ports
+    pub fn xxhash(self: *const @This()) u32 {
+        var h = std.hash.XxHash32.init(XXHASH_SEED);
+        h.update(utils.anytype2Slice(&self.bus));
+        h.update(utils.anytype2Slice(&self.port));
+        h.update(self.ports);
+        return h.final();
+    }
+};
+
 /// the essential part of the USB device.
 /// you could retrieve everything else from this
 /// with libusb API
@@ -94,7 +146,7 @@ const Transfer = struct {
     /// This mutex is mainly used in TX transfer.
     /// For RX transfer, the event loop is always polling and
     /// the transfer will be restarted after the callback is called.
-    mutex: Mutex = Mutex{},
+    mutex: Mutex,
 
     pub fn dtor(self: *@This()) void {
         if (self.closure_dtor) |free| {
@@ -155,6 +207,60 @@ const DeviceContext = struct {
 
     pub fn desc(self: *const Self) *const usb.libusb_device_descriptor {
         return &self.core.desc;
+    }
+
+    pub fn from_device_like(d: DeviceLike) LibUsbError!@This() {
+        var ret: c_int = undefined;
+        var l_hdl: ?*usb.libusb_device_handle = null;
+        // Internally, this function adds a reference to the device and makes it
+        // available to you through `libusb_get_device()`. This reference is
+        // removed during `libusb_close()`.
+        ret = usb.libusb_open(d.dev, &l_hdl);
+        if (ret != 0 or l_hdl == null) {
+            d.withLogger(logz.err().string("err", "failed to open device")).log();
+            return libusb_error_2_set(ret);
+        }
+        var l_desc: usb.libusb_device_descriptor = undefined;
+        ret = usb.libusb_get_device_descriptor(d.dev, &l_desc);
+        if (ret != 0) {
+            d.withLogger(logz.err()).string("err", "failed to get device descriptor").log();
+            return libusb_error_2_set(ret);
+        }
+
+        var gpa = DeviceGPA{};
+        const dyn_ports = gpa.allocator().alloc(u8, d.ports.len) catch @panic("OOM");
+        const eps = getEndpoints(gpa.allocator(), d.dev, &l_desc);
+        const serial = dynStringDescriptorOr(gpa.allocator(), l_hdl.?, l_desc.iSerialNumber, "");
+        @memcpy(dyn_ports, d.ports);
+        var dc = DeviceContext{
+            .gpa = gpa,
+            .core = DeviceHandles{
+                .dev = d.dev,
+                .hdl = l_hdl.?,
+                .desc = l_desc,
+            },
+            .bus = d.bus,
+            .port = d.port,
+            .ports = dyn_ports,
+            .serial = serial,
+            .endpoints = eps,
+            .arto = undefined,
+        };
+        const tx_transfer = usb.libusb_alloc_transfer(0);
+        const rx_transfer = usb.libusb_alloc_transfer(0);
+        if (tx_transfer == null or rx_transfer == null) {
+            dc.withLogger(logz.err()).string("err", "failed to allocate transfer").log();
+            @panic("failed to allocate transfer, might be OOM");
+        }
+        dc.arto.tx_transfer = Transfer{
+            .self = tx_transfer,
+            .mutex = Mutex{},
+        };
+        dc.arto.rx_transfer = Transfer{
+            .self = rx_transfer,
+            .mutex = Mutex{},
+        };
+        return dc;
     }
 
     pub fn dtor(self: *Self) void {
@@ -343,57 +449,6 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
     defer usb.libusb_free_device_list(c_device_list, 1);
     const device_list = c_device_list[0..@intCast(sz)];
 
-    const DeviceLike = struct {
-        const MAX_PORTS = 8;
-        dev: *usb.libusb_device,
-        vid: u16,
-        pid: u16,
-        bus: u8,
-        port: u8,
-        _ports_buf: [MAX_PORTS]u8,
-        ports: []const u8,
-
-        pub fn from_device(dev: *usb.libusb_device) AppError!@This() {
-            var desc: usb.libusb_device_descriptor = undefined;
-            const err = usb.libusb_get_device_descriptor(dev, &desc);
-            if (err != 0) {
-                return AppError.BadDescriptor;
-            }
-            var ret = @This(){
-                .dev = dev,
-                .vid = desc.idVendor,
-                .pid = desc.idProduct,
-                .bus = usb.libusb_get_bus_number(dev),
-                .port = usb.libusb_get_port_number(dev),
-                ._ports_buf = undefined,
-                .ports = undefined,
-            };
-            const lsz = usb.libusb_get_port_numbers(dev, &ret._ports_buf, MAX_PORTS);
-            if (lsz < 0) {
-                return AppError.BadPortNumbers;
-            }
-            ret.ports = ret._ports_buf[0..@intCast(lsz)];
-            return ret;
-        }
-
-        pub fn withLogger(self: *const @This(), logger: logz.Logger) logz.Logger {
-            return logger
-                .fmt("vid", "0x{x:0>4}", .{self.vid})
-                .fmt("pid", "0x{x:0>4}", .{self.pid})
-                .int("bus", self.bus)
-                .int("port", self.port);
-        }
-
-        /// hash the device by bus, port, and ports
-        pub fn xxhash(self: *const @This()) u32 {
-            var h = std.hash.XxHash32.init(XXHASH_SEED);
-            h.update(utils.anytype2Slice(&self.bus));
-            h.update(utils.anytype2Slice(&self.port));
-            h.update(self.ports);
-            return h.final();
-        }
-    };
-
     // https://www.reddit.com/r/Zig/comments/18p7w7v/making_a_struct_inside_a_function_makes_it_static/
     // https://www.reddit.com/r/Zig/comments/ard50a/static_local_variables_in_zig/
 
@@ -497,55 +552,11 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
 
     // open new devices
     for (r.items) |d| {
-        var ret: c_int = undefined;
-        var hdl: ?*usb.libusb_device_handle = null;
-        // Internally, this function adds a reference to the device and makes it
-        // available to you through `libusb_get_device()`. This reference is
-        // removed during `libusb_close()`.
-        ret = usb.libusb_open(d.dev, &hdl);
-        if (ret != 0 or hdl == null) {
-            const tmp = logz.err().string("err", "failed to open device");
-            d.withLogger(tmp).log();
+        var dc = DeviceContext.from_device_like(d) catch |e| {
+            d.withLogger(logz.err()).err(e).log();
             continue;
-        }
-        var desc: usb.libusb_device_descriptor = undefined;
-        ret = usb.libusb_get_device_descriptor(d.dev, &desc);
-        if (ret != 0) {
-            d.withLogger(logz.err()).string("err", "failed to get device descriptor").log();
-            continue;
-        }
-
-        var gpa = DeviceGPA{};
-        const dyn_ports = gpa.allocator().alloc(u8, d.ports.len) catch @panic("OOM");
-        const eps = getEndpoints(gpa.allocator(), d.dev, &desc);
-        const serial = dynStringDescriptorOr(gpa.allocator(), hdl.?, desc.iSerialNumber, "");
-        @memcpy(dyn_ports, d.ports);
-        var dc = DeviceContext{
-            .gpa = gpa,
-            .core = DeviceHandles{
-                .dev = d.dev,
-                .hdl = hdl.?,
-                .desc = desc,
-            },
-            .bus = d.bus,
-            .port = d.port,
-            .ports = dyn_ports,
-            .serial = serial,
-            .endpoints = eps,
-            .arto = undefined,
         };
-        const tx_transfer = usb.libusb_alloc_transfer(0);
-        const rx_transfer = usb.libusb_alloc_transfer(0);
-        if (tx_transfer == null or rx_transfer == null) {
-            dc.withLogger(logz.err()).string("err", "failed to allocate transfer").log();
-            @panic("failed to allocate transfer, might be OOM");
-        }
-        dc.arto.tx_transfer = Transfer{
-            .self = tx_transfer,
-        };
-        dc.arto.rx_transfer = Transfer{
-            .self = rx_transfer,
-        };
+        errdefer dc.dtor();
         ctx_list.append(dc) catch @panic("OOM");
         dc.withLogger(logz.info()).string("action", "added").log();
     }
@@ -938,6 +949,7 @@ pub fn main() !void {
         }
         device_list.deinit();
     }
+
     refreshDevList(ctx, &device_list);
 
     for (device_list.items) |*dev| {
@@ -945,7 +957,6 @@ pub fn main() !void {
             dev.withLogger(logz.err()).err(e).log();
         };
     }
-    logz.info().string("action", "start event loop").log();
 
     // https://www.reddit.com/r/Zig/comments/wviq36/how_to_catch_signals_at_least_sigint/
     // https://www.reddit.com/r/Zig/comments/11mr0r8/defer_errdefer_and_sigint_ctrlc/
@@ -997,6 +1008,7 @@ pub fn main() !void {
         .tv_usec = 0,
     };
 
+    logz.info().string("action", "start event loop").log();
     // https://libusb.sourceforge.io/api-1.0/libusb_mtasync.html
     // https://stackoverflow.com/questions/45672717/how-to-force-a-libusb-event-so-that-libusb-handle-events-returns
     // https://libusb.sourceforge.io/api-1.0/group__libusb__poll.html

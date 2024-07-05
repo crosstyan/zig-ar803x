@@ -389,14 +389,16 @@ const DeviceContext = struct {
         // Internally, this function adds a reference
         ret = usb.libusb_open(d.dev, &l_hdl);
         if (ret != 0 or l_hdl == null) {
-            d.withLogger(logz.err().string("err", "failed to open device")).log();
-            return libusb_error_2_set(ret);
+            const e = libusb_error_2_set(ret);
+            d.withLogger(logz.err().string("err", "failed to open device").err(e)).log();
+            return e;
         }
         var l_desc: usb.libusb_device_descriptor = undefined;
         ret = usb.libusb_get_device_descriptor(d.dev, &l_desc);
         if (ret != 0) {
-            d.withLogger(logz.err()).string("err", "failed to get device descriptor").log();
-            return libusb_error_2_set(ret);
+            const e = libusb_error_2_set(ret);
+            d.withLogger(logz.err().err(e)).string("err", "failed to get device descriptor").log();
+            return e;
         }
 
         var gpa = DeviceGPA{};
@@ -615,8 +617,9 @@ const DeviceContext = struct {
             self.transmit(data) catch |e| {
                 var lg = self.withLogger(logz.err());
                 lg.string("from", @src().fn_name)
+                    .err(e)
                     .string("action", "failed to transmit, exiting thread")
-                    .err(e).log();
+                    .log();
                 return;
             };
             std.time.sleep(1000 * std.time.ns_per_ms);
@@ -625,9 +628,10 @@ const DeviceContext = struct {
 
     pub fn recvLoop(self: *@This()) void {
         while (true) {
-            var mpk = self.arto.ctrl_queue.dequeue() catch {
+            var mpk = self.arto.ctrl_queue.dequeue() catch |e| {
                 var lg = self.withLogger(logz.err());
                 lg.string("from", @src().fn_name)
+                    .err(e)
                     .string("action", "failed to dequeue, exiting thread")
                     .log();
                 return;
@@ -976,7 +980,7 @@ const TransferCallback = struct {
         lg.string("status", @tagName(status))
             .int("flags", trans.*.flags)
             .string("action", "transmit")
-            .string("from", "TransferCallback::tx")
+            .string("from", @src().fn_name)
             .log();
         std.debug.assert(status == .completed);
     }

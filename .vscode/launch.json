@@ -33,6 +33,21 @@
             "externalConsole": false,
             "MIMode": "lldb",
             "preLaunchTask": "build",
+        },
+        {
+            "name": "(vsdbg) launch",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/zig-out/bin/ar8030.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/zig-out/bin",
+            "symbolSearchPath": "${workspaceFolder}/zig-out/bin",
+            "environment": [],
+            "externalConsole": false,
+            "logging": {
+                "moduleLoad": false
+            },
         }
     ]
 }

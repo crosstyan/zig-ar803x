@@ -9,6 +9,7 @@
         "anyopaque",
         "anytype",
         "ARTO",
+        "Artosyn",
         "callconv",
         "comptime",
         "deinit",

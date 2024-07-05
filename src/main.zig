@@ -89,7 +89,7 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
             };
         }
 
-        pub fn has_deinit(self: *@This()) bool {
+        pub fn hasDeinit(self: *@This()) bool {
             return self._has_deinit.load(std.builtin.AtomicOrder.unordered);
         }
 
@@ -101,7 +101,7 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
 
         pub fn enqueue(self: *@This(), pkt: T) ClosedError!void {
             {
-                if (self.has_deinit()) {
+                if (self.hasDeinit()) {
                     return ClosedError.Closed;
                 }
                 self.lock.lockShared();
@@ -114,14 +114,14 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
             self.cv.signal();
         }
 
-        pub fn is_empty(self: *@This()) bool {
+        pub fn isEmpty(self: *@This()) bool {
             self.lock.lockShared();
             defer self.lock.unlockShared();
             return self._list.items.len == 0;
         }
 
         pub fn peek(self: *@This()) ClosedError!?T {
-            if (self.has_deinit()) {
+            if (self.hasDeinit()) {
                 return ClosedError.Closed;
             }
             self.lock.lock();
@@ -140,16 +140,16 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            if (self.has_deinit()) {
+            if (self.hasDeinit()) {
                 return ClosedError.Closed;
             }
-            while (self.is_empty()) {
-                if (self.has_deinit()) {
+            while (self.isEmpty()) {
+                if (self.hasDeinit()) {
                     return ClosedError.Closed;
                 }
                 self.cv.wait(&self.mutex);
             }
-            if (self.has_deinit()) {
+            if (self.hasDeinit()) {
                 return ClosedError.Closed;
             }
             self.lock.lockShared();
@@ -200,7 +200,7 @@ const DeviceDesc = struct {
 
     /// the same as calling `DeviceContext.from_device_desc`
     pub inline fn toContext(self: @This(), alloc: std.mem.Allocator) LibUsbError!DeviceContext {
-        return DeviceContext.from_device_desc(alloc, self);
+        return DeviceContext.fromDeviceDesc(alloc, self);
     }
 
     pub fn withLogger(self: *const @This(), logger: logz.Logger) logz.Logger {
@@ -230,13 +230,13 @@ const DeviceHandles = struct {
     desc: usb.libusb_device_descriptor,
 
     const Self = @This();
-    pub fn dtor(self: *Self) void {
+    pub fn deinit(self: *Self) void {
         usb.libusb_close(self.hdl);
     }
 };
 
 /// Select every possible slot (14 slot?).
-/// Anyway it's magic a number.
+/// Anyway it's a magic number.
 ///
 /// `0b0011_1111_1111_1111`
 const SLOT_BIT_MAP_MAX = 0x3fff;
@@ -250,96 +250,92 @@ const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
 /// the maximum packet size of the endpoint, which is 512 for ar8030
 const TRANSFER_BUF_SIZE = 1024;
 
-/// Transfer is a wrapper of `libusb_transfer`
-/// but with a closure and a closure destructor
-const Transfer = struct {
-    self: *usb.libusb_transfer,
-    buf: [TRANSFER_BUF_SIZE]u8 = undefined,
-
-    /// lock when `libusb_submit_transfer` is called.
-    /// callback SHOULD be responsible for unlocking it.
-    ///
-    /// This mutex is mainly used in TX transfer.
-    /// For RX transfer, the event loop is always polling and
-    /// the transfer will be restarted after the callback is called.
-    lk: RwLock = RwLock{},
-
-    /// `user_data` in `libusb_transfer`
-    _closure: ?*anyopaque = null,
-    _closure_dtor: ?*const fn (*anyopaque) void = null,
-
-    /// ONLY used in RX transfer
-    pub fn written(self: *@This()) []const u8 {
-        return self.buf[0..@intCast(self.self.actual_length)];
-    }
-
-    pub fn setCallback(self: *@This(), cb: *anyopaque, destructor: *const fn (*anyopaque) void) void {
-        if (self._closure_dtor) |free| {
-            if (self._closure) |ptr| {
-                free(ptr);
-            }
-        }
-        self._closure = cb;
-        self._closure_dtor = destructor;
-    }
-
-    pub fn dtor(self: *@This()) void {
-        if (self._closure_dtor) |free| {
-            if (self._closure) |ptr| {
-                free(ptr);
-            }
-        }
-        usb.libusb_free_transfer(self.self);
-    }
-};
-
 /// See `UsbPack`
 const ManagedUsbPack = struct {
     allocator: std.mem.Allocator,
     pack: UsbPack,
 
     pub fn unmarshal(alloc: std.mem.Allocator, buf: []const u8) !ManagedUsbPack {
-        var pack = UsbPack.unmarshal(alloc, buf);
-        if (pack) |*p| {
-            return ManagedUsbPack{
-                .allocator = alloc,
-                .pack = p.*,
-            };
-        } else |err| {
-            return err;
-        }
+        const pack = try UsbPack.unmarshal(alloc, buf);
+        return ManagedUsbPack{
+            .allocator = alloc,
+            .pack = pack.*,
+        };
     }
 
     pub fn deinit(self: *@This()) void {
-        self.pack.dtor(self.allocator);
+        self.pack.deinit(self.allocator);
     }
 };
 
 const UsbPackQueue = LockedQueue(ManagedUsbPack, 8);
 
-// arto specific context
-// like network, transfer, etc.
-const ArtoContext = struct {
-    tx_transfer: Transfer,
-    rx_transfer: Transfer,
-    /// Note that the consumer should be responsible for
-    /// RELEASING the packet after consuming it.
-    ctrl_queue: UsbPackQueue,
-
-    /// only initialized in `init`
-    tx_thread: std.Thread,
-    rx_thread: std.Thread,
-
-    pub fn dtor(self: *@This()) void {
-        self.tx_transfer.dtor();
-        self.rx_transfer.dtor();
-        self.ctrl_queue.deinit();
-        self.tx_thread.join();
-        self.rx_thread.join();
-    }
-};
-
 const DeviceContext = struct {
+    /// Transfer is a wrapper of `libusb_transfer`
+    /// but with a closure and a closure destructor
+    const Transfer = struct {
+        self: *usb.libusb_transfer,
+        buf: [TRANSFER_BUF_SIZE]u8 = undefined,
+
+        /// lock when `libusb_submit_transfer` is called.
+        /// callback SHOULD be responsible for unlocking it.
+        ///
+        /// This mutex is mainly used in TX transfer.
+        /// For RX transfer, the event loop is always polling and
+        /// the transfer will be restarted after the callback is called.
+        lk: RwLock = RwLock{},
+
+        /// `user_data` in `libusb_transfer`
+        _closure: ?*anyopaque = null,
+        _closure_dtor: ?*const fn (*anyopaque) void = null,
+
+        /// ONLY used in RX transfer
+        pub fn written(self: *@This()) []const u8 {
+            return self.buf[0..@intCast(self.self.actual_length)];
+        }
+
+        pub fn setCallback(self: *@This(), cb: *anyopaque, destructor: *const fn (*anyopaque) void) void {
+            if (self._closure_dtor) |free| {
+                if (self._closure) |ptr| {
+                    free(ptr);
+                }
+            }
+            self._closure = cb;
+            self._closure_dtor = destructor;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            if (self._closure_dtor) |free| {
+                if (self._closure) |ptr| {
+                    free(ptr);
+                }
+            }
+            usb.libusb_free_transfer(self.self);
+        }
+    };
+
+    /// Artosyn specific context.
+    /// like network, transfer, etc.
+    const ArtoContext = struct {
+        tx_transfer: Transfer,
+        rx_transfer: Transfer,
+        /// Note that the consumer should be responsible for
+        /// RELEASING the packet after consuming it.
+        ctrl_queue: UsbPackQueue,
+
+        /// only initialized in `init`
+        tx_thread: std.Thread,
+        rx_thread: std.Thread,
+
+        pub fn deinit(self: *@This()) void {
+            self.tx_transfer.deinit();
+            self.rx_transfer.deinit();
+            self.ctrl_queue.deinit();
+            self.tx_thread.join();
+            self.rx_thread.join();
+        }
+    };
+
     _has_deinit: std.atomic.Value(bool),
     gpa: DeviceGPA,
     core: DeviceHandles,
@@ -356,7 +352,7 @@ const DeviceContext = struct {
     const Self = @This();
 
     pub fn serial(self: *const Self) []const u8 {
-        if (self.has_deinit()) {
+        if (self.hasDeinit()) {
             return "DEINIT";
         }
         return self._serial;
@@ -386,11 +382,12 @@ const DeviceContext = struct {
         return &self.core.desc;
     }
 
-    pub inline fn has_deinit(self: *const Self) bool {
+    pub inline fn hasDeinit(self: *const Self) bool {
         return self._has_deinit.load(std.builtin.AtomicOrder.unordered);
     }
 
-    pub fn from_device_desc(alloc: std.mem.Allocator, d: DeviceDesc) LibUsbError!@This() {
+    /// See `DeviceDesc`
+    pub fn fromDeviceDesc(alloc: std.mem.Allocator, d: DeviceDesc) LibUsbError!@This() {
         var ret: c_int = undefined;
         var l_hdl: ?*usb.libusb_device_handle = null;
         // Internally, this function adds a reference
@@ -448,11 +445,11 @@ const DeviceContext = struct {
 
     pub fn deinit(self: *Self) void {
         self._has_deinit.store(true, std.builtin.AtomicOrder.unordered);
-        self.core.dtor();
+        self.core.deinit();
         self.allocator().free(self.ports);
         self.allocator().free(self.endpoints);
         self.allocator().free(self._serial);
-        self.arto.dtor();
+        self.arto.deinit();
         const chk = self.gpa.deinit();
         if (chk != .ok) {
             std.debug.print("GPA thinks there are memory leaks when destroying device bus {} port {}\n", .{ self.bus, self.port });
@@ -505,7 +502,7 @@ const DeviceContext = struct {
     ///
     /// use `arto.ctrl_queue` to receive the data coming from the device
     pub fn transmit(self: *@This(), data: []const u8) !void {
-        if (self.has_deinit()) {
+        if (self.hasDeinit()) {
             return ClosedError.Closed;
         }
         const transfer = &self.arto.tx_transfer;
@@ -607,7 +604,7 @@ const DeviceContext = struct {
                 .ptr = payload.ptr,
                 .len = @intCast(payload.len),
             };
-            defer pack.dtor(stack_allocator);
+            defer pack.deinit(stack_allocator);
 
             const data = pack.marshal(stack_allocator) catch {
                 @panic("error when marshal");
@@ -713,7 +710,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         /// and the caller is responsible for freeing the memory.
         ///
         ///   - left: devices that should be removed from the context list (`*const DeviceContext`)
-        ///   - right: devices that should be added to the context list (`DeviceLike` that could be used to init a device)
+        ///   - right: devices that should be added to the context list (`DeviceDesc` that could be used to init a device)
         pub fn call(
             self: *const @This(),
             alloc: std.mem.Allocator,
@@ -802,12 +799,12 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
 
     // open new devices
     for (r.items) |d| {
-        var dc = d.toContext(ctx_list.allocator) catch |e| {
+        const dc = d.toContext(ctx_list.allocator) catch |e| {
             d.withLogger(logz.err()).err(e).log();
             continue;
         };
         ctx_list.append(dc) catch @panic("OOM");
-        dc.withLogger(logz.info()).string("action", "added").log();
+        d.withLogger(logz.info()).string("action", "added").log();
     }
 }
 
@@ -949,16 +946,16 @@ const TransferCallback = struct {
     /// reference, not OWNED
     dev: *DeviceContext,
     /// reference, not OWNED
-    transfer: *Transfer,
+    transfer: *DeviceContext.Transfer,
     endpoint: Endpoint,
 
-    pub fn dtor(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.alloc.destroy(self);
     }
 
     /// return a type-erased pointer to the destructor
     pub fn dtorPtrTypeErased() *const fn (*anyopaque) void {
-        return @ptrCast(&@This().dtor);
+        return @ptrCast(&@This().deinit);
     }
 
     /// just a notification of the completion or timeout of the transfer

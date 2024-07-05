@@ -113,7 +113,7 @@ pub const UsbPack = packed struct {
         return ret;
     }
 
-    pub fn dtor(self: *Self, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
         if (self.data()) |s| {
             alloc.free(s);
         } else |_| {}

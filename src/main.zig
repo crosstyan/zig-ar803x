@@ -100,16 +100,24 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
         }
 
         pub fn enqueue(self: *@This(), pkt: T) ClosedError!void {
-            if (self.has_deinit()) {
-                return ClosedError.Closed;
+            {
+                if (self.has_deinit()) {
+                    return ClosedError.Closed;
+                }
+                self.lock.lockShared();
+                defer self.lock.unlockShared();
+                while (self._list.items.len >= MAX_SIZE) {
+                    _ = self._list.orderedRemove(0);
+                }
+                self._list.append(pkt) catch @panic("OOM");
             }
-            self.lock.lockShared();
-            while (self._list.items.len >= MAX_SIZE) {
-                _ = self._list.orderedRemove(0);
-            }
-            self._list.append(pkt) catch @panic("OOM");
-            self.lock.unlockShared();
             self.cv.signal();
+        }
+
+        pub fn is_empty(self: *@This()) bool {
+            self.lock.lockShared();
+            defer self.lock.unlockShared();
+            return self._list.items.len == 0;
         }
 
         pub fn peek(self: *@This()) ClosedError!?T {
@@ -117,12 +125,11 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
                 return ClosedError.Closed;
             }
             self.lock.lock();
+            defer self.lock.unlock();
             if (self._list.len == 0) {
-                self.lock.unlock();
                 return null;
             } else {
                 const ret = self._list.items[0];
-                self.lock.unlock();
                 return ret;
             }
         }
@@ -130,17 +137,22 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
         /// note that this function will block indefinitely
         /// until the queue is not empty
         pub fn dequeue(self: *@This()) ClosedError!T {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
             if (self.has_deinit()) {
                 return ClosedError.Closed;
             }
-            self.cv.wait(&self.mutex);
+            while (self.is_empty()) {
+                self.cv.wait(&self.mutex);
+            }
             if (self.has_deinit()) {
                 return ClosedError.Closed;
             }
             self.lock.lockShared();
+            defer self.lock.unlockShared();
             const ret = self._list.items[0];
             _ = self._list.orderedRemove(0);
-            self.lock.unlockShared();
             return ret;
         }
     };
@@ -447,7 +459,7 @@ const DeviceContext = struct {
 
     fn init_transfer_tx(self: *@This(), ep: *Endpoint) void {
         const alloc = self.allocator();
-        var cb = alloc.create(transfer_callback) catch @panic("OOM");
+        var cb = alloc.create(TransferCallback) catch @panic("OOM");
         var transfer: *Transfer = &self.arto.tx_transfer;
         cb.alloc = alloc;
         cb.dev = self;
@@ -459,11 +471,11 @@ const DeviceContext = struct {
             ep.addr,
             &transfer.buf,
             @intCast(transfer.buf.len),
-            transfer_callback.tx,
+            TransferCallback.tx,
             cb,
             100,
         );
-        transfer.setCallback(cb, transfer_callback.dtorPtrTypeErased());
+        transfer.setCallback(cb, TransferCallback.dtorPtrTypeErased());
     }
 
     /// transmit the data to tx endpoint
@@ -496,7 +508,7 @@ const DeviceContext = struct {
     fn init_transfer_rx(self: *DeviceContext, ep: *Endpoint) void {
         var ret: c_int = undefined;
         const l_alloc = self.allocator();
-        var cb = l_alloc.create(transfer_callback) catch @panic("OOM");
+        var cb = l_alloc.create(TransferCallback) catch @panic("OOM");
         var transfer: *Transfer = &self.arto.rx_transfer;
         cb.alloc = l_alloc;
         cb.dev = self;
@@ -510,7 +522,7 @@ const DeviceContext = struct {
             ep.addr,
             &transfer.buf,
             @intCast(transfer.buf.len),
-            transfer_callback.rx,
+            TransferCallback.rx,
             cb,
             0,
         );
@@ -518,7 +530,7 @@ const DeviceContext = struct {
         lg = ep.withLogger(lg).string("action", "submitting transfer");
         lg.log();
         transfer._closure = cb;
-        transfer._closure_dtor = transfer_callback.dtorPtrTypeErased();
+        transfer._closure_dtor = TransferCallback.dtorPtrTypeErased();
 
         ret = usb.libusb_submit_transfer(transfer.self);
         switch (ret) {
@@ -562,8 +574,9 @@ const DeviceContext = struct {
             var in = bb.bb_get_status_in_t{
                 .user_bmp = SLOT_BIT_MAP_MAX,
             };
+            // note that this ownership of this payload will go with pack
             const payload = stack_allocator.alloc(u8, @sizeOf(@TypeOf(in))) catch @panic("OOM");
-            defer self.allocator().free(payload);
+
             utils.fillBytesWith(payload, &in) catch unreachable;
             var pack = UsbPack{
                 .reqid = bb.BB_GET_STATUS,
@@ -572,11 +585,13 @@ const DeviceContext = struct {
                 .ptr = payload.ptr,
                 .len = @intCast(payload.len),
             };
+            defer pack.dtor(stack_allocator);
 
             const data = pack.marshal(stack_allocator) catch {
                 @panic("error when marshal");
             };
-            defer pack.dtor(stack_allocator);
+            defer stack_allocator.free(data);
+
             self.transmit(data) catch |e| {
                 var lg = self.withLogger(logz.err());
                 lg.string("action", "failed to transmit").err(e).log();
@@ -588,12 +603,14 @@ const DeviceContext = struct {
 
     pub fn receive_loop(self: *@This()) void {
         while (true) {
-            var el = self.arto.ctrl_queue.dequeue() catch {
+            var mpk = self.arto.ctrl_queue.dequeue() catch {
                 return;
             };
-            defer el.deinit();
+            defer mpk.deinit();
             var lg = self.withLogger(logz.info());
-            lg.string("from", "receive_loop").string("action", "received packet").log();
+            lg.string("from", "DeviceContext::receive_loop")
+                .string("action", "received packet")
+                .log();
         }
     }
 
@@ -898,7 +915,7 @@ pub fn printEndpoints(vid: u16, pid: u16, endpoints: []const Endpoint) void {
 // main loop when events are ready to be handled, or you must use
 // some other scheme to allow libusb to undertake whatever work
 // needs to be done.
-const transfer_callback = struct {
+const TransferCallback = struct {
     alloc: std.mem.Allocator,
     /// reference, not OWNED
     dev: *DeviceContext,
@@ -930,6 +947,7 @@ const transfer_callback = struct {
         lg.string("status", @tagName(status))
             .int("flags", trans.*.flags)
             .string("action", "transmit")
+            .string("from", "TransferCallback::tx")
             .log();
     }
 
@@ -946,13 +964,17 @@ const transfer_callback = struct {
         lg.string("status", @tagName(status))
             .int("flags", trans.*.flags)
             .string("action", "receive")
+            .int("len", rx_buf.len)
+            .string("from", "TransferCallback::rx")
             .log();
         if (rx_buf.len > 0) {
             var pkt_ = ManagedUsbPack.unmarshal(self.alloc, rx_buf);
             if (pkt_) |*m| {
                 lg = self.dev.withLogger(logz.info());
                 lg = self.endpoint.withLogger(lg);
-                m.pack.withLogger(lg).log();
+                m.pack.withLogger(lg)
+                    .string("from", "TransferCallback::rx")
+                    .log();
                 self.dev.arto.ctrl_queue.enqueue(m.*) catch {
                     return;
                 };
@@ -962,6 +984,7 @@ const transfer_callback = struct {
                 lg = self.endpoint.withLogger(lg);
                 lg.string("what", "failed to unmarshal")
                     .fmt("data", "{any}", .{rx_buf})
+                    .string("from", "TransferCallback::rx")
                     .err(err)
                     .log();
             }

@@ -63,8 +63,8 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
         const MAX_SIZE = max_size;
         const Self = @This();
 
-        q: std.ArrayList(T),
-        /// read-write lock
+        /// WARNING: don't use it directly
+        _list: std.ArrayList(T),
         lock: RwLock = RwLock{},
 
         /// used with `cv` to signal the queue is not empty
@@ -73,31 +73,31 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
 
         pub fn init(alloc: std.mem.Allocator) Self {
             return Self{
-                .q = std.ArrayList(T).init(alloc),
+                ._list = std.ArrayList(T).init(alloc),
             };
         }
 
         pub fn deinit(self: *@This()) void {
-            self.q.deinit();
+            self._list.deinit();
         }
 
         pub fn enqueue(self: *@This(), pkt: T) void {
             self.lock.lockShared();
-            while (self.q.items.len >= MAX_SIZE) {
-                _ = self.q.orderedRemove(0);
+            while (self._list.items.len >= MAX_SIZE) {
+                _ = self._list.orderedRemove(0);
             }
-            self.q.append(pkt) catch @panic("OOM");
+            self._list.append(pkt) catch @panic("OOM");
             self.lock.unlockShared();
             self.cv.signal();
         }
 
         pub fn peek(self: *@This()) ?T {
             self.lock.lock();
-            if (self.q.len == 0) {
+            if (self._list.len == 0) {
                 self.lock.unlock();
                 return null;
             } else {
-                const ret = self.q.items[0];
+                const ret = self._list.items[0];
                 self.lock.unlock();
                 return ret;
             }
@@ -106,8 +106,8 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
         pub fn dequeue(self: *@This()) T {
             self.cv.wait(&self.mutex);
             self.lock.lockShared();
-            const ret = self.q.items[0];
-            _ = self.q.orderedRemove(0);
+            const ret = self._list.items[0];
+            _ = self._list.orderedRemove(0);
             self.lock.unlockShared();
             return ret;
         }
@@ -115,7 +115,10 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
     return LockedQueueImpl;
 }
 
-const DeviceLike = struct {
+/// DeviceDesc is a intermediate struct for device information.
+/// Note that it's different from `libusb_device_descriptor`
+/// and it could construct a `DeviceContext` from it.
+const DeviceDesc = struct {
     const MAX_PORTS = 8;
     dev: *usb.libusb_device,
     vid: u16,
@@ -146,6 +149,11 @@ const DeviceLike = struct {
         }
         ret.ports = ret._ports_buf[0..@intCast(lsz)];
         return ret;
+    }
+
+    /// the same as calling `DeviceContext.from_device_desc`
+    pub inline fn to_context(self: @This(), alloc: std.mem.Allocator) LibUsbError!DeviceContext {
+        return DeviceContext.from_device_desc(alloc, self);
     }
 
     pub fn withLogger(self: *const @This(), logger: logz.Logger) logz.Logger {
@@ -270,7 +278,7 @@ const DeviceContext = struct {
         return &self.core.desc;
     }
 
-    pub fn from_device_like(alloc: std.mem.Allocator, d: DeviceLike) LibUsbError!@This() {
+    pub fn from_device_desc(alloc: std.mem.Allocator, d: DeviceDesc) LibUsbError!@This() {
         var ret: c_int = undefined;
         var l_hdl: ?*usb.libusb_device_handle = null;
         // Internally, this function adds a reference to the device and makes it
@@ -530,9 +538,9 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             self: *const @This(),
             alloc: std.mem.Allocator,
             poll_list: []const ?*usb.libusb_device,
-        ) struct { std.ArrayList(*const DeviceContext), std.ArrayList(DeviceLike) } {
+        ) struct { std.ArrayList(*const DeviceContext), std.ArrayList(DeviceDesc) } {
             var ret: c_int = undefined;
-            var filtered = std.ArrayList(DeviceLike).init(alloc);
+            var filtered = std.ArrayList(DeviceDesc).init(alloc);
             defer filtered.deinit();
             for (poll_list) |device| {
                 if (device) |val| {
@@ -542,10 +550,10 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
                         continue;
                     }
                     if (l_desc.idVendor == ARTO_RTOS_VID and l_desc.idProduct == ARTO_RTOS_PID) {
-                        const dev_like = DeviceLike.from_device(val) catch {
+                        const dd = DeviceDesc.from_device(val) catch {
                             continue;
                         };
-                        filtered.append(dev_like) catch @panic("OOM");
+                        filtered.append(dd) catch @panic("OOM");
                     }
                 }
             }
@@ -553,9 +561,9 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             const DEFAULT_CAP = 4;
             var left = std.ArrayList(*const DeviceContext).init(alloc);
             left.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
-            var right = std.ArrayList(DeviceLike).init(alloc);
+            var right = std.ArrayList(DeviceDesc).init(alloc);
             right.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
-            var inter = std.ArrayList(DeviceLike).init(alloc);
+            var inter = std.ArrayList(DeviceDesc).init(alloc);
             inter.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
             defer inter.deinit();
 
@@ -563,11 +571,11 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
             for (self.ctx_list) |*dc| {
                 var found = false;
                 const l_hash = dc.xxhash();
-                inner: for (filtered.items) |dl| {
-                    const r_hash = dl.xxhash();
+                inner: for (filtered.items) |dd| {
+                    const r_hash = dd.xxhash();
                     if (l_hash == r_hash) {
                         found = true;
-                        inter.append(dl) catch @panic("OOM");
+                        inter.append(dd) catch @panic("OOM");
                         break :inner;
                     }
                 }
@@ -577,11 +585,11 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
                 }
             }
 
-            for (filtered.items) |fdl| {
+            for (filtered.items) |fdd| {
                 var found = false;
-                const r_hash = fdl.xxhash();
-                inner: for (inter.items) |idl| {
-                    const l_hash = idl.xxhash();
+                const r_hash = fdd.xxhash();
+                inner: for (inter.items) |idd| {
+                    const l_hash = idd.xxhash();
                     if (l_hash == r_hash) {
                         found = true;
                         break :inner;
@@ -589,7 +597,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
                 }
 
                 if (!found) {
-                    right.append(fdl) catch @panic("OOM");
+                    right.append(fdd) catch @panic("OOM");
                 }
             }
 
@@ -614,7 +622,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
 
     // open new devices
     for (r.items) |d| {
-        var dc = DeviceContext.from_device_like(ctx_list.allocator, d) catch |e| {
+        var dc = d.to_context(ctx_list.allocator) catch |e| {
             d.withLogger(logz.err()).err(e).log();
             continue;
         };

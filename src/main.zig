@@ -1,12 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const logz = @import("logz");
+const bb = @import("bb/c.zig");
+const UsbPack = @import("bb/usbpack.zig").UsbPack;
+const ManagedUsbPack = @import("bb/usbpack.zig").ManagedUsbPack;
+const utils = @import("utils.zig");
 const usb = @cImport({
     @cInclude("libusb.h");
 });
-const bb = @import("bb/c.zig");
-const UsbPack = @import("bb/usbpack.zig").UsbPack;
-const utils = @import("utils.zig");
+
 const BadEnum = utils.BadEnum;
 const Mutex = std.Thread.Mutex;
 const RwLock = std.Thread.RwLock;
@@ -256,24 +258,6 @@ const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
 /// the maximum packet size of the endpoint, which is 512 for ar8030
 const TRANSFER_BUF_SIZE = 1024;
 
-/// See `UsbPack`
-const ManagedUsbPack = struct {
-    allocator: std.mem.Allocator,
-    pack: UsbPack,
-
-    pub fn unmarshal(alloc: std.mem.Allocator, buf: []const u8) !ManagedUsbPack {
-        const pack = try UsbPack.unmarshal(alloc, buf);
-        return ManagedUsbPack{
-            .allocator = alloc,
-            .pack = pack,
-        };
-    }
-
-    pub fn deinit(self: *@This()) void {
-        self.pack.deinit(self.allocator);
-    }
-};
-
 const UsbPackQueue = LockedQueue(ManagedUsbPack, 8);
 
 const DeviceContext = struct {
@@ -342,6 +326,9 @@ const DeviceContext = struct {
         }
     };
 
+    const Self = @This();
+
+    // ****** fields ******
     _has_deinit: std.atomic.Value(bool),
     gpa: DeviceGPA,
     core: DeviceHandles,
@@ -354,8 +341,7 @@ const DeviceContext = struct {
     /// managed by `alloc`
     _serial: []const u8,
     arto: ArtoContext,
-
-    const Self = @This();
+    // ****** end of fields ******
 
     pub fn ports(self: *const Self) []const u8 {
         return self._ports_buf[0..self._ports_len];

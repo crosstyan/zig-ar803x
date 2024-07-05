@@ -119,3 +119,21 @@ pub const UsbPack = packed struct {
         } else |_| {}
     }
 };
+
+/// See `UsbPack`
+pub const ManagedUsbPack = struct {
+    allocator: std.mem.Allocator,
+    pack: UsbPack,
+
+    pub fn unmarshal(alloc: std.mem.Allocator, buf: []const u8) !ManagedUsbPack {
+        const pack = try UsbPack.unmarshal(alloc, buf);
+        return ManagedUsbPack{
+            .allocator = alloc,
+            .pack = pack,
+        };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.pack.deinit(self.allocator);
+    }
+};

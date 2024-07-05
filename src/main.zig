@@ -61,6 +61,8 @@ pub fn libusb_error_2_set(err: c_int) LibUsbError {
 fn LockedQueue(comptime T: type, comptime max_size: usize) type {
     const LockedQueueImpl = struct {
         const MAX_SIZE = max_size;
+        const Self = @This();
+
         q: std.ArrayList(T),
         /// read-write lock
         lock: RwLock = RwLock{},
@@ -69,9 +71,9 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
         mutex: Mutex = Mutex{},
         cv: std.Thread.Condition = std.Thread.Condition{},
 
-        pub fn init(alloc: std.mem.Allocator) @This() {
-            return @This(){
-                .q = std.ArrayList(UsbPack).init(alloc),
+        pub fn init(alloc: std.mem.Allocator) Self {
+            return Self{
+                .q = std.ArrayList(T).init(alloc),
             };
         }
 
@@ -268,7 +270,7 @@ const DeviceContext = struct {
         return &self.core.desc;
     }
 
-    pub fn from_device_like(d: DeviceLike) LibUsbError!@This() {
+    pub fn from_device_like(alloc: std.mem.Allocator, d: DeviceLike) LibUsbError!@This() {
         var ret: c_int = undefined;
         var l_hdl: ?*usb.libusb_device_handle = null;
         // Internally, this function adds a reference to the device and makes it
@@ -319,7 +321,7 @@ const DeviceContext = struct {
             .self = rx_transfer,
             .lk = RwLock{},
         };
-        dc.arto.ctrl_queue = UsbPackQueue.init(gpa.allocator());
+        dc.arto.ctrl_queue = UsbPackQueue.init(alloc);
         return dc;
     }
 
@@ -612,7 +614,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
 
     // open new devices
     for (r.items) |d| {
-        var dc = DeviceContext.from_device_like(d) catch |e| {
+        var dc = DeviceContext.from_device_like(ctx_list.allocator, d) catch |e| {
             d.withLogger(logz.err()).err(e).log();
             continue;
         };

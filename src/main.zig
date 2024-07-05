@@ -144,6 +144,9 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
                 return ClosedError.Closed;
             }
             while (self.is_empty()) {
+                if (self.has_deinit()) {
+                    return ClosedError.Closed;
+                }
                 self.cv.wait(&self.mutex);
             }
             if (self.has_deinit()) {

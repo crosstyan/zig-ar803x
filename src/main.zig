@@ -311,6 +311,10 @@ const ArtoContext = struct {
     /// RELEASING the packet after consuming it.
     ctrl_queue: UsbPackQueue,
 
+    /// only initialized in `init`
+    tx_thread: std.Thread,
+    rx_thread: std.Thread,
+
     pub fn dtor(self: *@This()) void {
         self.tx_transfer.dtor();
         self.rx_transfer.dtor();
@@ -473,12 +477,13 @@ const DeviceContext = struct {
         const transfer = &self.arto.tx_transfer;
         const ok = transfer.lk.tryLockShared();
         if (!ok) {
-            TransmitError.Busy;
+            return TransmitError.Busy;
         }
         if (data.len > transfer.buf.len) {
             return TransmitError.Overflow;
         }
-        @memcpy(transfer.buf, data);
+        const target_slice = transfer.buf[0..data.len];
+        @memcpy(target_slice, data);
         transfer.self.length = @intCast(data.len);
         const ret = usb.libusb_submit_transfer(transfer.self);
         if (ret != 0) {
@@ -537,10 +542,22 @@ const DeviceContext = struct {
         }
     }
 
+    fn init_threads(self: *@This()) void {
+        const config = std.Thread.SpawnConfig{
+            .stack_size = 16 * 1024 * 1024,
+            .allocator = self.allocator(),
+        };
+        const tx_thread = std.Thread.spawn(config, Self.send_loop, .{self}) catch @panic("init thread");
+        const rx_thread = std.Thread.spawn(config, Self.receive_loop, .{self}) catch @panic("init thread");
+        self.arto.tx_thread = tx_thread;
+        self.arto.rx_thread = rx_thread;
+    }
+
     pub fn send_loop(self: *@This()) void {
         const BUFFER_SIZE = 4096;
-        const stack_buf: [BUFFER_SIZE]u8 = undefined;
-        var stack_allocator = std.heap.FixedBufferAllocator.init(stack_buf);
+        var stack_buf: [BUFFER_SIZE]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(stack_buf[0..]);
+        var stack_allocator = fixed.allocator();
         while (true) {
             var in = bb.bb_get_status_in_t{
                 .user_bmp = SLOT_BIT_MAP_MAX,
@@ -552,22 +569,26 @@ const DeviceContext = struct {
                 .reqid = bb.BB_GET_STATUS,
                 .msgid = 0,
                 .sta = 0,
-                .ptr = payload,
-                .len = payload.len,
+                .ptr = payload.ptr,
+                .len = @intCast(payload.len),
             };
 
             const data = pack.marshal(stack_allocator) catch {
                 @panic("error when marshal");
             };
             defer pack.dtor(stack_allocator);
-            self.transmit(data);
+            self.transmit(data) catch |e| {
+                var lg = self.withLogger(logz.err());
+                lg.string("action", "failed to transmit").err(e).log();
+                @panic("failed to transmit");
+            };
             std.time.sleep(1000 * std.time.ns_per_ms);
         }
     }
 
     pub fn receive_loop(self: *@This()) void {
         while (true) {
-            const el = self.arto.ctrl_queue.dequeue() catch {
+            var el = self.arto.ctrl_queue.dequeue() catch {
                 return;
             };
             defer el.deinit();
@@ -602,6 +623,7 @@ const DeviceContext = struct {
             return libusb_error_2_set(ret);
         }
         self.init_endpoints();
+        self.init_threads();
     }
 };
 

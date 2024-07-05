@@ -803,6 +803,8 @@ const transfer_callback = struct {
         if (rx_buf.len > 0) {
             var pkt_ = UsbPack.unmarshal(self.alloc, rx_buf);
             if (pkt_) |*pkt| {
+                lg = self.dev.withLogger(logz.info());
+                lg = self.endpoint.withLogger(lg);
                 pkt.withLogger(lg).log();
                 self.dev.arto.ctrl_queue.enqueue(pkt.*);
             } else |err| {

@@ -525,9 +525,8 @@ const DeviceContext = struct {
         if (ret != 0) {
             return libusb_error_2_set(ret);
         }
-        var lg = self.withLogger(logz.info());
-        lg.string("what", "submitted transmit")
-            .string("from", @src().fn_name).log();
+        var lg = utils.logWithSrc(self.withLogger(logz.info()), @src());
+        lg.string("what", "submitted transmit").log();
     }
 
     /// receive message from the IN endpoint (RX transfer)
@@ -570,9 +569,8 @@ const DeviceContext = struct {
             0 => transfer.lk.lockShared(),
             else => {
                 var lg = self.withLogger(logz.err());
-                lg = ep.withLogger(lg);
+                lg = utils.logWithSrc(ep.withLogger(lg), @src());
                 lg.int("code", ret)
-                    .string("from", @src().fn_name)
                     .string("what", "failed to submit transfer")
                     .log();
                 @panic("failed to submit transfer");
@@ -619,8 +617,7 @@ const DeviceContext = struct {
         self.withLogger(logz.info())
             .fmt("status", "{any}", .{status}).log();
 
-        self.withLogger(logz.info())
-            .string("from", @src().fn_name)
+        utils.logWithSrc(self.withLogger(logz.info()), @src())
             .string("what", "preparing finished").log();
 
         // finally, we start the loop thread, after querying status
@@ -675,9 +672,8 @@ const DeviceContext = struct {
             defer stack_allocator.free(data);
 
             self.transmit(data) catch |e| {
-                var lg = self.withLogger(logz.err());
-                lg.string("from", @src().fn_name)
-                    .err(e)
+                var lg = utils.logWithSrc(self.withLogger(logz.err()), @src());
+                lg.err(e)
                     .string("what", "failed to transmit, exiting thread")
                     .log();
                 return;
@@ -689,17 +685,15 @@ const DeviceContext = struct {
     pub fn recvLoop(self: *@This()) void {
         while (true) {
             var mpk = self.receive() catch |e| {
-                var lg = self.withLogger(logz.err());
-                lg.string("from", @src().fn_name)
-                    .err(e)
+                var lg = utils.logWithSrc(self.withLogger(logz.err()), @src());
+                lg.err(e)
                     .string("what", "failed to dequeue, exiting thread")
                     .log();
                 return;
             };
             defer mpk.deinit();
-            var lg = self.withLogger(logz.info());
-            lg.string("from", @src().fn_name)
-                .string("what", "received packet")
+            var lg = utils.logWithSrc(self.withLogger(logz.info()), @src());
+            lg.string("what", "received packet")
                 .log();
         }
     }
@@ -1037,12 +1031,11 @@ const TransferCallback = struct {
         self.transfer.lk.unlockShared();
         const status = transferStatusFromInt(trans.*.status) catch unreachable;
 
-        var lg = self.dev.withLogger(logz.info());
+        var lg = utils.logWithSrc(self.dev.withLogger(logz.info()), @src());
         lg = self.endpoint.withLogger(lg);
         lg.string("status", @tagName(status))
             .int("flags", trans.*.flags)
             .string("action", "transmit")
-            .string("from", @src().fn_name)
             .log();
         std.debug.assert(status == .completed);
     }
@@ -1056,33 +1049,30 @@ const TransferCallback = struct {
 
         const rx_buf = self.transfer.written();
         self.transfer.lk.unlockShared();
-        var lg = self.dev.withLogger(logz.info());
+        var lg = utils.logWithSrc(self.dev.withLogger(logz.info()), @src());
         lg = self.endpoint.withLogger(lg);
         lg.string("status", @tagName(status))
             .int("flags", trans.*.flags)
             .string("action", "receive")
             .int("len", rx_buf.len)
-            .string("from", @src().fn_name)
             .log();
 
         if (rx_buf.len > 0) {
             var pkt_ = ManagedUsbPack.unmarshal(self.alloc, rx_buf);
             if (pkt_) |*m| {
-                lg = self.dev.withLogger(logz.info());
+                lg = utils.logWithSrc(self.dev.withLogger(logz.info()), @src());
                 lg = self.endpoint.withLogger(lg);
                 m.pack.withLogger(lg)
-                    .string("from", @src().fn_name)
                     .log();
                 self.dev.arto.rx_queue.enqueue(m.*) catch {
                     return;
                 };
             } else |err| {
                 // failed to unmarshal
-                lg = self.dev.withLogger(logz.err());
+                lg = utils.logWithSrc(self.dev.withLogger(logz.err()), @src());
                 lg = self.endpoint.withLogger(lg);
                 lg.string("what", "failed to unmarshal")
                     .fmt("data", "{any}", .{rx_buf})
-                    .string("from", @src().fn_name)
                     .err(err)
                     .log();
             }

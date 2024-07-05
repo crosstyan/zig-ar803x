@@ -71,5 +71,5 @@ pub fn fillBytesWith(dst: []u8, src: anytype) LengthNotEqual!void {
 // https://github.com/ziglang/zig/blob/b3afba8a70af984423fc24e5b834df966693b50a/lib/std/builtin.zig#L243-L250
 pub fn logWithSrc(logger: logz.Logger, src: std.builtin.SourceLocation) logz.Logger {
     return logger
-        .fmt("from", "{s}:{d}@{s}", .{ src.file, src.line, src.fn_name });
+        .fmt("src", "{s}:{d}@{s}", .{ src.file, src.line, src.fn_name });
 }

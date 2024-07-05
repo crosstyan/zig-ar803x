@@ -474,7 +474,7 @@ const DeviceContext = struct {
         return h.final();
     }
 
-    fn init_transfer_tx(self: *@This(), ep: *Endpoint) void {
+    fn initTransferTx(self: *@This(), ep: *Endpoint) void {
         const alloc = self.allocator();
         var cb = alloc.create(TransferCallback) catch @panic("OOM");
         var transfer: *Transfer = &self.arto.tx_transfer;
@@ -525,7 +525,7 @@ const DeviceContext = struct {
         lg.string("action", "submitted transmit").log();
     }
 
-    fn init_transfer_rx(self: *DeviceContext, ep: *Endpoint) void {
+    fn initTransferRx(self: *DeviceContext, ep: *Endpoint) void {
         var ret: c_int = undefined;
         const l_alloc = self.allocator();
         var cb = l_alloc.create(TransferCallback) catch @panic("OOM");
@@ -564,28 +564,28 @@ const DeviceContext = struct {
         }
     }
 
-    fn init_endpoints(self: *@This()) void {
+    fn initEndpoints(self: *@This()) void {
         for (self.endpoints) |*ep| {
             if (ep.direction == Direction.out and ep.transferType == TransferType.bulk) {
-                self.init_transfer_tx(ep);
+                self.initTransferTx(ep);
             } else if (ep.direction == Direction.in and ep.transferType == TransferType.bulk) {
-                self.init_transfer_rx(ep);
+                self.initTransferRx(ep);
             }
         }
     }
 
-    fn init_threads(self: *@This()) void {
+    fn initThreads(self: *@This()) void {
         const config = std.Thread.SpawnConfig{
             .stack_size = 16 * 1024 * 1024,
             .allocator = self.allocator(),
         };
-        const tx_thread = std.Thread.spawn(config, Self.send_loop, .{self}) catch @panic("init thread");
-        const rx_thread = std.Thread.spawn(config, Self.receive_loop, .{self}) catch @panic("init thread");
+        const tx_thread = std.Thread.spawn(config, Self.sendLoop, .{self}) catch @panic("init thread");
+        const rx_thread = std.Thread.spawn(config, Self.recvLoop, .{self}) catch @panic("init thread");
         self.arto.tx_thread = tx_thread;
         self.arto.rx_thread = rx_thread;
     }
 
-    pub fn send_loop(self: *@This()) void {
+    pub fn sendLoop(self: *@This()) void {
         const BUFFER_SIZE = 4096;
         var stack_buf: [BUFFER_SIZE]u8 = undefined;
         var fixed = std.heap.FixedBufferAllocator.init(stack_buf[0..]);
@@ -623,7 +623,7 @@ const DeviceContext = struct {
         }
     }
 
-    pub fn receive_loop(self: *@This()) void {
+    pub fn recvLoop(self: *@This()) void {
         while (true) {
             var mpk = self.arto.ctrl_queue.dequeue() catch {
                 var lg = self.withLogger(logz.err());
@@ -663,9 +663,9 @@ const DeviceContext = struct {
                 .log();
             return libusb_error_2_set(ret);
         }
-        self.init_endpoints();
+        self.initEndpoints();
         self._has_deinit.store(false, std.builtin.AtomicOrder.unordered);
-        self.init_threads();
+        self.initThreads();
         const speed = usb.libusb_get_device_speed(self.mutDev());
         self.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
     }
@@ -817,10 +817,6 @@ pub inline fn usbEndpointTransferType(ep_attr: u8) u8 {
     return ep_attr & @as(u8, usb.LIBUSB_TRANSFER_TYPE_MASK);
 }
 
-pub inline fn unwarp_ifaces_desc(iface: *const usb.libusb_interface) []const usb.libusb_interface_descriptor {
-    return iface.altsetting[0..@intCast(iface.num_altsetting)];
-}
-
 const Direction = enum {
     in,
     out,
@@ -844,7 +840,7 @@ const Endpoint = struct {
     transferType: TransferType,
     maxPacketSize: u16,
 
-    pub fn from_desc(iConfig: u8, iInterface: u8, ep: *const usb.libusb_endpoint_descriptor) AppError!Endpoint {
+    pub fn fromDesc(iConfig: u8, iInterface: u8, ep: *const usb.libusb_endpoint_descriptor) AppError!Endpoint {
         const local = struct {
             pub inline fn addr_to_dir(addr: u8) BadEnum!Direction {
                 const dir = addr & usb.LIBUSB_ENDPOINT_DIR_MASK;
@@ -900,12 +896,17 @@ pub fn getEndpoints(alloc: std.mem.Allocator, device: *usb.libusb_device, ldesc:
         }
         if (config_) |config| {
             const ifaces = config.interface[0..@intCast(config.bNumInterfaces)];
-            for (ifaces) |iface_| {
-                // I don't really care alternate setting
-                const iface = unwarp_ifaces_desc(&iface_)[0];
+            for (ifaces) |iface_alt| {
+                const iface_alts = iface_alt.altsetting[0..@intCast(iface_alt.num_altsetting)];
+                if (iface_alts.len == 0) {
+                    continue;
+                }
+
+                // I don't really care alternate setting. Take the first one
+                const iface = iface_alts[0];
                 const endpoints = iface.endpoint[0..@intCast(iface.bNumEndpoints)];
                 for (endpoints) |ep| {
-                    const app_ep = Endpoint.from_desc(@intCast(i), iface.bInterfaceNumber, &ep) catch |e| {
+                    const app_ep = Endpoint.fromDesc(@intCast(i), iface.bInterfaceNumber, &ep) catch |e| {
                         logWithDevice(logz.err(), device, ldesc).err(e).log();
                         continue;
                     };

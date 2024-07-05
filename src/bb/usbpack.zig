@@ -1,5 +1,7 @@
 const std = @import("std");
 const logz = @import("logz");
+const utils = @import("../utils.zig");
+const LengthNotEqual = utils.LengthNotEqual;
 
 pub fn xorCheck(buf: []const u8) u8 {
     var xor: u8 = 0xff;
@@ -15,6 +17,7 @@ pub const UnmarshalError = error{
     LengthTooShort,
 };
 const NoContent = error{NoContent};
+const HasContent = error{HasContent};
 
 // Note that this struct is NOT owning `data`
 pub const UsbPack = packed struct {
@@ -40,6 +43,47 @@ pub const UsbPack = packed struct {
             return NoContent.NoContent;
         }
         return self.ptr.?[0..self.len];
+    }
+
+    /// data returns an instance of struct `T` filled with the data field
+    pub fn dataAs(self: *const Self, comptime T: type) !T {
+        const d = try self.data();
+        switch (@typeInfo(T)) {
+            .Struct => {
+                var ret: T = undefined;
+                try utils.fillWithBytes(&ret, d);
+                return ret;
+            },
+            else => @compileError("expected a struct type, found `" ++ @typeName(T) ++ "`"),
+        }
+    }
+
+    /// `fillWith` will allocate a new buffer with `alloc` and fill it with
+    /// the content of `data_ref`, which should be a pointer to its underlying data.
+    ///
+    /// Note that the ownership of the buffer is belongs to the `alloc` allocator,
+    /// so caller might want to free it after use.
+    ///
+    /// Will return `error.HasContent` if the `ptr` field is not null and `len` is greater than 0,
+    /// which means the buffer is already filled.
+    pub fn fillWith(self: *Self, alloc: std.mem.Allocator, data_ref: anytype) !void {
+        if (self.data()) |_| {
+            return HasContent.HasContent;
+        } else |_| {
+            // I'm expecting no content here
+            const P = @TypeOf(data_ref);
+            switch (@typeInfo(P)) {
+                .Pointer => {
+                    const T = @typeInfo(P).Pointer.child;
+                    const size = @sizeOf(T);
+                    const buf = try alloc.alloc(u8, size);
+                    try utils.fillBytesWith(buf, data_ref);
+                    self.ptr = buf.ptr;
+                    self.len = size;
+                },
+                else => @compileError("`data_ref` must be a pointer type, found `" ++ @typeName(P) ++ "`"),
+            }
+        }
     }
 
     /// marshal packs the struct into a byte slice
@@ -113,7 +157,9 @@ pub const UsbPack = packed struct {
         return ret;
     }
 
-    pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
+    /// free the `data`. Note that the `alloc` should be the same allocator
+    /// that was used to allocate the `data`
+    pub fn deinitWith(self: *Self, alloc: std.mem.Allocator) void {
         if (self.data()) |s| {
             alloc.free(s);
         } else |_| {}
@@ -122,6 +168,8 @@ pub const UsbPack = packed struct {
 
 /// See `UsbPack`
 pub const ManagedUsbPack = struct {
+    const Self = @This();
+
     allocator: std.mem.Allocator,
     pack: UsbPack,
 
@@ -133,7 +181,12 @@ pub const ManagedUsbPack = struct {
         };
     }
 
+    /// data returns an instance of struct `T` filled with the data field
+    pub fn dataAs(self: *const Self, comptime T: type) !T {
+        return self.pack.dataAs(T);
+    }
+
     pub fn deinit(self: *@This()) void {
-        self.pack.deinit(self.allocator);
+        self.pack.deinitWith(self.allocator);
     }
 };

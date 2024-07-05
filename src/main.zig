@@ -110,6 +110,8 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
                 self.lock.lockShared();
                 defer self.lock.unlockShared();
                 while (self._list.items.len >= MAX_SIZE) {
+                    utils.logWithSrc(logz.warn(), @src())
+                        .string("what", "queue is full, waiting for dequeue").log();
                     _ = self._list.orderedRemove(0);
                 }
                 self._list.append(pkt) catch @panic("OOM");
@@ -311,7 +313,7 @@ const DeviceContext = struct {
         rx_transfer: Transfer,
         /// Note that the consumer should be responsible for
         /// RELEASING the packet after consuming it.
-        ctrl_queue: UsbPackQueue,
+        rx_queue: UsbPackQueue,
 
         /// only initialized in `init`
         tx_thread: std.Thread,
@@ -320,7 +322,7 @@ const DeviceContext = struct {
         pub fn deinit(self: *@This()) void {
             self.tx_transfer.deinit();
             self.rx_transfer.deinit();
-            self.ctrl_queue.deinit();
+            self.rx_queue.deinit();
             self.tx_thread.join();
             self.rx_thread.join();
         }
@@ -436,7 +438,7 @@ const DeviceContext = struct {
         // the `DeviceContext`, which would cause a deadlock.
         // Interestingly, the deadlock is from the internal of GPA, needs to be
         // investigated further.
-        dc.arto.ctrl_queue = UsbPackQueue.init(alloc);
+        dc.arto.rx_queue = UsbPackQueue.init(alloc);
         return dc;
     }
 
@@ -524,7 +526,19 @@ const DeviceContext = struct {
             return libusb_error_2_set(ret);
         }
         var lg = self.withLogger(logz.info());
-        lg.string("action", "submitted transmit").log();
+        lg.string("what", "submitted transmit")
+            .string("from", @src().fn_name).log();
+    }
+
+    /// receive message from the IN endpoint (RX transfer)
+    ///
+    /// Note that the consumer is responsible for freeing the memory
+    /// by calling `deinit` after receiving a packet.
+    pub inline fn receive(self: *@This()) !ManagedUsbPack {
+        if (self.hasDeinit()) {
+            return ClosedError.Closed;
+        }
+        return self.arto.rx_queue.dequeue();
     }
 
     fn initTransferRx(self: *DeviceContext, ep: *Endpoint) void {
@@ -576,6 +590,56 @@ const DeviceContext = struct {
         }
     }
 
+    /// doing status query before start forward loop,
+    /// and it still NEEDS event loop running. Please call it in a separate thread.
+    fn loopPrepare(self: *@This()) void {
+        const BUFFER_SIZE = 4096;
+        var stack_buf: [BUFFER_SIZE]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(stack_buf[0..]);
+        const stack_allocator = fixed.allocator();
+
+        var in = bb.bb_get_status_in_t{
+            .user_bmp = SLOT_BIT_MAP_MAX,
+        };
+        var pack = UsbPack{
+            .reqid = bb.BB_GET_STATUS,
+            .msgid = 0,
+            .sta = 0,
+            .ptr = null,
+            .len = undefined,
+        };
+
+        // explicitly using stack space, don't have to release them
+        pack.fillWith(stack_allocator, &in) catch unreachable;
+        const data = pack.marshal(stack_allocator) catch unreachable;
+        self.transmit(data) catch unreachable;
+        var mpk = self.receive() catch unreachable;
+        defer mpk.deinit();
+        const status = mpk.dataAs(bb.bb_get_status_out_t) catch unreachable;
+        self.withLogger(logz.info())
+            .fmt("status", "{any}", .{status}).log();
+
+        self.withLogger(logz.info())
+            .string("from", @src().fn_name)
+            .string("what", "preparing finished").log();
+
+        // finally, we start the loop thread, after querying status
+        // and set callback etc.
+        self.initThreads();
+    }
+
+    /// run `loopPrepare` in a separate thread
+    fn runLoopPrepare(self: *@This()) void {
+        const config = std.Thread.SpawnConfig{
+            .stack_size = 16 * 1024 * 1024,
+            .allocator = self.allocator(),
+        };
+
+        // expect it to exit soon
+        var t_hdl = std.Thread.spawn(config, Self.loopPrepare, .{self}) catch @panic("init thread");
+        t_hdl.detach();
+    }
+
     fn initThreads(self: *@This()) void {
         const config = std.Thread.SpawnConfig{
             .stack_size = 16 * 1024 * 1024,
@@ -596,29 +660,25 @@ const DeviceContext = struct {
             var in = bb.bb_get_status_in_t{
                 .user_bmp = SLOT_BIT_MAP_MAX,
             };
-            // note that this ownership of this payload will go with pack
-            const payload = stack_allocator.alloc(u8, @sizeOf(@TypeOf(in))) catch @panic("OOM");
 
-            utils.fillBytesWith(payload, &in) catch unreachable;
             var pack = UsbPack{
                 .reqid = bb.BB_GET_STATUS,
                 .msgid = 0,
                 .sta = 0,
-                .ptr = payload.ptr,
-                .len = @intCast(payload.len),
+                .ptr = null,
+                .len = undefined,
             };
-            defer pack.deinit(stack_allocator);
+            pack.fillWith(stack_allocator, &in) catch @panic("stack OOM");
+            defer pack.deinitWith(stack_allocator);
 
-            const data = pack.marshal(stack_allocator) catch {
-                @panic("error when marshal");
-            };
+            const data = pack.marshal(stack_allocator) catch unreachable;
             defer stack_allocator.free(data);
 
             self.transmit(data) catch |e| {
                 var lg = self.withLogger(logz.err());
                 lg.string("from", @src().fn_name)
                     .err(e)
-                    .string("action", "failed to transmit, exiting thread")
+                    .string("what", "failed to transmit, exiting thread")
                     .log();
                 return;
             };
@@ -628,18 +688,18 @@ const DeviceContext = struct {
 
     pub fn recvLoop(self: *@This()) void {
         while (true) {
-            var mpk = self.arto.ctrl_queue.dequeue() catch |e| {
+            var mpk = self.receive() catch |e| {
                 var lg = self.withLogger(logz.err());
                 lg.string("from", @src().fn_name)
                     .err(e)
-                    .string("action", "failed to dequeue, exiting thread")
+                    .string("what", "failed to dequeue, exiting thread")
                     .log();
                 return;
             };
             defer mpk.deinit();
             var lg = self.withLogger(logz.info());
             lg.string("from", @src().fn_name)
-                .string("action", "received packet")
+                .string("what", "received packet")
                 .log();
         }
     }
@@ -669,7 +729,9 @@ const DeviceContext = struct {
         }
         self.initEndpoints();
         self._has_deinit.store(false, std.builtin.AtomicOrder.unordered);
-        self.initThreads();
+        // we could call transmit/receive from now on, as long as the event loop is running
+
+        self.runLoopPrepare();
         const speed = usb.libusb_get_device_speed(self.mutDev());
         self.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
     }
@@ -1011,7 +1073,7 @@ const TransferCallback = struct {
                 m.pack.withLogger(lg)
                     .string("from", @src().fn_name)
                     .log();
-                self.dev.arto.ctrl_queue.enqueue(m.*) catch {
+                self.dev.arto.rx_queue.enqueue(m.*) catch {
                     return;
                 };
             } else |err| {

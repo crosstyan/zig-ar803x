@@ -331,10 +331,13 @@ const ArtoContext = struct {
         self.tx_transfer.dtor();
         self.rx_transfer.dtor();
         self.ctrl_queue.deinit();
+        self.tx_thread.join();
+        self.rx_thread.join();
     }
 };
 
 const DeviceContext = struct {
+    _has_deinit: std.atomic.Value(bool),
     gpa: DeviceGPA,
     core: DeviceHandles,
     bus: u8,
@@ -373,6 +376,10 @@ const DeviceContext = struct {
         return &self.core.desc;
     }
 
+    pub inline fn has_deinit(self: *const Self) bool {
+        return self._has_deinit.load(std.builtin.AtomicOrder.unordered);
+    }
+
     pub fn from_device_desc(alloc: std.mem.Allocator, d: DeviceDesc) LibUsbError!@This() {
         var ret: c_int = undefined;
         var l_hdl: ?*usb.libusb_device_handle = null;
@@ -395,6 +402,7 @@ const DeviceContext = struct {
         const serial = dynStringDescriptorOr(gpa.allocator(), l_hdl.?, l_desc.iSerialNumber, "");
         @memcpy(dyn_ports, d.ports);
         var dc = DeviceContext{
+            ._has_deinit = std.atomic.Value(bool).init(true),
             .gpa = gpa,
             .core = DeviceHandles{
                 .dev = d.dev,
@@ -428,7 +436,8 @@ const DeviceContext = struct {
         return dc;
     }
 
-    pub fn dtor(self: *Self) void {
+    pub fn deinit(self: *Self) void {
+        self._has_deinit.store(true, std.builtin.AtomicOrder.unordered);
         self.core.dtor();
         self.allocator().free(self.ports);
         self.allocator().free(self.endpoints);
@@ -486,6 +495,9 @@ const DeviceContext = struct {
     ///
     /// use `arto.ctrl_queue` to receive the data coming from the device
     pub fn transmit(self: *@This(), data: []const u8) !void {
+        if (self.has_deinit()) {
+            return ClosedError.Closed;
+        }
         const transfer = &self.arto.tx_transfer;
         const ok = transfer.lk.tryLockShared();
         if (!ok) {
@@ -594,8 +606,10 @@ const DeviceContext = struct {
 
             self.transmit(data) catch |e| {
                 var lg = self.withLogger(logz.err());
-                lg.string("action", "failed to transmit").err(e).log();
-                @panic("failed to transmit");
+                lg.string("from", "DeviceContext::receive_loop")
+                    .string("action", "failed to transmit, exiting thread")
+                    .err(e).log();
+                return;
             };
             std.time.sleep(1000 * std.time.ns_per_ms);
         }
@@ -641,6 +655,7 @@ const DeviceContext = struct {
         }
         self.init_endpoints();
         self.init_threads();
+        self._has_deinit.store(false, std.builtin.AtomicOrder.unordered);
     }
 };
 
@@ -764,7 +779,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         inner: for (ctx_list.items, 0..) |*rdc, index| {
             if (ldc == rdc) {
                 rdc.withLogger(logz.warn().string("action", "removed")).log();
-                rdc.dtor();
+                rdc.deinit();
                 _ = ctx_list.orderedRemove(index);
                 break :inner;
             }
@@ -1154,7 +1169,7 @@ pub fn main() !void {
     var device_list = std.ArrayList(DeviceContext).init(alloc);
     defer {
         for (device_list.items) |*dev| {
-            dev.dtor();
+            dev.deinit();
         }
         device_list.deinit();
     }

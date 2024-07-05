@@ -44,6 +44,10 @@ const TransmitError = error{
     Busy,
 };
 
+const ClosedError = error{
+    Closed,
+};
+
 pub fn libusb_error_2_set(err: c_int) LibUsbError {
     return switch (err) {
         usb.LIBUSB_ERROR_IO => LibUsbError.IO,
@@ -68,6 +72,8 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
         const MAX_SIZE = max_size;
         const Self = @This();
 
+        /// should be false until `deinit` is called
+        _has_deinit: std.atomic.Value(bool),
         /// WARNING: don't use it directly
         _list: std.ArrayList(T),
         lock: RwLock = RwLock{},
@@ -79,14 +85,24 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
         pub fn init(alloc: std.mem.Allocator) Self {
             return Self{
                 ._list = std.ArrayList(T).init(alloc),
+                ._has_deinit = std.atomic.Value(bool).init(false),
             };
         }
 
+        pub fn has_deinit(self: *@This()) bool {
+            return self._has_deinit.load(std.builtin.AtomicOrder.unordered);
+        }
+
         pub fn deinit(self: *@This()) void {
+            self._has_deinit.store(true, std.builtin.AtomicOrder.unordered);
+            self.cv.broadcast();
             self._list.deinit();
         }
 
-        pub fn enqueue(self: *@This(), pkt: T) void {
+        pub fn enqueue(self: *@This(), pkt: T) ClosedError!void {
+            if (self.has_deinit()) {
+                return ClosedError.Closed;
+            }
             self.lock.lockShared();
             while (self._list.items.len >= MAX_SIZE) {
                 _ = self._list.orderedRemove(0);
@@ -96,7 +112,10 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
             self.cv.signal();
         }
 
-        pub fn peek(self: *@This()) ?T {
+        pub fn peek(self: *@This()) ClosedError!?T {
+            if (self.has_deinit()) {
+                return ClosedError.Closed;
+            }
             self.lock.lock();
             if (self._list.len == 0) {
                 self.lock.unlock();
@@ -108,8 +127,16 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
             }
         }
 
-        pub fn dequeue(self: *@This()) T {
+        /// note that this function will block indefinitely
+        /// until the queue is not empty
+        pub fn dequeue(self: *@This()) ClosedError!T {
+            if (self.has_deinit()) {
+                return ClosedError.Closed;
+            }
             self.cv.wait(&self.mutex);
+            if (self.has_deinit()) {
+                return ClosedError.Closed;
+            }
             self.lock.lockShared();
             const ret = self._list.items[0];
             _ = self._list.orderedRemove(0);
@@ -510,6 +537,45 @@ const DeviceContext = struct {
         }
     }
 
+    pub fn send_loop(self: *@This()) void {
+        const BUFFER_SIZE = 4096;
+        const stack_buf: [BUFFER_SIZE]u8 = undefined;
+        var stack_allocator = std.heap.FixedBufferAllocator.init(stack_buf);
+        while (true) {
+            var in = bb.bb_get_status_in_t{
+                .user_bmp = SLOT_BIT_MAP_MAX,
+            };
+            const payload = stack_allocator.alloc(u8, @sizeOf(@TypeOf(in))) catch @panic("OOM");
+            defer self.allocator().free(payload);
+            utils.fillBytesWith(payload, &in) catch unreachable;
+            var pack = UsbPack{
+                .reqid = bb.BB_GET_STATUS,
+                .msgid = 0,
+                .sta = 0,
+                .ptr = payload,
+                .len = payload.len,
+            };
+
+            const data = pack.marshal(stack_allocator) catch {
+                @panic("error when marshal");
+            };
+            defer pack.dtor(stack_allocator);
+            self.transmit(data);
+            std.time.sleep(1000 * std.time.ns_per_ms);
+        }
+    }
+
+    pub fn receive_loop(self: *@This()) void {
+        while (true) {
+            const el = self.arto.ctrl_queue.dequeue() catch {
+                return;
+            };
+            defer el.deinit();
+            var lg = self.withLogger(logz.info());
+            lg.string("from", "receive_loop").string("action", "received packet").log();
+        }
+    }
+
     pub fn init(self: *@This()) LibUsbError!void {
         const speed = usb.libusb_get_device_speed(self.mutDev());
         var ret: c_int = undefined;
@@ -865,7 +931,9 @@ const transfer_callback = struct {
                 lg = self.dev.withLogger(logz.info());
                 lg = self.endpoint.withLogger(lg);
                 m.pack.withLogger(lg).log();
-                self.dev.arto.ctrl_queue.enqueue(m.*);
+                self.dev.arto.ctrl_queue.enqueue(m.*) catch {
+                    return;
+                };
             } else |err| {
                 // failed to unmarshal
                 lg = self.dev.withLogger(logz.err());

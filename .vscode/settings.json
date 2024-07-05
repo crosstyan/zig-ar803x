@@ -12,6 +12,7 @@
         "callconv",
         "comptime",
         "deinit",
+        "deinitialized",
         "DWORD",
         "iface",
         "ifaces",

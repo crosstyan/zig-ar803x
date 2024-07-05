@@ -1,0 +1,21 @@
+// from https://dev.to/watzon/debugging-zig-with-vs-code-44ca
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build",
+            "type": "shell",
+            "command": "zig build",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            // https://stackoverflow.com/questions/47946868/how-to-get-rid-of-terminal-will-be-reused-by-tasks-press-any-key-to-close-it
+            "presentation": {
+                "reveal": "silent",
+                "revealProblems": "onProblem",
+                "close": true
+            }
+        }
+    ]
+}

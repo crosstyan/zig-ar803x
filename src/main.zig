@@ -347,10 +347,17 @@ const DeviceContext = struct {
     /// managed by `alloc`
     endpoints: []Endpoint,
     /// managed by `alloc`
-    serial: []const u8,
+    _serial: []const u8,
     arto: ArtoContext,
 
     const Self = @This();
+
+    pub fn serial(self: *const Self) []const u8 {
+        if (self.has_deinit()) {
+            return "DEINIT";
+        }
+        return self._serial;
+    }
 
     pub fn allocator(self: *Self) std.mem.Allocator {
         return self.gpa.allocator();
@@ -399,7 +406,7 @@ const DeviceContext = struct {
         var gpa = DeviceGPA{};
         const dyn_ports = gpa.allocator().alloc(u8, d.ports.len) catch @panic("OOM");
         const eps = getEndpoints(gpa.allocator(), d.dev, &l_desc);
-        const serial = dynStringDescriptorOr(gpa.allocator(), l_hdl.?, l_desc.iSerialNumber, "");
+        const l_serial = dynStringDescriptorOr(gpa.allocator(), l_hdl.?, l_desc.iSerialNumber, "");
         @memcpy(dyn_ports, d.ports);
         var dc = DeviceContext{
             ._has_deinit = std.atomic.Value(bool).init(true),
@@ -412,7 +419,7 @@ const DeviceContext = struct {
             .bus = d.bus,
             .port = d.port,
             .ports = dyn_ports,
-            .serial = serial,
+            ._serial = l_serial,
             .endpoints = eps,
             .arto = undefined,
         };
@@ -441,7 +448,7 @@ const DeviceContext = struct {
         self.core.dtor();
         self.allocator().free(self.ports);
         self.allocator().free(self.endpoints);
-        self.allocator().free(self.serial);
+        self.allocator().free(self._serial);
         self.arto.dtor();
         const chk = self.gpa.deinit();
         if (chk != .ok) {
@@ -452,7 +459,7 @@ const DeviceContext = struct {
     /// attach the device information to the logger
     pub fn withLogger(self: *const Self, logger: logz.Logger) logz.Logger {
         return logger
-            .string("serial_number", self.serial)
+            .string("serial_number", self.serial())
             .int("bus", self.bus)
             .int("port", self.port);
     }
@@ -606,7 +613,7 @@ const DeviceContext = struct {
 
             self.transmit(data) catch |e| {
                 var lg = self.withLogger(logz.err());
-                lg.string("from", "DeviceContext::receive_loop")
+                lg.string("from", "DeviceContext::send_loop")
                     .string("action", "failed to transmit, exiting thread")
                     .err(e).log();
                 return;
@@ -618,6 +625,10 @@ const DeviceContext = struct {
     pub fn receive_loop(self: *@This()) void {
         while (true) {
             var mpk = self.arto.ctrl_queue.dequeue() catch {
+                var lg = self.withLogger(logz.err());
+                lg.string("from", "DeviceContext::receive_loop")
+                    .string("action", "failed to dequeue, exiting thread")
+                    .log();
                 return;
             };
             defer mpk.deinit();
@@ -629,11 +640,9 @@ const DeviceContext = struct {
     }
 
     pub fn init(self: *@This()) LibUsbError!void {
-        const speed = usb.libusb_get_device_speed(self.mutDev());
         var ret: c_int = undefined;
         printStrDesc(self.mutHdl(), self.desc());
         printEndpoints(self.desc().idVendor, self.desc().idProduct, self.endpoints);
-        self.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
         if (!is_windows) {
             // https://libusb.sourceforge.io/api-1.0/group__libusb__self.html#gac35b26fef01271eba65c60b2b3ce1cbf
             ret = usb.libusb_set_auto_detach_kernel_driver(self.mutHdl(), 1);
@@ -654,8 +663,10 @@ const DeviceContext = struct {
             return libusb_error_2_set(ret);
         }
         self.init_endpoints();
-        self.init_threads();
         self._has_deinit.store(false, std.builtin.AtomicOrder.unordered);
+        self.init_threads();
+        const speed = usb.libusb_get_device_speed(self.mutDev());
+        self.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
     }
 };
 

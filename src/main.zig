@@ -211,7 +211,7 @@ const Transfer = struct {
     /// This mutex is mainly used in TX transfer.
     /// For RX transfer, the event loop is always polling and
     /// the transfer will be restarted after the callback is called.
-    lk: RwLock,
+    lk: RwLock = RwLock{},
 
     pub fn dtor(self: *@This()) void {
         if (self.closure_dtor) |free| {
@@ -281,9 +281,7 @@ const DeviceContext = struct {
     pub fn from_device_desc(alloc: std.mem.Allocator, d: DeviceDesc) LibUsbError!@This() {
         var ret: c_int = undefined;
         var l_hdl: ?*usb.libusb_device_handle = null;
-        // Internally, this function adds a reference to the device and makes it
-        // available to you through `libusb_get_device()`. This reference is
-        // removed during `libusb_close()`.
+        // Internally, this function adds a reference
         ret = usb.libusb_open(d.dev, &l_hdl);
         if (ret != 0 or l_hdl == null) {
             d.withLogger(logz.err().string("err", "failed to open device")).log();
@@ -323,12 +321,14 @@ const DeviceContext = struct {
         }
         dc.arto.tx_transfer = Transfer{
             .self = tx_transfer,
-            .lk = RwLock{},
         };
         dc.arto.rx_transfer = Transfer{
             .self = rx_transfer,
-            .lk = RwLock{},
         };
+        // somehow the `ctrl_queue` is not happy with allocated with allocator in
+        // the `DeviceContext`, which would cause a deadlock.
+        // Interestingly, the deadlock is from the internal of GPA, needs to be
+        // investigated further.
         dc.arto.ctrl_queue = UsbPackQueue.init(alloc);
         return dc;
     }

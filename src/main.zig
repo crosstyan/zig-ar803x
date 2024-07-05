@@ -14,6 +14,7 @@ const RwLock = std.Thread.RwLock;
 const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
 const XXHASH_SEED: u32 = 0x0;
+const USB_MAX_PORTS = 8;
 
 const AppError = error{
     BadDescriptor,
@@ -166,14 +167,18 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
 /// Note that it's different from `libusb_device_descriptor`
 /// and it could construct a `DeviceContext` from it.
 const DeviceDesc = struct {
-    const MAX_PORTS = 8;
+    const Self = @This();
     dev: *usb.libusb_device,
     vid: u16,
     pid: u16,
     bus: u8,
     port: u8,
-    _ports_buf: [MAX_PORTS]u8,
-    ports: []const u8,
+    _ports_buf: [USB_MAX_PORTS]u8,
+    _ports_len: usize,
+
+    pub fn ports(self: *const Self) []const u8 {
+        return self._ports_buf[0..self._ports_len];
+    }
 
     pub fn fromDevice(dev: *usb.libusb_device) AppError!@This() {
         var desc: usb.libusb_device_descriptor = undefined;
@@ -188,13 +193,14 @@ const DeviceDesc = struct {
             .bus = usb.libusb_get_bus_number(dev),
             .port = usb.libusb_get_port_number(dev),
             ._ports_buf = undefined,
-            .ports = undefined,
+            ._ports_len = 0,
         };
-        const lsz = usb.libusb_get_port_numbers(dev, &ret._ports_buf, MAX_PORTS);
-        if (lsz < 0) {
+        const sz = usb.libusb_get_port_numbers(dev, &ret._ports_buf, USB_MAX_PORTS);
+        if (sz < 0) {
             return AppError.BadPortNumbers;
         }
-        ret.ports = ret._ports_buf[0..@intCast(lsz)];
+        ret._ports_len = @intCast(sz);
+
         return ret;
     }
 
@@ -216,7 +222,7 @@ const DeviceDesc = struct {
         var h = std.hash.XxHash32.init(XXHASH_SEED);
         h.update(utils.anytype2Slice(&self.bus));
         h.update(utils.anytype2Slice(&self.port));
-        h.update(self.ports);
+        h.update(self.ports());
         return h.final();
     }
 };
@@ -259,7 +265,7 @@ const ManagedUsbPack = struct {
         const pack = try UsbPack.unmarshal(alloc, buf);
         return ManagedUsbPack{
             .allocator = alloc,
-            .pack = pack.*,
+            .pack = pack,
         };
     }
 
@@ -341,8 +347,8 @@ const DeviceContext = struct {
     core: DeviceHandles,
     bus: u8,
     port: u8,
-    /// managed by `alloc`
-    ports: []const u8,
+    _ports_buf: [USB_MAX_PORTS]u8,
+    _ports_len: usize,
     /// managed by `alloc`
     endpoints: []Endpoint,
     /// managed by `alloc`
@@ -351,9 +357,13 @@ const DeviceContext = struct {
 
     const Self = @This();
 
-    pub fn serial(self: *const Self) []const u8 {
+    pub fn ports(self: *const Self) []const u8 {
+        return self._ports_buf[0..self._ports_len];
+    }
+
+    pub fn serial(self: *const Self) ClosedError![]const u8 {
         if (self.hasDeinit()) {
-            return "DEINIT";
+            return ClosedError.Closed;
         }
         return self._serial;
     }
@@ -404,10 +414,8 @@ const DeviceContext = struct {
         }
 
         var gpa = DeviceGPA{};
-        const dyn_ports = gpa.allocator().alloc(u8, d.ports.len) catch @panic("OOM");
         const eps = getEndpoints(gpa.allocator(), d.dev, &l_desc);
         const l_serial = dynStringDescriptorOr(gpa.allocator(), l_hdl.?, l_desc.iSerialNumber, "");
-        @memcpy(dyn_ports, d.ports);
         var dc = DeviceContext{
             ._has_deinit = std.atomic.Value(bool).init(true),
             .gpa = gpa,
@@ -418,7 +426,8 @@ const DeviceContext = struct {
             },
             .bus = d.bus,
             .port = d.port,
-            .ports = dyn_ports,
+            ._ports_buf = d._ports_buf,
+            ._ports_len = d._ports_len,
             ._serial = l_serial,
             .endpoints = eps,
             .arto = undefined,
@@ -446,7 +455,6 @@ const DeviceContext = struct {
     pub fn deinit(self: *Self) void {
         self._has_deinit.store(true, std.builtin.AtomicOrder.unordered);
         self.core.deinit();
-        self.allocator().free(self.ports);
         self.allocator().free(self.endpoints);
         self.allocator().free(self._serial);
         self.arto.deinit();
@@ -458,10 +466,17 @@ const DeviceContext = struct {
 
     /// attach the device information to the logger
     pub fn withLogger(self: *const Self, logger: logz.Logger) logz.Logger {
-        return logger
-            .string("serial_number", self.serial())
-            .int("bus", self.bus)
-            .int("port", self.port);
+        const s = self.serial();
+        if (s) |sn| {
+            return logger
+                .string("serial_number", sn)
+                .int("bus", self.bus)
+                .int("port", self.port);
+        } else |_| {
+            return logger
+                .int("bus", self.bus)
+                .int("port", self.port);
+        }
     }
 
     /// hash the device by bus, port, and ports
@@ -469,7 +484,7 @@ const DeviceContext = struct {
         var h = std.hash.XxHash32.init(XXHASH_SEED);
         h.update(utils.anytype2Slice(&self.bus));
         h.update(utils.anytype2Slice(&self.port));
-        h.update(self.ports);
+        h.update(self.ports());
         return h.final();
     }
 

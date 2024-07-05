@@ -58,58 +58,60 @@ pub fn libusb_error_2_set(err: c_int) LibUsbError {
     };
 }
 
-const LockedQueue = struct {
-    const MAX_SIZE = 3;
-    const T = UsbPack;
-    q: std.ArrayList(T),
-    /// read-write lock
-    lock: RwLock = RwLock{},
+fn LockedQueue(comptime T: type, comptime max_size: usize) type {
+    const LockedQueueImpl = struct {
+        const MAX_SIZE = max_size;
+        q: std.ArrayList(T),
+        /// read-write lock
+        lock: RwLock = RwLock{},
 
-    /// used with `cv` to signal the queue is not empty
-    mutex: Mutex = Mutex{},
-    cv: std.Thread.Condition = std.Thread.Condition{},
+        /// used with `cv` to signal the queue is not empty
+        mutex: Mutex = Mutex{},
+        cv: std.Thread.Condition = std.Thread.Condition{},
 
-    pub fn init(alloc: std.mem.Allocator) LockedQueue {
-        return LockedQueue{
-            .q = std.ArrayList(UsbPack).init(alloc),
-        };
-    }
-
-    pub fn deinit(self: *@This()) void {
-        self.q.deinit();
-    }
-
-    pub fn enqueue(self: *@This(), pkt: T) void {
-        self.lock.lockShared();
-        while (self.q.items.len >= MAX_SIZE) {
-            _ = self.q.orderedRemove(0);
+        pub fn init(alloc: std.mem.Allocator) @This() {
+            return @This(){
+                .q = std.ArrayList(UsbPack).init(alloc),
+            };
         }
-        self.q.append(pkt) catch @panic("OOM");
-        self.lock.unlockShared();
-        self.cv.signal();
-    }
 
-    pub fn peek(self: *@This()) ?T {
-        self.lock.lock();
-        if (self.q.len == 0) {
-            self.lock.unlock();
-            return null;
-        } else {
+        pub fn deinit(self: *@This()) void {
+            self.q.deinit();
+        }
+
+        pub fn enqueue(self: *@This(), pkt: T) void {
+            self.lock.lockShared();
+            while (self.q.items.len >= MAX_SIZE) {
+                _ = self.q.orderedRemove(0);
+            }
+            self.q.append(pkt) catch @panic("OOM");
+            self.lock.unlockShared();
+            self.cv.signal();
+        }
+
+        pub fn peek(self: *@This()) ?T {
+            self.lock.lock();
+            if (self.q.len == 0) {
+                self.lock.unlock();
+                return null;
+            } else {
+                const ret = self.q.items[0];
+                self.lock.unlock();
+                return ret;
+            }
+        }
+
+        pub fn dequeue(self: *@This()) T {
+            self.cv.wait(&self.mutex);
+            self.lock.lockShared();
             const ret = self.q.items[0];
-            self.lock.unlock();
+            _ = self.q.orderedRemove(0);
+            self.lock.unlockShared();
             return ret;
         }
-    }
-
-    pub fn dequeue(self: *@This()) T {
-        self.cv.wait(&self.mutex);
-        self.lock.lockShared();
-        const ret = self.q.items[0];
-        _ = self.q.orderedRemove(0);
-        self.lock.unlockShared();
-        return ret;
-    }
-};
+    };
+    return LockedQueueImpl;
+}
 
 const DeviceLike = struct {
     const MAX_PORTS = 8;
@@ -211,12 +213,14 @@ const Transfer = struct {
     }
 };
 
+const UsbPackQueue = LockedQueue(UsbPack, 8);
+
 // arto specific context
 // like network, transfer, etc.
 const ArtoContext = struct {
     tx_transfer: Transfer,
     rx_transfer: Transfer,
-    ctrl_queue: LockedQueue,
+    ctrl_queue: UsbPackQueue,
 
     pub fn dtor(self: *@This()) void {
         self.tx_transfer.dtor();
@@ -315,7 +319,7 @@ const DeviceContext = struct {
             .self = rx_transfer,
             .lk = RwLock{},
         };
-        dc.arto.ctrl_queue = LockedQueue.init(gpa.allocator());
+        dc.arto.ctrl_queue = UsbPackQueue.init(gpa.allocator());
         return dc;
     }
 

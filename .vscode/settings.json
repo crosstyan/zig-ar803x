@@ -5,12 +5,14 @@
     ],
     "cSpell.words": [
         "alloc",
+        "altsetting",
         "anyopaque",
         "anytype",
         "ARTO",
         "callconv",
         "comptime",
         "deinit",
+        "DWORD",
         "iface",
         "ifaces",
         "ldesc",
@@ -28,9 +30,12 @@
         "struct",
         "timeval",
         "unmarshal",
+        "unref",
+        "unwarp",
         "usbpack",
         "usec",
         "usize",
+        "WINAPI",
         "XXHASH"
     ]
 }

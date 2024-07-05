@@ -39,6 +39,11 @@ const LibUsbError = error{
     Unknown,
 };
 
+const TransmitError = error{
+    Overflow,
+    Busy,
+};
+
 pub fn libusb_error_2_set(err: c_int) LibUsbError {
     return switch (err) {
         usb.LIBUSB_ERROR_IO => LibUsbError.IO,
@@ -128,7 +133,7 @@ const DeviceDesc = struct {
     _ports_buf: [MAX_PORTS]u8,
     ports: []const u8,
 
-    pub fn from_device(dev: *usb.libusb_device) AppError!@This() {
+    pub fn fromDevice(dev: *usb.libusb_device) AppError!@This() {
         var desc: usb.libusb_device_descriptor = undefined;
         const err = usb.libusb_get_device_descriptor(dev, &desc);
         if (err != 0) {
@@ -152,7 +157,7 @@ const DeviceDesc = struct {
     }
 
     /// the same as calling `DeviceContext.from_device_desc`
-    pub inline fn to_context(self: @This(), alloc: std.mem.Allocator) LibUsbError!DeviceContext {
+    pub inline fn toContext(self: @This(), alloc: std.mem.Allocator) LibUsbError!DeviceContext {
         return DeviceContext.from_device_desc(alloc, self);
     }
 
@@ -199,12 +204,16 @@ const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
     .thread_safe = true,
 });
 
+/// I believe it should be fine as long as it's larger
+/// the maximum packet size of the endpoint, which is 512 for ar8030
+const TRANSFER_BUF_SIZE = 1024;
+
 /// Transfer is a wrapper of `libusb_transfer`
 /// but with a closure and a closure destructor
 const Transfer = struct {
     self: *usb.libusb_transfer,
-    closure: ?*anyopaque = null,
-    closure_dtor: ?*const fn (*anyopaque) void = null,
+    buf: [TRANSFER_BUF_SIZE]u8 = undefined,
+
     /// lock when `libusb_submit_transfer` is called.
     /// callback SHOULD be responsible for unlocking it.
     ///
@@ -213,9 +222,28 @@ const Transfer = struct {
     /// the transfer will be restarted after the callback is called.
     lk: RwLock = RwLock{},
 
+    /// `user_data` in `libusb_transfer`
+    _closure: ?*anyopaque = null,
+    _closure_dtor: ?*const fn (*anyopaque) void = null,
+
+    /// ONLY used in RX transfer
+    pub fn written(self: *@This()) []const u8 {
+        return self.buf[0..@intCast(self.self.actual_length)];
+    }
+
+    pub fn setCallback(self: *@This(), cb: *anyopaque, destructor: *const fn (*anyopaque) void) void {
+        if (self._closure_dtor) |free| {
+            if (self._closure) |ptr| {
+                free(ptr);
+            }
+        }
+        self._closure = cb;
+        self._closure_dtor = destructor;
+    }
+
     pub fn dtor(self: *@This()) void {
-        if (self.closure_dtor) |free| {
-            if (self.closure) |ptr| {
+        if (self._closure_dtor) |free| {
+            if (self._closure) |ptr| {
                 free(ptr);
             }
         }
@@ -223,13 +251,37 @@ const Transfer = struct {
     }
 };
 
-const UsbPackQueue = LockedQueue(UsbPack, 8);
+/// See `UsbPack`
+const ManagedUsbPack = struct {
+    allocator: std.mem.Allocator,
+    pack: UsbPack,
+
+    pub fn unmarshal(alloc: std.mem.Allocator, buf: []const u8) !ManagedUsbPack {
+        var pack = UsbPack.unmarshal(alloc, buf);
+        if (pack) |*p| {
+            return ManagedUsbPack{
+                .allocator = alloc,
+                .pack = p.*,
+            };
+        } else |err| {
+            return err;
+        }
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.pack.dtor(self.allocator);
+    }
+};
+
+const UsbPackQueue = LockedQueue(ManagedUsbPack, 8);
 
 // arto specific context
 // like network, transfer, etc.
 const ArtoContext = struct {
     tx_transfer: Transfer,
     rx_transfer: Transfer,
+    /// Note that the consumer should be responsible for
+    /// RELEASING the packet after consuming it.
     ctrl_queue: UsbPackQueue,
 
     pub fn dtor(self: *@This()) void {
@@ -363,7 +415,6 @@ const DeviceContext = struct {
     }
 
     fn init_transfer_tx(self: *@This(), ep: *Endpoint) void {
-        var ret: c_int = undefined;
         const alloc = self.allocator();
         var cb = alloc.create(transfer_callback) catch @panic("OOM");
         var transfer: *Transfer = &self.arto.tx_transfer;
@@ -371,46 +422,43 @@ const DeviceContext = struct {
         cb.dev = self;
         cb.transfer = transfer;
         cb.endpoint = ep.*;
-        const payload = bb.bb_get_status_in_t{
-            .user_bmp = SLOT_BIT_MAP_MAX,
-        };
-        const data_buf = alloc.alloc(u8, @sizeOf(@TypeOf(payload))) catch @panic("OOM");
-        defer alloc.free(data_buf);
-        utils.fillBytesWith(data_buf, &payload) catch unreachable;
-        const header = UsbPack{
-            .msgid = 0x0,
-            .reqid = bb.BB_GET_STATUS,
-            .sta = 0x0,
-            .ptr = data_buf.ptr,
-            .len = @intCast(data_buf.len),
-        };
-        const tx_buffer = header.marshal(alloc) catch @panic("OOM");
-        cb.buffer = tx_buffer;
         usb.libusb_fill_bulk_transfer(
             transfer.self,
             self.mutHdl(),
             ep.addr,
-            tx_buffer.ptr,
-            @intCast(tx_buffer.len),
+            &transfer.buf,
+            @intCast(transfer.buf.len),
             transfer_callback.tx,
             cb,
-            1_000,
+            100,
         );
-        var lg = self.withLogger(logz.info());
-        lg = ep.withLogger(lg).string("action", "submitting transfer");
-        lg.log();
-        transfer.closure = cb;
-        transfer.closure_dtor = transfer_callback.void_dtor();
-        ret = usb.libusb_submit_transfer(transfer.self);
-        switch (ret) {
-            0 => transfer.lk.lockShared(),
-            else => {
-                lg = self.withLogger(logz.err());
-                lg = ep.withLogger(lg);
-                lg.int("code", ret).string("what", "failed to submit transfer").log();
-                @panic("failed to submit transfer");
-            },
+        transfer.setCallback(cb, transfer_callback.dtorPtrTypeErased());
+    }
+
+    /// transmit the data to tx endpoint
+    ///
+    /// `init_transfer_tx` should be called before this
+    /// and the event loop should have started (you can't call this in the event
+    /// loop thread)
+    ///
+    /// use `arto.ctrl_queue` to receive the data coming from the device
+    pub fn transmit(self: *@This(), data: []const u8) !void {
+        const transfer = &self.arto.tx_transfer;
+        const ok = transfer.lk.tryLockShared();
+        if (!ok) {
+            TransmitError.Busy;
         }
+        if (data.len > transfer.buf.len) {
+            return TransmitError.Overflow;
+        }
+        @memcpy(transfer.buf, data);
+        transfer.self.length = @intCast(data.len);
+        const ret = usb.libusb_submit_transfer(transfer.self);
+        if (ret != 0) {
+            return libusb_error_2_set(ret);
+        }
+        var lg = self.withLogger(logz.info());
+        lg.string("action", "submitted transfer").log();
     }
 
     fn init_transfer_rx(self: *DeviceContext, ep: *Endpoint) void {
@@ -422,16 +470,14 @@ const DeviceContext = struct {
         cb.dev = self;
         cb.transfer = transfer;
         cb.endpoint = ep.*;
-        const rx_buffer = l_alloc.alloc(u8, ep.maxPacketSize) catch @panic("OOM");
-        cb.buffer = rx_buffer;
         // timeout 0
         // callback won't be called because of timeout
         usb.libusb_fill_bulk_transfer(
             transfer.self,
             self.mutHdl(),
             ep.addr,
-            rx_buffer.ptr,
-            @intCast(rx_buffer.len),
+            &transfer.buf,
+            @intCast(transfer.buf.len),
             transfer_callback.rx,
             cb,
             0,
@@ -439,8 +485,8 @@ const DeviceContext = struct {
         var lg = self.withLogger(logz.info());
         lg = ep.withLogger(lg).string("action", "submitting transfer");
         lg.log();
-        transfer.closure = cb;
-        transfer.closure_dtor = transfer_callback.void_dtor();
+        transfer._closure = cb;
+        transfer._closure_dtor = transfer_callback.dtorPtrTypeErased();
 
         ret = usb.libusb_submit_transfer(transfer.self);
         switch (ret) {
@@ -550,7 +596,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
                         continue;
                     }
                     if (l_desc.idVendor == ARTO_RTOS_VID and l_desc.idProduct == ARTO_RTOS_PID) {
-                        const dd = DeviceDesc.from_device(val) catch {
+                        const dd = DeviceDesc.fromDevice(val) catch {
                             continue;
                         };
                         filtered.append(dd) catch @panic("OOM");
@@ -622,7 +668,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
 
     // open new devices
     for (r.items) |d| {
-        var dc = d.to_context(ctx_list.allocator) catch |e| {
+        var dc = d.toContext(ctx_list.allocator) catch |e| {
             d.withLogger(logz.err()).err(e).log();
             continue;
         };
@@ -770,20 +816,20 @@ const transfer_callback = struct {
     dev: *DeviceContext,
     /// reference, not OWNED
     transfer: *Transfer,
-    /// owned by `alloc`
-    buffer: []u8,
     endpoint: Endpoint,
 
     pub fn dtor(self: *@This()) void {
-        self.alloc.free(self.buffer);
         self.alloc.destroy(self);
     }
 
-    /// return a function pointer to the destructor
-    pub fn void_dtor() *const fn (*anyopaque) void {
+    /// return a type-erased pointer to the destructor
+    pub fn dtorPtrTypeErased() *const fn (*anyopaque) void {
         return @ptrCast(&@This().dtor);
     }
 
+    /// just a notification of the completion or timeout of the transfer
+    ///
+    /// Note that the lock (`lk`) is assumed to be locked (by `DeviceContext.transmit`)
     pub fn tx(trans: [*c]usb.libusb_transfer) callconv(.C) void {
         if (trans == null) {
             @panic("null transfer");
@@ -805,8 +851,7 @@ const transfer_callback = struct {
         }
         const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
         const status = transferStatusFromInt(trans.*.status) catch unreachable;
-        const len: usize = @intCast(trans.*.actual_length);
-        const rx_buf: []const u8 = self.buffer[0..len];
+        const rx_buf = self.transfer.written();
         self.transfer.lk.unlockShared();
         var lg = self.dev.withLogger(logz.info());
         lg = self.endpoint.withLogger(lg);
@@ -815,12 +860,12 @@ const transfer_callback = struct {
             .string("action", "receive")
             .log();
         if (rx_buf.len > 0) {
-            var pkt_ = UsbPack.unmarshal(self.alloc, rx_buf);
-            if (pkt_) |*pkt| {
+            var pkt_ = ManagedUsbPack.unmarshal(self.alloc, rx_buf);
+            if (pkt_) |*m| {
                 lg = self.dev.withLogger(logz.info());
                 lg = self.endpoint.withLogger(lg);
-                pkt.withLogger(lg).log();
-                self.dev.arto.ctrl_queue.enqueue(pkt.*);
+                m.pack.withLogger(lg).log();
+                self.dev.arto.ctrl_queue.enqueue(m.*);
             } else |err| {
                 // failed to unmarshal
                 lg = self.dev.withLogger(logz.err());

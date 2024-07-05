@@ -536,7 +536,7 @@ const DeviceContext = struct {
             return libusb_error_2_set(ret);
         }
         var lg = self.withLogger(logz.info());
-        lg.string("action", "submitted transfer").log();
+        lg.string("action", "submitted transmit").log();
     }
 
     fn init_transfer_rx(self: *DeviceContext, ep: *Endpoint) void {
@@ -560,9 +560,6 @@ const DeviceContext = struct {
             cb,
             0,
         );
-        var lg = self.withLogger(logz.info());
-        lg = ep.withLogger(lg).string("action", "submitting transfer");
-        lg.log();
         transfer._closure = cb;
         transfer._closure_dtor = TransferCallback.dtorPtrTypeErased();
 
@@ -570,9 +567,12 @@ const DeviceContext = struct {
         switch (ret) {
             0 => transfer.lk.lockShared(),
             else => {
-                lg = self.withLogger(logz.err());
+                var lg = self.withLogger(logz.err());
                 lg = ep.withLogger(lg);
-                lg.int("code", ret).string("what", "failed to submit transfer").log();
+                lg.int("code", ret)
+                    .string("from", @src().fn_name)
+                    .string("what", "failed to submit transfer")
+                    .log();
                 @panic("failed to submit transfer");
             },
         }
@@ -628,7 +628,7 @@ const DeviceContext = struct {
 
             self.transmit(data) catch |e| {
                 var lg = self.withLogger(logz.err());
-                lg.string("from", "DeviceContext::send_loop")
+                lg.string("from", @src().fn_name)
                     .string("action", "failed to transmit, exiting thread")
                     .err(e).log();
                 return;
@@ -641,14 +641,14 @@ const DeviceContext = struct {
         while (true) {
             var mpk = self.arto.ctrl_queue.dequeue() catch {
                 var lg = self.withLogger(logz.err());
-                lg.string("from", "DeviceContext::receive_loop")
+                lg.string("from", @src().fn_name)
                     .string("action", "failed to dequeue, exiting thread")
                     .log();
                 return;
             };
             defer mpk.deinit();
             var lg = self.withLogger(logz.info());
-            lg.string("from", "DeviceContext::receive_loop")
+            lg.string("from", @src().fn_name)
                 .string("action", "received packet")
                 .log();
         }
@@ -983,6 +983,7 @@ const TransferCallback = struct {
         const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
         self.transfer.lk.unlockShared();
         const status = transferStatusFromInt(trans.*.status) catch unreachable;
+
         var lg = self.dev.withLogger(logz.info());
         lg = self.endpoint.withLogger(lg);
         lg.string("status", @tagName(status))
@@ -990,6 +991,7 @@ const TransferCallback = struct {
             .string("action", "transmit")
             .string("from", "TransferCallback::tx")
             .log();
+        std.debug.assert(status == .completed);
     }
 
     pub fn rx(trans: [*c]usb.libusb_transfer) callconv(.C) void {
@@ -998,6 +1000,7 @@ const TransferCallback = struct {
         }
         const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
         const status = transferStatusFromInt(trans.*.status) catch unreachable;
+
         const rx_buf = self.transfer.written();
         self.transfer.lk.unlockShared();
         var lg = self.dev.withLogger(logz.info());
@@ -1006,15 +1009,16 @@ const TransferCallback = struct {
             .int("flags", trans.*.flags)
             .string("action", "receive")
             .int("len", rx_buf.len)
-            .string("from", "TransferCallback::rx")
+            .string("from", @src().fn_name)
             .log();
+
         if (rx_buf.len > 0) {
             var pkt_ = ManagedUsbPack.unmarshal(self.alloc, rx_buf);
             if (pkt_) |*m| {
                 lg = self.dev.withLogger(logz.info());
                 lg = self.endpoint.withLogger(lg);
                 m.pack.withLogger(lg)
-                    .string("from", "TransferCallback::rx")
+                    .string("from", @src().fn_name)
                     .log();
                 self.dev.arto.ctrl_queue.enqueue(m.*) catch {
                     return;
@@ -1025,11 +1029,12 @@ const TransferCallback = struct {
                 lg = self.endpoint.withLogger(lg);
                 lg.string("what", "failed to unmarshal")
                     .fmt("data", "{any}", .{rx_buf})
-                    .string("from", "TransferCallback::rx")
+                    .string("from", @src().fn_name)
                     .err(err)
                     .log();
             }
         }
+
         // keeps receiving
         const err = usb.libusb_submit_transfer(trans);
         lg = self.dev.withLogger(logz.err());

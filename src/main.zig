@@ -101,7 +101,7 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
             };
         }
 
-        pub fn hasDeinit(self: *@This()) bool {
+        pub fn hasDeinit(self: *const @This()) bool {
             return self._has_deinit.load(std.builtin.AtomicOrder.unordered);
         }
 
@@ -118,7 +118,7 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
             {
                 self.lock.lockShared();
                 defer self.lock.unlockShared();
-                while (self._list.items.len >= MAX_SIZE) {
+                while (self.lenNoCheck() >= MAX_SIZE) {
                     utils.logWithSrc(logz.warn(), @src())
                         .string("what", "full queue, discarding old element").log();
                     var elem = self._list.orderedRemove(0);
@@ -131,9 +131,27 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
             self.cv.signal();
         }
 
-        pub inline fn isEmpty(self: *@This()) bool {
-            // don't even bother to lock
-            return self._list.items.len == 0;
+        inline fn lenNoCheck(self: *const @This()) usize {
+            return self._list.items.len;
+        }
+
+        inline fn isEmptyNoCheck(self: *const @This()) bool {
+            return self.lenNoCheck() == 0;
+        }
+
+        /// return the length of the queue
+        pub inline fn len(self: *@This()) ClosedError!usize {
+            if (self.hasDeinit()) {
+                return ClosedError.Closed;
+            }
+            self.lock.lock();
+            defer self.lock.unlock();
+            return self.lenNoCheck();
+        }
+
+        /// return whether the queue is empty
+        pub inline fn isEmpty(self: *@This()) ClosedError!bool {
+            return try self.len() == 0;
         }
 
         pub fn peek(self: *@This()) ClosedError!?T {
@@ -159,7 +177,7 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
             if (self.hasDeinit()) {
                 return ClosedError.Closed;
             }
-            while (self.isEmpty()) {
+            while (self.isEmptyNoCheck()) {
                 if (self.hasDeinit()) {
                     return ClosedError.Closed;
                 }
@@ -571,8 +589,7 @@ const DeviceContext = struct {
             cb,
             0,
         );
-        transfer._closure = cb;
-        transfer._closure_dtor = TransferCallback.dtorPtrTypeErased();
+        transfer.setCallback(cb, TransferCallback.dtorPtrTypeErased());
 
         ret = usb.libusb_submit_transfer(transfer.self);
         switch (ret) {
@@ -1046,6 +1063,8 @@ const TransferCallback = struct {
         std.debug.assert(status == .completed);
     }
 
+    /// basically it checks & unmarshal the packet received from the endpoint,
+    /// and then enqueues it to the `rx_queue` in `DeviceContext` for further processing.
     pub fn rx(trans: [*c]usb.libusb_transfer) callconv(.C) void {
         if (trans == null) {
             @panic("null transfer");
@@ -1064,17 +1083,19 @@ const TransferCallback = struct {
             .log();
 
         if (rx_buf.len > 0) {
-            var pkt_ = ManagedUsbPack.unmarshal(self.alloc, rx_buf);
-            if (pkt_) |*m| {
+            var mpk_ = ManagedUsbPack.unmarshal(self.alloc, rx_buf);
+            if (mpk_) |*mpk| {
                 lg = utils.logWithSrc(self.dev.withLogger(logz.info()), @src());
                 lg = self.endpoint.withLogger(lg);
-                m.pack.withLogger(lg)
+                mpk.pack.withLogger(lg)
                     .log();
-                self.dev.arto.rx_queue.enqueue(m.*) catch {
+                self.dev.arto.rx_queue.enqueue(mpk.*) catch |e| {
+                    lg = utils.logWithSrc(self.dev.withLogger(logz.err()), @src());
+                    lg.err(e).string("what", "failed to enqueue").log();
+                    mpk.deinit();
                     return;
                 };
             } else |err| {
-                // failed to unmarshal
                 lg = utils.logWithSrc(self.dev.withLogger(logz.err()), @src());
                 lg = self.endpoint.withLogger(lg);
                 lg.string("what", "failed to unmarshal")
@@ -1084,12 +1105,12 @@ const TransferCallback = struct {
             }
         }
 
-        // keeps receiving
+        // resubmit the transfer
         const err = usb.libusb_submit_transfer(trans);
         lg = self.dev.withLogger(logz.err());
         lg = self.endpoint.withLogger(lg);
         switch (err) {
-            0 => self.transfer.lk.unlockShared(),
+            0 => self.transfer.lk.lockShared(),
             usb.LIBUSB_ERROR_NO_DEVICE => {
                 // upstream should monitor the device list
                 // and handle the device removal

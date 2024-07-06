@@ -24,6 +24,7 @@
         "logz",
         "memcpy",
         "msgid",
+        "orelse",
         "pointee",
         "posix",
         "reqid",

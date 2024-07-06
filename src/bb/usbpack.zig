@@ -32,7 +32,11 @@ pub const UsbPack = packed struct {
     const fixedPackBase = 1 + 4 + 4 + 4 + 4 + 1 + 1;
 
     pub inline fn withLogger(self: *const Self, log: logz.Logger) logz.Logger {
-        return log.int("reqid", self.reqid).int("msgid", self.msgid).int("sta", self.sta);
+        if (self.data()) |d| {
+            return log.int("reqid", self.reqid).int("msgid", self.msgid).int("sta", self.sta).int("data_len", d.len);
+        } else |_| {
+            return log.int("reqid", self.reqid).int("msgid", self.msgid).int("sta", self.sta);
+        }
     }
 
     /// data combines the `ptr` and `len` fields into a valid byte slice

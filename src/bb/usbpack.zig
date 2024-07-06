@@ -23,9 +23,9 @@ const HasContent = error{HasContent};
 pub const UsbPack = packed struct {
     reqid: u32,
     msgid: u32,
-    sta: i32,
-    ptr: ?[*]const u8,
-    len: u32,
+    sta: i32 = 0,
+    ptr: ?[*]const u8 = null,
+    len: u32 = 0,
 
     const Self = @This();
     // usbpack 的固定长度

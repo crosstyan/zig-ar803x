@@ -512,6 +512,9 @@ const DeviceContext = struct {
     /// and the event loop should have started (you can't call this in the event
     /// loop thread)
     ///
+    /// Note that the data will be copy to the internal buffer, and will return
+    /// `TransmitError.Overflow` if the data is too large. (See `TRANSFER_BUF_SIZE`)
+    ///
     /// use `arto.ctrl_queue` to receive the data coming from the device
     pub fn transmit(self: *@This(), data: []const u8) !void {
         if (self.hasDeinit()) {
@@ -610,8 +613,6 @@ const DeviceContext = struct {
             .reqid = bb.BB_GET_STATUS,
             .msgid = 0,
             .sta = 0,
-            .ptr = null,
-            .len = undefined,
         };
 
         // explicitly using stack space, don't have to release them
@@ -669,8 +670,6 @@ const DeviceContext = struct {
                 .reqid = bb.BB_GET_STATUS,
                 .msgid = 0,
                 .sta = 0,
-                .ptr = null,
-                .len = undefined,
             };
             pack.fillWith(stack_allocator, &in) catch @panic("stack OOM");
             defer pack.deinitWith(stack_allocator);

@@ -68,7 +68,7 @@ pub fn libusb_error_2_set(err: c_int) LibUsbError {
         usb.LIBUSB_ERROR_NO_MEM => LibUsbError.NoMem,
         usb.LIBUSB_ERROR_NOT_SUPPORTED => LibUsbError.NotSupported,
         usb.LIBUSB_ERROR_OTHER => LibUsbError.Other,
-        else => LibUsbError.Unknown,
+        else => std.debug.panic("unknown libusb error code: {}", .{err}),
     };
 }
 
@@ -450,8 +450,7 @@ const DeviceContext = struct {
         const tx_transfer = usb.libusb_alloc_transfer(0);
         const rx_transfer = usb.libusb_alloc_transfer(0);
         if (tx_transfer == null or rx_transfer == null) {
-            dc.withLogger(logz.err()).string("err", "failed to allocate transfer").log();
-            @panic("failed to allocate transfer, might be OOM");
+            std.debug.panic("device at bus {} port {} failed to allocate transfer, might be OOM", .{ d.bus, d.port });
         }
         dc.arto.tx_transfer = Transfer{
             .self = tx_transfer,
@@ -658,7 +657,7 @@ const DeviceContext = struct {
         };
 
         // expect it to exit soon
-        var t_hdl = std.Thread.spawn(config, Self.loopPrepare, .{self}) catch @panic("init thread");
+        var t_hdl = std.Thread.spawn(config, Self.loopPrepare, .{self}) catch unreachable;
         t_hdl.detach();
     }
 
@@ -667,8 +666,8 @@ const DeviceContext = struct {
             .stack_size = DEFAULT_THREAD_STACK_SIZE,
             .allocator = self.allocator(),
         };
-        const tx_thread = std.Thread.spawn(config, Self.sendLoop, .{self}) catch @panic("init thread");
-        const rx_thread = std.Thread.spawn(config, Self.recvLoop, .{self}) catch @panic("init thread");
+        const tx_thread = std.Thread.spawn(config, Self.sendLoop, .{self}) catch unreachable;
+        const rx_thread = std.Thread.spawn(config, Self.recvLoop, .{self}) catch unreachable;
         self.arto.tx_thread = tx_thread;
         self.arto.rx_thread = rx_thread;
     }

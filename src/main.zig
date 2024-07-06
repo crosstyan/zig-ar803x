@@ -17,6 +17,8 @@ const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
 const XXHASH_SEED: u32 = 0x0;
 const USB_MAX_PORTS = 8;
+const TRANSFER_BUF_SIZE = 2048;
+const DEFAULT_THREAD_STACK_SIZE = 16 * 1024 * 1024;
 
 const AppError = error{
     BadDescriptor,
@@ -79,15 +81,22 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
         _has_deinit: std.atomic.Value(bool),
         /// WARNING: don't use it directly
         _list: std.ArrayList(T),
+        /// used when modifying the `_list`
         lock: RwLock = RwLock{},
 
-        /// used with `cv` to signal the queue is not empty
+        /// used with `cv` to signal the `dequeue`, different from `lock`
         mutex: Mutex = Mutex{},
         cv: std.Thread.Condition = std.Thread.Condition{},
+        /// function to call when removing an element.
+        /// Only useful when the queue is full, and needs to discard old
+        /// elements.
+        elem_dtor: ?*const fn (*T) void = null,
 
         pub fn init(alloc: std.mem.Allocator) Self {
+            var l = std.ArrayList(T).init(alloc);
+            l.ensureTotalCapacity(max_size) catch @panic("OOM");
             return Self{
-                ._list = std.ArrayList(T).init(alloc),
+                ._list = l,
                 ._has_deinit = std.atomic.Value(bool).init(false),
             };
         }
@@ -103,25 +112,27 @@ fn LockedQueue(comptime T: type, comptime max_size: usize) type {
         }
 
         pub fn enqueue(self: *@This(), pkt: T) ClosedError!void {
+            if (self.hasDeinit()) {
+                return ClosedError.Closed;
+            }
             {
-                if (self.hasDeinit()) {
-                    return ClosedError.Closed;
-                }
                 self.lock.lockShared();
                 defer self.lock.unlockShared();
                 while (self._list.items.len >= MAX_SIZE) {
                     utils.logWithSrc(logz.warn(), @src())
-                        .string("what", "queue is full, waiting for dequeue").log();
-                    _ = self._list.orderedRemove(0);
+                        .string("what", "full queue, discarding old element").log();
+                    var elem = self._list.orderedRemove(0);
+                    if (self.elem_dtor) |dtor| {
+                        dtor(&elem);
+                    }
                 }
                 self._list.append(pkt) catch @panic("OOM");
             }
             self.cv.signal();
         }
 
-        pub fn isEmpty(self: *@This()) bool {
-            self.lock.lockShared();
-            defer self.lock.unlockShared();
+        pub inline fn isEmpty(self: *@This()) bool {
+            // don't even bother to lock
             return self._list.items.len == 0;
         }
 
@@ -255,10 +266,6 @@ const is_windows = builtin.os.tag == .windows;
 const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
     .thread_safe = true,
 });
-
-/// I believe it should be fine as long as it's larger
-/// the maximum packet size of the endpoint, which is 512 for ar8030
-const TRANSFER_BUF_SIZE = 1024;
 
 const UsbPackQueue = LockedQueue(ManagedUsbPack, 8);
 
@@ -628,7 +635,7 @@ const DeviceContext = struct {
     /// run `loopPrepare` in a separate thread
     fn runLoopPrepare(self: *@This()) void {
         const config = std.Thread.SpawnConfig{
-            .stack_size = 16 * 1024 * 1024,
+            .stack_size = DEFAULT_THREAD_STACK_SIZE,
             .allocator = self.allocator(),
         };
 
@@ -639,7 +646,7 @@ const DeviceContext = struct {
 
     fn initThreads(self: *@This()) void {
         const config = std.Thread.SpawnConfig{
-            .stack_size = 16 * 1024 * 1024,
+            .stack_size = DEFAULT_THREAD_STACK_SIZE,
             .allocator = self.allocator(),
         };
         const tx_thread = std.Thread.spawn(config, Self.sendLoop, .{self}) catch @panic("init thread");

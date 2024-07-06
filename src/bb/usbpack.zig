@@ -31,7 +31,7 @@ pub const UsbPack = packed struct {
     // usbpack 的固定长度
     const fixedPackBase = 1 + 4 + 4 + 4 + 4 + 1 + 1;
 
-    pub fn withLogger(self: *const Self, log: logz.Logger) logz.Logger {
+    pub inline fn withLogger(self: *const Self, log: logz.Logger) logz.Logger {
         return log.int("reqid", self.reqid).int("msgid", self.msgid).int("sta", self.sta);
     }
 
@@ -173,7 +173,7 @@ pub const ManagedUsbPack = struct {
     allocator: std.mem.Allocator,
     pack: UsbPack,
 
-    pub fn unmarshal(alloc: std.mem.Allocator, buf: []const u8) !ManagedUsbPack {
+    pub inline fn unmarshal(alloc: std.mem.Allocator, buf: []const u8) !ManagedUsbPack {
         const pack = try UsbPack.unmarshal(alloc, buf);
         return ManagedUsbPack{
             .allocator = alloc,
@@ -182,7 +182,7 @@ pub const ManagedUsbPack = struct {
     }
 
     /// data returns an instance of struct `T` filled with the data field
-    pub fn dataAs(self: *const Self, comptime T: type) !T {
+    pub inline fn dataAs(self: *const Self, comptime T: type) !T {
         return self.pack.dataAs(T);
     }
 

@@ -180,7 +180,7 @@ const DeviceDesc = struct {
     _ports_buf: [USB_MAX_PORTS]u8,
     _ports_len: usize,
 
-    pub fn ports(self: *const Self) []const u8 {
+    pub inline fn ports(self: *const Self) []const u8 {
         return self._ports_buf[0..self._ports_len];
     }
 
@@ -213,7 +213,7 @@ const DeviceDesc = struct {
         return DeviceContext.fromDeviceDesc(alloc, self);
     }
 
-    pub fn withLogger(self: *const @This(), logger: logz.Logger) logz.Logger {
+    pub inline fn withLogger(self: *const @This(), logger: logz.Logger) logz.Logger {
         return logger
             .fmt("vid", "0x{x:0>4}", .{self.vid})
             .fmt("pid", "0x{x:0>4}", .{self.pid})
@@ -282,11 +282,11 @@ const DeviceContext = struct {
         _closure_dtor: ?*const fn (*anyopaque) void = null,
 
         /// ONLY used in RX transfer
-        pub fn written(self: *@This()) []const u8 {
+        pub inline fn written(self: *@This()) []const u8 {
             return self.buf[0..@intCast(self.self.actual_length)];
         }
 
-        pub fn setCallback(self: *@This(), cb: *anyopaque, destructor: *const fn (*anyopaque) void) void {
+        pub inline fn setCallback(self: *@This(), cb: *anyopaque, destructor: *const fn (*anyopaque) void) void {
             if (self._closure_dtor) |free| {
                 if (self._closure) |ptr| {
                     free(ptr);
@@ -345,38 +345,38 @@ const DeviceContext = struct {
     arto: ArtoContext,
     // ****** end of fields ******
 
-    pub fn ports(self: *const Self) []const u8 {
+    pub inline fn ports(self: *const Self) []const u8 {
         return self._ports_buf[0..self._ports_len];
     }
 
-    pub fn serial(self: *const Self) ClosedError![]const u8 {
+    pub inline fn serial(self: *const Self) ClosedError![]const u8 {
         if (self.hasDeinit()) {
             return ClosedError.Closed;
         }
         return self._serial;
     }
 
-    pub fn allocator(self: *Self) std.mem.Allocator {
+    pub inline fn allocator(self: *Self) std.mem.Allocator {
         return self.gpa.allocator();
     }
 
-    pub fn dev(self: *const Self) *const usb.libusb_device {
+    pub inline fn dev(self: *const Self) *const usb.libusb_device {
         return self.core.dev;
     }
 
-    pub fn mutDev(self: *Self) *usb.libusb_device {
+    pub inline fn mutDev(self: *Self) *usb.libusb_device {
         return self.core.dev;
     }
 
-    pub fn hdl(self: *const Self) *const usb.libusb_device_handle {
+    pub inline fn hdl(self: *const Self) *const usb.libusb_device_handle {
         return self.core.hdl;
     }
 
-    pub fn mutHdl(self: *Self) *usb.libusb_device_handle {
+    pub inline fn mutHdl(self: *Self) *usb.libusb_device_handle {
         return self.core.hdl;
     }
 
-    pub fn desc(self: *const Self) *const usb.libusb_device_descriptor {
+    pub inline fn desc(self: *const Self) *const usb.libusb_device_descriptor {
         return &self.core.desc;
     }
 
@@ -455,7 +455,7 @@ const DeviceContext = struct {
     }
 
     /// attach the device information to the logger
-    pub fn withLogger(self: *const Self, logger: logz.Logger) logz.Logger {
+    pub inline fn withLogger(self: *const Self, logger: logz.Logger) logz.Logger {
         const s = self.serial();
         if (s) |sn| {
             return logger

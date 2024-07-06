@@ -19,6 +19,7 @@ const XXHASH_SEED: u32 = 0x0;
 const USB_MAX_PORTS = 8;
 const TRANSFER_BUF_SIZE = 2048;
 const DEFAULT_THREAD_STACK_SIZE = 16 * 1024 * 1024;
+const MAX_SERIAL_SIZE = 32;
 
 const AppError = error{
     BadDescriptor,
@@ -361,24 +362,23 @@ const DeviceContext = struct {
     core: DeviceHandles,
     bus: u8,
     port: u8,
-    _ports_buf: [USB_MAX_PORTS]u8,
-    _ports_len: usize,
     /// managed by `alloc`
     endpoints: []Endpoint,
-    /// managed by `alloc`
-    _serial: []const u8,
     arto: ArtoContext,
+
+    _ports_buf: [USB_MAX_PORTS]u8 = undefined,
+    _ports_len: usize = 0,
+
+    _serial_buf: [MAX_SERIAL_SIZE]u8 = undefined,
+    _serial_len: usize = 0,
     // ****** end of fields ******
 
     pub inline fn ports(self: *const Self) []const u8 {
         return self._ports_buf[0..self._ports_len];
     }
 
-    pub inline fn serial(self: *const Self) ClosedError![]const u8 {
-        if (self.hasDeinit()) {
-            return ClosedError.Closed;
-        }
-        return self._serial;
+    pub inline fn serial(self: *const Self) []const u8 {
+        return self._serial_buf[0..self._serial_len];
     }
 
     pub inline fn allocator(self: *Self) std.mem.Allocator {
@@ -428,9 +428,11 @@ const DeviceContext = struct {
             return e;
         }
 
+        const sn = dynStringDescriptorOr(alloc, l_hdl.?, l_desc.iSerialNumber, "");
+        defer alloc.free(sn);
+
         var gpa = DeviceGPA{};
         const eps = getEndpoints(gpa.allocator(), d.dev, &l_desc);
-        const l_serial = dynStringDescriptorOr(gpa.allocator(), l_hdl.?, l_desc.iSerialNumber, "");
         var dc = DeviceContext{
             ._has_deinit = std.atomic.Value(bool).init(true),
             .gpa = gpa,
@@ -443,10 +445,16 @@ const DeviceContext = struct {
             .port = d.port,
             ._ports_buf = d._ports_buf,
             ._ports_len = d._ports_len,
-            ._serial = l_serial,
             .endpoints = eps,
             .arto = undefined,
         };
+
+        if (sn.len > MAX_SERIAL_SIZE) {
+            std.debug.panic("unexpected serial number {s} (len={d}, max={d})", .{ sn, sn.len, MAX_SERIAL_SIZE });
+        }
+        @memcpy(dc._serial_buf[0..sn.len], sn);
+        dc._serial_len = sn.len;
+
         const tx_transfer = usb.libusb_alloc_transfer(0);
         const rx_transfer = usb.libusb_alloc_transfer(0);
         if (tx_transfer == null or rx_transfer == null) {
@@ -470,7 +478,6 @@ const DeviceContext = struct {
         self._has_deinit.store(true, std.builtin.AtomicOrder.unordered);
         self.core.deinit();
         self.allocator().free(self.endpoints);
-        self.allocator().free(self._serial);
         self.arto.deinit();
         const chk = self.gpa.deinit();
         if (chk != .ok) {
@@ -481,12 +488,12 @@ const DeviceContext = struct {
     /// attach the device information to the logger
     pub inline fn withLogger(self: *const Self, logger: logz.Logger) logz.Logger {
         const s = self.serial();
-        if (s) |sn| {
+        if (s.len != 0) {
             return logger
-                .string("serial_number", sn)
+                .string("serial_number", s)
                 .int("bus", self.bus)
                 .int("port", self.port);
-        } else |_| {
+        } else {
             return logger
                 .int("bus", self.bus)
                 .int("port", self.port);
@@ -560,7 +567,7 @@ const DeviceContext = struct {
     ///
     /// Note that the consumer is responsible for freeing the memory
     /// by calling `deinit` after receiving a packet.
-    pub inline fn receive(self: *@This()) !ManagedUsbPack {
+    pub inline fn receive(self: *@This()) ClosedError!ManagedUsbPack {
         if (self.hasDeinit()) {
             return ClosedError.Closed;
         }

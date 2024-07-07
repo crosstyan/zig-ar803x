@@ -20,6 +20,7 @@ const USB_MAX_PORTS = 8;
 const TRANSFER_BUF_SIZE = 2048;
 const DEFAULT_THREAD_STACK_SIZE = 16 * 1024 * 1024;
 const MAX_SERIAL_SIZE = 32;
+const REFRESH_CONTAINER_DEFAULT_CAP = 4;
 
 const AppError = error{
     BadDescriptor,
@@ -772,7 +773,7 @@ pub fn logWithDevice(logger: logz.Logger, device: *usb.libusb_device, desc: *con
         .int("port", port);
 }
 
-fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceContext)) void {
+fn refreshDevList(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator, ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceContext)) void {
     var c_device_list: [*c]?*usb.libusb_device = undefined;
     const sz = usb.libusb_get_device_list(ctx, &c_device_list);
     // See also
@@ -803,9 +804,10 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         ///   - right: devices that should be added to the context list (`DeviceDesc` that could be used to init a device)
         pub fn call(
             self: *const @This(),
-            alloc: std.mem.Allocator,
+            arena_alloc: *std.heap.ArenaAllocator,
             poll_list: []const ?*usb.libusb_device,
         ) struct { std.ArrayList(*const DeviceContext), std.ArrayList(DeviceDesc) } {
+            const alloc = arena_alloc.allocator();
             var ret: c_int = undefined;
             var filtered = std.ArrayList(DeviceDesc).init(alloc);
             defer filtered.deinit();
@@ -825,13 +827,12 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
                 }
             }
 
-            const DEFAULT_CAP = 4;
             var left = std.ArrayList(*const DeviceContext).init(alloc);
-            left.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
+            left.ensureTotalCapacity(REFRESH_CONTAINER_DEFAULT_CAP) catch @panic("OOM");
             var right = std.ArrayList(DeviceDesc).init(alloc);
-            right.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
+            right.ensureTotalCapacity(REFRESH_CONTAINER_DEFAULT_CAP) catch @panic("OOM");
             var inter = std.ArrayList(DeviceDesc).init(alloc);
-            inter.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
+            inter.ensureTotalCapacity(REFRESH_CONTAINER_DEFAULT_CAP) catch @panic("OOM");
             defer inter.deinit();
 
             // TODO: improve the performance by using a hash set or a hash map
@@ -872,7 +873,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
         }
     };
 
-    const l, const r = (find_diff{ .ctx_list = ctx_list.items }).call(ctx_list.allocator, device_list);
+    const l, const r = (find_diff{ .ctx_list = ctx_list.items }).call(arena, device_list);
     defer l.deinit();
     defer r.deinit();
     // destroy detached devices
@@ -889,7 +890,7 @@ fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceConte
 
     // open new devices
     for (r.items) |d| {
-        const dc = d.toContext(ctx_list.allocator) catch |e| {
+        const dc = d.toContext(allocator) catch |e| {
             d.withLogger(logz.err()).err(e).log();
             continue;
         };
@@ -1227,14 +1228,14 @@ pub fn transferStatusFromInt(status: c_uint) BadEnum!TransferStatus {
 
 pub fn main() !void {
     // Use a separate allocator for logz
-    var logz_gpa = std.heap.GeneralPurposeAllocator(.{
+    var _logz_gpa = std.heap.GeneralPurposeAllocator(.{
         .thread_safe = false,
         .safety = false,
     }){};
     defer {
-        _ = logz_gpa.deinit();
+        _ = _logz_gpa.deinit();
     }
-    try logz.setup(logz_gpa.allocator(), .{
+    try logz.setup(_logz_gpa.allocator(), .{
         .level = .Debug,
         .pool_size = 96,
         .buffer_size = 4096,
@@ -1281,7 +1282,13 @@ pub fn main() !void {
         device_list.deinit();
     }
 
-    refreshDevList(ctx, &device_list);
+    const BUFFER_SIZE = REFRESH_CONTAINER_DEFAULT_CAP * (@sizeOf(*const DeviceContext) + @sizeOf(DeviceDesc) * 2) + 1024;
+    var stack_buf: [BUFFER_SIZE]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(stack_buf[0..]);
+    const stack_allocator = fixed.allocator();
+    var arena = std.heap.ArenaAllocator.init(stack_allocator);
+    refreshDevList(alloc, &arena, ctx, &device_list);
+    _ = arena.reset(.retain_capacity);
 
     for (device_list.items) |*dev| {
         dev.init() catch |e| {

@@ -466,8 +466,7 @@ const DeviceContext = struct {
         dc.arto.rx_transfer = Transfer{
             .self = rx_transfer,
         };
-
-        // somehow the `ArrayList` is not happy with allocated with allocator in
+        // somehow the `ctrl_queue` is not happy with allocated with allocator in
         // the `DeviceContext`, which would cause a deadlock.
         // Interestingly, the deadlock is from the internal of GPA, needs to be
         // investigated further.
@@ -773,18 +772,7 @@ pub fn logWithDevice(logger: logz.Logger, device: *usb.libusb_device, desc: *con
         .int("port", port);
 }
 
-/// new discovered devices will rely on `allocator`, for other temporary memory, this function will use its own
-/// local allocator.
-///
-/// TODO: maybe pass a local allocator instead of using the stack
-fn refreshDevList(allocator: std.mem.Allocator, ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceContext)) void {
-    // about 20KB memory, hopefully it won't blow up the stack
-    const DEFAULT_CAP = 4;
-    const BUFFER_SIZE = DEFAULT_CAP * @sizeOf(DeviceContext) + DEFAULT_CAP * 4 * @sizeOf(DeviceDesc);
-    var stack_buf: [BUFFER_SIZE]u8 = undefined;
-    var fixed = std.heap.FixedBufferAllocator.init(stack_buf[0..]);
-    const stack_allocator = fixed.allocator();
-
+fn refreshDevList(ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceContext)) void {
     var c_device_list: [*c]?*usb.libusb_device = undefined;
     const sz = usb.libusb_get_device_list(ctx, &c_device_list);
     // See also
@@ -813,16 +801,14 @@ fn refreshDevList(allocator: std.mem.Allocator, ctx: *usb.libusb_context, ctx_li
         ///
         ///   - left: devices that should be removed from the context list (`*const DeviceContext`)
         ///   - right: devices that should be added to the context list (`DeviceDesc` that could be used to init a device)
-        ///
-        /// Note that this function WILL NOT release its memory, the caller SHOULD pass an arena like allocator
-        /// to get memory released, Otherwise there's no way to reclaim the memory
         pub fn call(
             self: *const @This(),
-            arena_alloc: std.mem.Allocator,
+            alloc: std.mem.Allocator,
             poll_list: []const ?*usb.libusb_device,
         ) struct { std.ArrayList(*const DeviceContext), std.ArrayList(DeviceDesc) } {
             var ret: c_int = undefined;
-            var filtered = std.ArrayList(DeviceDesc).init(arena_alloc);
+            var filtered = std.ArrayList(DeviceDesc).init(alloc);
+            defer filtered.deinit();
             for (poll_list) |device| {
                 if (device) |val| {
                     var l_desc: usb.libusb_device_descriptor = undefined;
@@ -834,17 +820,19 @@ fn refreshDevList(allocator: std.mem.Allocator, ctx: *usb.libusb_context, ctx_li
                         const dd = DeviceDesc.fromDevice(val) catch {
                             continue;
                         };
-                        filtered.append(dd) catch @panic("arena OOM");
+                        filtered.append(dd) catch @panic("OOM");
                     }
                 }
             }
 
-            var left = std.ArrayList(*const DeviceContext).init(arena_alloc);
-            left.ensureTotalCapacity(DEFAULT_CAP) catch @panic("arena OOM");
-            var right = std.ArrayList(DeviceDesc).init(arena_alloc);
-            right.ensureTotalCapacity(DEFAULT_CAP) catch @panic("arena OOM");
-            var inter = std.ArrayList(DeviceDesc).init(arena_alloc);
-            inter.ensureTotalCapacity(DEFAULT_CAP) catch @panic("arena OOM");
+            const DEFAULT_CAP = 4;
+            var left = std.ArrayList(*const DeviceContext).init(alloc);
+            left.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
+            var right = std.ArrayList(DeviceDesc).init(alloc);
+            right.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
+            var inter = std.ArrayList(DeviceDesc).init(alloc);
+            inter.ensureTotalCapacity(DEFAULT_CAP) catch @panic("OOM");
+            defer inter.deinit();
 
             // TODO: improve the performance by using a hash set or a hash map
             for (self.ctx_list) |*dc| {
@@ -884,7 +872,9 @@ fn refreshDevList(allocator: std.mem.Allocator, ctx: *usb.libusb_context, ctx_li
         }
     };
 
-    const l, const r = (find_diff{ .ctx_list = ctx_list.items }).call(stack_allocator, device_list);
+    const l, const r = (find_diff{ .ctx_list = ctx_list.items }).call(ctx_list.allocator, device_list);
+    defer l.deinit();
+    defer r.deinit();
     // destroy detached devices
     for (l.items) |ldc| {
         inner: for (ctx_list.items, 0..) |*rdc, index| {
@@ -899,7 +889,7 @@ fn refreshDevList(allocator: std.mem.Allocator, ctx: *usb.libusb_context, ctx_li
 
     // open new devices
     for (r.items) |d| {
-        const dc = d.toContext(allocator) catch |e| {
+        const dc = d.toContext(ctx_list.allocator) catch |e| {
             d.withLogger(logz.err()).err(e).log();
             continue;
         };
@@ -1237,14 +1227,14 @@ pub fn transferStatusFromInt(status: c_uint) BadEnum!TransferStatus {
 
 pub fn main() !void {
     // Use a separate allocator for logz
-    var _logz_gpa = std.heap.GeneralPurposeAllocator(.{
+    var logz_gpa = std.heap.GeneralPurposeAllocator(.{
         .thread_safe = false,
         .safety = false,
     }){};
     defer {
-        _ = _logz_gpa.deinit();
+        _ = logz_gpa.deinit();
     }
-    try logz.setup(_logz_gpa.allocator(), .{
+    try logz.setup(logz_gpa.allocator(), .{
         .level = .Debug,
         .pool_size = 96,
         .buffer_size = 4096,
@@ -1291,7 +1281,7 @@ pub fn main() !void {
         device_list.deinit();
     }
 
-    refreshDevList(gpa.allocator(), ctx, &device_list);
+    refreshDevList(ctx, &device_list);
 
     for (device_list.items) |*dev| {
         dev.init() catch |e| {

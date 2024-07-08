@@ -1282,13 +1282,19 @@ pub fn main() !void {
         device_list.deinit();
     }
 
-    const BUFFER_SIZE = REFRESH_CONTAINER_DEFAULT_CAP * (@sizeOf(*const DeviceContext) + @sizeOf(DeviceDesc) * 2) + 1024;
-    var stack_buf: [BUFFER_SIZE]u8 = undefined;
-    var fixed = std.heap.FixedBufferAllocator.init(stack_buf[0..]);
-    const stack_allocator = fixed.allocator();
-    var arena = std.heap.ArenaAllocator.init(stack_allocator);
-    refreshDevList(alloc, &arena, ctx, &device_list);
-    _ = arena.reset(.retain_capacity);
+    {
+        const BUFFER_SIZE = REFRESH_CONTAINER_DEFAULT_CAP * (@sizeOf(*const DeviceContext) + @sizeOf(DeviceDesc) * 2) + 1024;
+        var stack_buf: [BUFFER_SIZE]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(stack_buf[0..]);
+        const stack_allocator = fixed.allocator();
+        var arena = std.heap.ArenaAllocator.init(stack_allocator);
+        defer {
+            _ = arena.reset(.retain_capacity);
+            arena.deinit();
+        }
+        // TODO: call it in a separate thread, looping
+        refreshDevList(alloc, &arena, ctx, &device_list);
+    }
 
     for (device_list.items) |*dev| {
         dev.init() catch |e| {

@@ -627,33 +627,73 @@ const DeviceContext = struct {
     /// doing status query before start forward loop,
     /// and it still NEEDS event loop running. Please call it in a separate thread.
     fn loopPrepare(self: *@This()) void {
-        const BUFFER_SIZE = 4096;
+        const BUFFER_SIZE = 8192;
         var stack_buf: [BUFFER_SIZE]u8 = undefined;
         var fixed = std.heap.FixedBufferAllocator.init(stack_buf[0..]);
-        const stack_allocator = fixed.allocator();
+        var arena = std.heap.ArenaAllocator.init(fixed.allocator());
+        defer arena.deinit();
+        const stack_allocator = arena.allocator();
 
-        var in = bb.bb_get_status_in_t{
-            .user_bmp = SLOT_BIT_MAP_MAX,
-        };
-        var pack = UsbPack{
-            .reqid = bb.BB_GET_STATUS,
-            .msgid = 0,
-            .sta = 0,
-        };
+        // query status
+        {
+            {
+                var in = bb.bb_get_status_in_t{
+                    .user_bmp = SLOT_BIT_MAP_MAX,
+                };
+                var pack = UsbPack{
+                    .reqid = bb.BB_GET_STATUS,
+                    .msgid = 0,
+                    .sta = 0,
+                };
+                pack.fillWith(stack_allocator, &in) catch unreachable;
+                defer pack.deinitWith(stack_allocator);
+                const data = pack.marshal(stack_allocator) catch unreachable;
+                defer stack_allocator.free(data);
+                self.transmit(data) catch unreachable;
+            }
 
-        // explicitly using stack space, don't have to release them
-        pack.fillWith(stack_allocator, &in) catch unreachable;
-        const data = pack.marshal(stack_allocator) catch unreachable;
-        self.transmit(data) catch unreachable;
-        var mpk = self.receive() catch unreachable;
-        defer mpk.deinit();
-        const status = mpk.dataAs(bb.bb_get_status_out_t) catch unreachable;
-        self.withLogger(logz.info())
-            .fmt("status", "{any}", .{status}).log();
+            {
+                var mpk = self.receive() catch unreachable;
+                defer mpk.deinit();
+                const status = mpk.dataAs(bb.bb_get_status_out_t) catch unreachable;
+                self.withLogger(logz.info())
+                    .fmt("status", "{any}", .{status}).log();
+            }
+        }
+
+        // query system info (build time, version, etc.)
+        {
+            {
+                var pack = UsbPack{
+                    .reqid = bb.BB_GET_SYS_INFO,
+                    .msgid = 0,
+                    .sta = 0,
+                };
+                const data = pack.marshal(stack_allocator) catch unreachable;
+                defer stack_allocator.free(data);
+                self.transmit(data) catch unreachable;
+            }
+
+            {
+                var mpk = self.receive() catch unreachable;
+                defer mpk.deinit();
+                const info = mpk.dataAs(bb.bb_get_sys_info_out_t) catch unreachable;
+                const compile_time: [*:0]const u8 = @ptrCast(&info.compile_time);
+                const soft_ver: [*:0]const u8 = @ptrCast(&info.soft_ver);
+                const hard_ver: [*:0]const u8 = @ptrCast(&info.hardware_ver);
+                const firmware_ver: [*:0]const u8 = @ptrCast(&info.firmware_ver);
+
+                self.withLogger(logz.info())
+                    .int("uptime", info.uptime)
+                    .stringSafeZ("compile_time", compile_time)
+                    .stringSafeZ("soft_ver", soft_ver)
+                    .stringSafeZ("hard_ver", hard_ver)
+                    .stringSafeZ("firmware_ver", firmware_ver).log();
+            }
+        }
 
         utils.logWithSrc(self.withLogger(logz.info()), @src())
             .string("what", "preparing finished").log();
-
         // finally, we start the loop thread, after querying status
         // and set callback etc.
         self.initThreads();

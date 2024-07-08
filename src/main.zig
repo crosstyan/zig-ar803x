@@ -8,6 +8,7 @@ const utils = @import("utils.zig");
 const usb = @cImport({
     @cInclude("libusb.h");
 });
+const network = @import("network");
 
 const BadEnum = utils.BadEnum;
 const Mutex = std.Thread.Mutex;
@@ -342,8 +343,9 @@ const DeviceContext = struct {
         /// RELEASING the packet after consuming it.
         rx_queue: UsbPackQueue,
 
-        /// only initialized in `init`
+        /// initialized in `initThreads`
         tx_thread: std.Thread,
+        /// initialized in `initThreads`
         rx_thread: std.Thread,
 
         pub fn deinit(self: *@This()) void {

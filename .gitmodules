@@ -1,3 +1,6 @@
 [submodule "log.zig"]
 	path = lib/log.zig
 	url = https://github.com/karlseguin/log.zig
+[submodule "lib/zig-network"]
+	path = lib/zig-network
+	url = https://github.com/ikskuh/zig-network

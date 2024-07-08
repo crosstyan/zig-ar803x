@@ -54,6 +54,9 @@
         .logz = .{
             .path = "lib/log.zig",
         },
+        .network = .{
+            .path = "lib/zig-network",
+        },
     },
 
     // Specifies the set of files and directories that are included in this package.

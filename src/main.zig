@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const logz = @import("logz");
 const bb = @import("bb/c.zig");
+const bt = @import("bb/t.zig");
 const UsbPack = @import("bb/usbpack.zig").UsbPack;
 const ManagedUsbPack = @import("bb/usbpack.zig").ManagedUsbPack;
 const utils = @import("utils.zig");
@@ -689,6 +690,36 @@ const DeviceContext = struct {
                     .stringSafeZ("soft_ver", soft_ver)
                     .stringSafeZ("hard_ver", hard_ver)
                     .stringSafeZ("firmware_ver", firmware_ver).log();
+            }
+        }
+
+        // open socket
+        const sel_slot = bb.BB_SLOT_AP;
+        const sel_port = 3;
+        {
+            // note that sta == 0x101 means already opened socket
+            const req = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
+            {
+                const opt = bb.bb_sock_opt_t{ .tx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE, .rx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE };
+                var pack = UsbPack{
+                    .reqid = req,
+                    .msgid = 0,
+                    .sta = 0,
+                };
+                pack.fillWith(stack_allocator, &opt) catch unreachable;
+                defer pack.deinitWith(stack_allocator);
+                const data = pack.marshal(stack_allocator) catch unreachable;
+                defer stack_allocator.free(data);
+                self.transmit(data) catch unreachable;
+            }
+
+            {
+                var mpk = self.receive() catch unreachable;
+                defer mpk.deinit();
+                const sta = mpk.pack.sta;
+                if (sta != 0) {
+                    std.debug.panic("failed to open socket {}", .{sta});
+                }
             }
         }
 

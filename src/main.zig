@@ -635,68 +635,73 @@ const DeviceContext = struct {
         defer arena.deinit();
         const stack_allocator = arena.allocator();
 
-        // query status
-        {
-            {
-                var in = bb.bb_get_status_in_t{
-                    .user_bmp = SLOT_BIT_MAP_MAX,
-                };
-                var pack = UsbPack{
-                    .reqid = bb.BB_GET_STATUS,
-                    .msgid = 0,
-                    .sta = 0,
-                };
-                pack.fillWith(stack_allocator, &in) catch unreachable;
-                defer pack.deinitWith(stack_allocator);
-                const data = pack.marshal(stack_allocator) catch unreachable;
-                defer stack_allocator.free(data);
-                self.transmit(data) catch unreachable;
-            }
-
-            {
-                var mpk = self.receive() catch unreachable;
-                defer mpk.deinit();
-                const status = mpk.dataAs(bb.bb_get_status_out_t) catch unreachable;
-                self.withLogger(logz.info())
-                    .fmt("status", "{any}", .{status}).log();
-            }
-        }
-
-        // query system info (build time, version, etc.)
-        {
-            {
-                var pack = UsbPack{
-                    .reqid = bb.BB_GET_SYS_INFO,
-                    .msgid = 0,
-                    .sta = 0,
-                };
-                const data = pack.marshal(stack_allocator) catch unreachable;
-                defer stack_allocator.free(data);
-                self.transmit(data) catch unreachable;
-            }
-
-            {
-                var mpk = self.receive() catch unreachable;
-                defer mpk.deinit();
-                const info = mpk.dataAs(bb.bb_get_sys_info_out_t) catch unreachable;
-                const compile_time: [*:0]const u8 = @ptrCast(&info.compile_time);
-                const soft_ver: [*:0]const u8 = @ptrCast(&info.soft_ver);
-                const hard_ver: [*:0]const u8 = @ptrCast(&info.hardware_ver);
-                const firmware_ver: [*:0]const u8 = @ptrCast(&info.firmware_ver);
-
-                self.withLogger(logz.info())
-                    .int("uptime", info.uptime)
-                    .stringSafeZ("compile_time", compile_time)
-                    .stringSafeZ("soft_ver", soft_ver)
-                    .stringSafeZ("hard_ver", hard_ver)
-                    .stringSafeZ("firmware_ver", firmware_ver).log();
-            }
-        }
-
         const local_t = struct {
             stack_allocator: std.mem.Allocator,
             self: *DeviceContext,
-            pub fn register_event(closure: *@This(), event: bt.Event) !void {
+
+            // query status
+            pub fn query_status(cap: *@This()) !void {
+                {
+                    {
+                        var in = bb.bb_get_status_in_t{
+                            .user_bmp = SLOT_BIT_MAP_MAX,
+                        };
+                        var pack = UsbPack{
+                            .reqid = bb.BB_GET_STATUS,
+                            .msgid = 0,
+                            .sta = 0,
+                        };
+                        try pack.fillWith(cap.stack_allocator, &in);
+                        defer pack.deinitWith(cap.stack_allocator);
+                        const data = try pack.marshal(cap.stack_allocator);
+                        defer cap.stack_allocator.free(data);
+                        cap.self.transmit(data) catch unreachable;
+                    }
+
+                    {
+                        var mpk = try cap.self.receive();
+                        defer mpk.deinit();
+                        const status = try mpk.dataAs(bb.bb_get_status_out_t);
+                        cap.self.withLogger(logz.info())
+                            .fmt("status", "{any}", .{status}).log();
+                    }
+                }
+            }
+
+            // query system info (build time, version, etc.)
+            pub fn query_info(cap: *@This()) !void {
+                {
+                    {
+                        var pack = UsbPack{
+                            .reqid = bb.BB_GET_SYS_INFO,
+                            .msgid = 0,
+                            .sta = 0,
+                        };
+                        const data = try pack.marshal(cap.stack_allocator);
+                        defer cap.stack_allocator.free(data);
+                        try cap.self.transmit(data);
+                    }
+
+                    {
+                        var mpk = try cap.self.receive();
+                        defer mpk.deinit();
+                        const info = try mpk.dataAs(bb.bb_get_sys_info_out_t);
+                        const compile_time: [*:0]const u8 = @ptrCast(&info.compile_time);
+                        const soft_ver: [*:0]const u8 = @ptrCast(&info.soft_ver);
+                        const hard_ver: [*:0]const u8 = @ptrCast(&info.hardware_ver);
+                        const firmware_ver: [*:0]const u8 = @ptrCast(&info.firmware_ver);
+
+                        cap.self.withLogger(logz.info())
+                            .int("uptime", info.uptime)
+                            .stringSafeZ("compile_time", compile_time)
+                            .stringSafeZ("soft_ver", soft_ver)
+                            .stringSafeZ("hard_ver", hard_ver)
+                            .stringSafeZ("firmware_ver", firmware_ver).log();
+                    }
+                }
+            }
+
+            pub fn register_event(cap: *@This(), event: bt.Event) !void {
                 {
                     const req = bt.subscribeRequestId(event);
                     {
@@ -705,20 +710,52 @@ const DeviceContext = struct {
                             .msgid = 0,
                             .sta = 0,
                         };
-                        defer pack.deinitWith(closure.stack_allocator);
-                        const data = try pack.marshal(closure.stack_allocator);
-                        defer closure.stack_allocator.free(data);
-                        try closure.self.transmit(data);
+                        defer pack.deinitWith(cap.stack_allocator);
+                        const data = try pack.marshal(cap.stack_allocator);
+                        defer cap.stack_allocator.free(data);
+                        try cap.self.transmit(data);
                     }
 
                     {
-                        var mpk = try closure.self.receive();
+                        var mpk = try cap.self.receive();
                         defer mpk.deinit();
                         const sta = mpk.pack.sta;
                         if (sta != 0) {
                             std.debug.panic("failed to register event {}", .{sta});
                         }
-                        closure.self.withLogger(logz.info()).string("registered", @tagName(event)).log();
+                        cap.self.withLogger(logz.info()).string("registered", @tagName(event)).log();
+                    }
+                }
+            }
+
+            pub fn open_socket(cap: *@This()) !void {
+                // open socket
+                const sel_slot = bb.BB_SLOT_AP;
+                const sel_port = 3;
+                {
+                    // note that sta == 0x101 means already opened socket
+                    const req = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
+                    {
+                        const opt = bb.bb_sock_opt_t{ .tx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE, .rx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE };
+                        var pack = UsbPack{
+                            .reqid = req,
+                            .msgid = 0,
+                            .sta = 0,
+                        };
+                        try pack.fillWith(cap.stack_allocator, &opt);
+                        defer pack.deinitWith(cap.stack_allocator);
+                        const data = try pack.marshal(cap.stack_allocator);
+                        defer cap.stack_allocator.free(data);
+                        try cap.self.transmit(data);
+                    }
+
+                    {
+                        var mpk = try cap.self.receive();
+                        defer mpk.deinit();
+                        const sta = mpk.pack.sta;
+                        if (sta != 0) {
+                            std.debug.panic("failed to open socket {}", .{sta});
+                        }
                     }
                 }
             }
@@ -728,39 +765,12 @@ const DeviceContext = struct {
             .stack_allocator = stack_allocator,
             .self = self,
         };
+        local.query_status() catch unreachable;
+        local.query_info() catch unreachable;
         local.register_event(.link_state) catch unreachable;
         local.register_event(.mcs_change) catch unreachable;
         local.register_event(.chan_change) catch unreachable;
-
-        // open socket
-        const sel_slot = bb.BB_SLOT_AP;
-        const sel_port = 3;
-        {
-            // note that sta == 0x101 means already opened socket
-            const req = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
-            {
-                const opt = bb.bb_sock_opt_t{ .tx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE, .rx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE };
-                var pack = UsbPack{
-                    .reqid = req,
-                    .msgid = 0,
-                    .sta = 0,
-                };
-                pack.fillWith(stack_allocator, &opt) catch unreachable;
-                defer pack.deinitWith(stack_allocator);
-                const data = pack.marshal(stack_allocator) catch unreachable;
-                defer stack_allocator.free(data);
-                self.transmit(data) catch unreachable;
-            }
-
-            {
-                var mpk = self.receive() catch unreachable;
-                defer mpk.deinit();
-                const sta = mpk.pack.sta;
-                if (sta != 0) {
-                    std.debug.panic("failed to open socket {}", .{sta});
-                }
-            }
-        }
+        local.open_socket() catch unreachable;
 
         utils.logWithSrc(self.withLogger(logz.info()), @src())
             .string("what", "preparing finished").log();

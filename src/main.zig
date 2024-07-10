@@ -693,6 +693,45 @@ const DeviceContext = struct {
             }
         }
 
+        const local_t = struct {
+            stack_allocator: std.mem.Allocator,
+            self: *DeviceContext,
+            pub fn register_event(closure: *@This(), event: bt.Event) !void {
+                {
+                    const req = bt.subscribeRequestId(event);
+                    {
+                        var pack = UsbPack{
+                            .reqid = req,
+                            .msgid = 0,
+                            .sta = 0,
+                        };
+                        defer pack.deinitWith(closure.stack_allocator);
+                        const data = try pack.marshal(closure.stack_allocator);
+                        defer closure.stack_allocator.free(data);
+                        try closure.self.transmit(data);
+                    }
+
+                    {
+                        var mpk = try closure.self.receive();
+                        defer mpk.deinit();
+                        const sta = mpk.pack.sta;
+                        if (sta != 0) {
+                            std.debug.panic("failed to register event {}", .{sta});
+                        }
+                        closure.self.withLogger(logz.info()).string("registered", @tagName(event)).log();
+                    }
+                }
+            }
+        };
+
+        var local = local_t{
+            .stack_allocator = stack_allocator,
+            .self = self,
+        };
+        local.register_event(.link_state) catch unreachable;
+        local.register_event(.mcs_change) catch unreachable;
+        local.register_event(.chan_change) catch unreachable;
+
         // open socket
         const sel_slot = bb.BB_SLOT_AP;
         const sel_port = 3;
@@ -1004,7 +1043,7 @@ const Endpoint = struct {
     maxPacketSize: u16,
 
     pub fn fromDesc(iConfig: u8, iInterface: u8, ep: *const usb.libusb_endpoint_descriptor) AppError!Endpoint {
-        const local = struct {
+        const local_t = struct {
             pub inline fn addr_to_dir(addr: u8) BadEnum!Direction {
                 const dir = addr & usb.LIBUSB_ENDPOINT_DIR_MASK;
                 const r = switch (dir) {
@@ -1030,8 +1069,8 @@ const Endpoint = struct {
             .iInterface = iInterface,
             .addr = ep.bEndpointAddress,
             .number = usbEndpointNum(ep.bEndpointAddress),
-            .direction = try local.addr_to_dir(ep.bEndpointAddress),
-            .transferType = try local.attr_to_transfer_type(ep.bmAttributes),
+            .direction = try local_t.addr_to_dir(ep.bEndpointAddress),
+            .transferType = try local_t.attr_to_transfer_type(ep.bmAttributes),
             .maxPacketSize = ep.wMaxPacketSize,
         };
     }
@@ -1231,7 +1270,7 @@ pub fn dynStringDescriptorOr(alloc: std.mem.Allocator, hdl: *usb.libusb_device_h
 /// Print the manufacturer, product, serial number of a device.
 /// If a string descriptor is not available, 'N/A' will be display.
 fn printStrDesc(hdl: *usb.libusb_device_handle, desc: *const usb.libusb_device_descriptor) void {
-    const local = struct {
+    const local_t = struct {
         /// Get string descriptor or return a default value.
         /// Note that the caller must ensure the buffer is large enough.
         /// The return slice will be a slice of the buffer.
@@ -1248,13 +1287,13 @@ fn printStrDesc(hdl: *usb.libusb_device_handle, desc: *const usb.libusb_device_d
 
     const BUF_SIZE = 128;
     var manufacturer_buf: [BUF_SIZE]u8 = undefined;
-    const manufacturer = local.get_string_descriptor_or(hdl, desc.iManufacturer, &manufacturer_buf, "N/A");
+    const manufacturer = local_t.get_string_descriptor_or(hdl, desc.iManufacturer, &manufacturer_buf, "N/A");
 
     var product_buf: [BUF_SIZE]u8 = undefined;
-    const product = local.get_string_descriptor_or(hdl, desc.iProduct, &product_buf, "N/A");
+    const product = local_t.get_string_descriptor_or(hdl, desc.iProduct, &product_buf, "N/A");
 
     var serial_buf: [BUF_SIZE]u8 = undefined;
-    const serial = local.get_string_descriptor_or(hdl, desc.iSerialNumber, &serial_buf, "N/A");
+    const serial = local_t.get_string_descriptor_or(hdl, desc.iSerialNumber, &serial_buf, "N/A");
     logz.info()
         .fmt("vid", "0x{x:0>4}", .{desc.idVendor})
         .fmt("pid", "0x{x:0>4}", .{desc.idProduct})

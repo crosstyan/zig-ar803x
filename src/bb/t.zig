@@ -19,7 +19,7 @@ pub const Event = enum {
     mcs_change_end,
 
     pub fn toC(event: Event) u8 {
-        const ev = switch (event) {
+        const ev: c_int = switch (event) {
             .link_state => bb.BB_EVENT_LINK_STATE,
             .mcs_change => bb.BB_EVENT_MCS_CHANGE,
             .chan_change => bb.BB_EVENT_CHAN_CHANGE,
@@ -30,7 +30,6 @@ pub const Event = enum {
             .pair_result => bb.BB_EVENT_PAIR_RESULT,
             .prj_dispatch_2 => bb.BB_EVENT_PRJ_DISPATCH2,
             .mcs_change_end => bb.BB_EVENT_MCS_CHANGE_END,
-            else => std.debug.panic("unknown C enum for `bb_event_e` {}", .{event}),
         };
         return @intCast(ev);
     }
@@ -59,7 +58,7 @@ pub const SoCmdOpt = enum {
     close,
 
     pub fn toByte(soCmd: SoCmdOpt) u8 {
-        const cmd = switch (soCmd) {
+        const cmd: u8 = switch (soCmd) {
             .open => 0,
             .write => 1,
             .read => 2,
@@ -81,12 +80,15 @@ pub const SoCmdOpt = enum {
 
 /// see `BB_EVENT_*` constants
 pub fn subscribeRequestId(event: Event) u32 {
-    return bb.BB_REQ_CB << 24 | SUBSCRIBE_REQ << 16 | @as(u32, event.toC());
+    return @as(u32, bb.BB_REQ_CB) << 24 | @as(u32, SUBSCRIBE_REQ) << 16 | @as(u32, event.toC());
 }
 
 /// see `dev_dat_so_write_proc`
 pub fn socketRequestId(soCmd: SoCmdOpt, slot: u8, port: u8) u32 {
     std.debug.assert(slot < bb.BB_SLOT_MAX);
     std.debug.assert(port < bb.BB_CONFIG_MAX_TRANSPORT_PER_SLOT);
-    return 4 << 24 | @as(u32, soCmd.toByte()) << 16 | slot << 8 | port;
+    // https://github.com/ziglang/zig/issues/7605
+    // needs explicit cast
+    // wait for upstream to fix
+    return @as(u32, 4) << @as(u32, 24) | @as(u32, soCmd.toByte()) << @as(u32, 16) | @as(u32, slot) << @intCast(8) | @as(u32, port);
 }

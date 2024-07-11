@@ -753,13 +753,7 @@ const DeviceContext = struct {
                 std.debug.assert(mpk.pack.sta == 0);
             }
 
-            pub fn open_socket(cap: *@This()) !void {
-                // note that sta == 0x0101 (i.e. 257) means already opened socket
-                const ERROR_ALREADY_OPENED_SOCKET = 257;
-                // -259 is a generic error code, I have no idea what's the exact meaning
-                const ERROR_UNKNOWN = -259;
-                _ = ERROR_UNKNOWN;
-
+            fn maybe_socket_open(cap: *@This()) !ManagedUsbPack {
                 const req = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
                 const flags: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
                 const opt = bb.bb_sock_opt_t{ .tx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE, .rx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE };
@@ -772,7 +766,18 @@ const DeviceContext = struct {
                 const payload = try list.toOwnedSlice();
                 defer cap.stack_allocator.free(payload);
 
-                var mpk = try cap.query_common_slice(req, payload);
+                const mpk = try cap.query_common_slice(req, payload);
+                return mpk;
+            }
+
+            pub fn open_socket(cap: *@This()) !void {
+                // note that sta == 0x0101 (i.e. 257) means already opened socket
+                const ERROR_ALREADY_OPENED_SOCKET = 257;
+                // -259 is a generic error code, I have no idea what's the exact meaning
+                const ERROR_UNKNOWN = -259;
+                _ = ERROR_UNKNOWN;
+
+                var mpk = try cap.maybe_socket_open();
                 defer mpk.deinit();
                 const sta = mpk.pack.sta;
                 if (sta == 0) {
@@ -785,18 +790,30 @@ const DeviceContext = struct {
                 }
                 if (sta == ERROR_ALREADY_OPENED_SOCKET) {
                     cap.self.withSrcLogger(logz.warn(), @src())
+                        .int("slot", sel_slot)
+                        .int("port", sel_port)
                         .string("what", "socket already opened")
                         .log();
                     try cap.close_socket();
                     cap.self.withSrcLogger(logz.warn(), @src())
+                        .int("slot", sel_slot)
+                        .int("port", sel_port)
                         .string("what", "close opened socket")
                         .log();
-                    // Hopefully it won't become an infinite loop
-                    try cap.open_socket();
-                    cap.self.withSrcLogger(logz.warn(), @src())
-                        .string("what", "reopen socket")
-                        .log();
-                    return;
+
+                    var i_mpk = try cap.maybe_socket_open();
+                    defer i_mpk.deinit();
+                    const i_sta = i_mpk.pack.sta;
+                    if (i_sta == 0) {
+                        cap.self.withSrcLogger(logz.warn(), @src())
+                            .int("slot", sel_slot)
+                            .int("port", sel_port)
+                            .string("what", "reopen socket")
+                            .log();
+                        return;
+                    } else {
+                        std.debug.panic("failed to reopen socket, sta={d}", .{i_sta});
+                    }
                 }
                 std.debug.panic("failed to open socket, sta={d}", .{sta});
             }

@@ -569,7 +569,7 @@ const DeviceContext = struct {
         if (ret != 0) {
             return libusb_error_2_set(ret);
         }
-        var lg = utils.logWithSrc(self.withLogger(logz.info()), @src());
+        var lg = utils.logWithSrc(self.withLogger(logz.debug()), @src());
         lg.string("what", "submitted transmit").log();
     }
 
@@ -657,8 +657,7 @@ const DeviceContext = struct {
                         };
                         switch (@typeInfo(P)) {
                             .Pointer => {
-                                try pack.fillWith(cap.stack_allocator, &payload);
-                                defer pack.deinitWith(cap.stack_allocator);
+                                try pack.fillWith(&payload);
                             },
                             .Null => {}, // do nothing
                             else => @compileError("expected a pointer type or null, found `" ++ @typeName(P) ++ "`"),
@@ -875,7 +874,7 @@ const DeviceContext = struct {
                 .msgid = 0,
                 .sta = 0,
             };
-            pack.fillWith(stack_allocator, &in) catch @panic("stack OOM");
+            pack.fillWith(&in) catch unreachable;
             defer pack.deinitWith(stack_allocator);
 
             const data = pack.marshal(stack_allocator) catch unreachable;

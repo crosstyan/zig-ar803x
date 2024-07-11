@@ -49,6 +49,10 @@ pub const UsbPack = packed struct {
         return self.ptr.?[0..self.len];
     }
 
+    pub fn hasData(self: *const Self) bool {
+        return self.ptr != null and self.len > 0;
+    }
+
     /// data returns an instance of struct `T` filled with the data field
     pub fn dataAs(self: *const Self, comptime T: type) !T {
         const d = try self.data();
@@ -62,7 +66,7 @@ pub const UsbPack = packed struct {
         }
     }
 
-    /// `fillWith` will allocate a new buffer with `alloc` and fill it with
+    /// `fillWithAlloc` will allocate a new buffer with `alloc` and fill it with
     /// the content of `data_ref`, which should be a pointer to its underlying data.
     ///
     /// Note that the ownership of the buffer is belongs to the `alloc` allocator,
@@ -70,7 +74,9 @@ pub const UsbPack = packed struct {
     ///
     /// Will return `error.HasContent` if the `ptr` field is not null and `len` is greater than 0,
     /// which means the buffer is already filled.
-    pub fn fillWith(self: *Self, alloc: std.mem.Allocator, data_ref: anytype) !void {
+    ///
+    /// Call might needs to call `deinitWith` to free the buffer.
+    pub fn fillWithAlloc(self: *Self, alloc: std.mem.Allocator, data_ref: anytype) !void {
         if (self.data()) |_| {
             return HasContent.HasContent;
         } else |_| {
@@ -82,6 +88,29 @@ pub const UsbPack = packed struct {
                     const size = @sizeOf(T);
                     const buf = try alloc.alloc(u8, size);
                     try utils.fillBytesWith(buf, data_ref);
+                    self.ptr = buf.ptr;
+                    self.len = size;
+                },
+                else => @compileError("`data_ref` must be a pointer type, found `" ++ @typeName(P) ++ "`"),
+            }
+        }
+    }
+
+    /// use `data_ref` directly to fill the `data` field
+    ///
+    /// Note that the caller SHOULD NOT call `deinitWith` with this instance,
+    /// since there's no allocation happens here, only reinterpreting the data.
+    pub fn fillWith(self: *Self, data_ref: anytype) !void {
+        if (self.data()) |_| {
+            return HasContent.HasContent;
+        } else |_| {
+            // I'm expecting no content here
+            const P = @TypeOf(data_ref);
+            switch (@typeInfo(P)) {
+                .Pointer => {
+                    const T = @typeInfo(P).Pointer.child;
+                    const size = @sizeOf(T);
+                    const buf = utils.anytype2Slice(data_ref);
                     self.ptr = buf.ptr;
                     self.len = size;
                 },

@@ -505,7 +505,9 @@ const DeviceContext = struct {
     }
 
     pub inline fn withSrcLogger(self: *const Self, logger: logz.Logger, src: std.builtin.SourceLocation) logz.Logger {
-        return self.withLogger(utils.logWithSrc(logger, src));
+        var lg = self.withLogger(logger);
+        lg = utils.logWithSrc(lg, src);
+        return lg;
     }
 
     /// hash the device by bus, port, and ports
@@ -733,6 +735,48 @@ const DeviceContext = struct {
                 }
             }
 
+            pub fn close_socket(cap: *@This()) !void {
+                // open socket
+                const sel_slot = bb.BB_SLOT_AP;
+                const sel_port = 3;
+                {
+                    // note that sta == 0x101 means already opened socket
+                    const req = bt.socketRequestId(.close, @intCast(sel_slot), @intCast(sel_port));
+                    {
+                        const opt = bb.bb_sock_opt_t{ .tx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE, .rx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE };
+                        var pack = UsbPack{
+                            .reqid = req,
+                            .msgid = 0,
+                            .sta = 0,
+                        };
+                        const flags: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
+                        const opt_buf = utils.anytype2Slice(&opt);
+                        var list = std.ArrayList(u8).init(cap.stack_allocator);
+                        var writer = list.writer();
+                        try writer.writeByte(flags);
+                        _ = try writer.write(opt_buf);
+                        const payload = try list.toOwnedSlice();
+                        defer cap.stack_allocator.free(payload);
+                        try pack.fillWith(cap.stack_allocator, payload);
+                        defer pack.deinitWith(cap.stack_allocator);
+                        const data = try pack.marshal(cap.stack_allocator);
+                        defer cap.stack_allocator.free(data);
+                        try cap.self.transmit(data);
+                    }
+
+                    {
+                        var mpk = try cap.self.receive();
+                        defer mpk.deinit();
+                        const sta = mpk.pack.sta;
+                        // sta=257 seems to be the error code for already opened socket
+                        // sta=-259 seems to be error parameter or a general error, not sure
+                        if (sta != 0) {
+                            std.debug.panic("failed to open socket {}", .{sta});
+                        }
+                    }
+                }
+            }
+
             pub fn open_socket(cap: *@This()) !void {
                 // open socket
                 const sel_slot = bb.BB_SLOT_AP;
@@ -747,7 +791,15 @@ const DeviceContext = struct {
                             .msgid = 0,
                             .sta = 0,
                         };
-                        try pack.fillWith(cap.stack_allocator, &opt);
+                        const flags: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
+                        const opt_buf = utils.anytype2Slice(&opt);
+                        var list = std.ArrayList(u8).init(cap.stack_allocator);
+                        var writer = list.writer();
+                        try writer.writeByte(flags);
+                        _ = try writer.write(opt_buf);
+                        const payload = try list.toOwnedSlice();
+                        defer cap.stack_allocator.free(payload);
+                        try pack.fillWith(cap.stack_allocator, payload);
                         defer pack.deinitWith(cap.stack_allocator);
                         const data = try pack.marshal(cap.stack_allocator);
                         defer cap.stack_allocator.free(data);
@@ -758,7 +810,18 @@ const DeviceContext = struct {
                         var mpk = try cap.self.receive();
                         defer mpk.deinit();
                         const sta = mpk.pack.sta;
+                        // sta=257 seems to be the error code for already opened socket
+                        // sta=-259 seems to be error parameter or a general error, not sure
                         if (sta != 0) {
+                            if (sta == 257) {
+                                cap.self.withSrcLogger(logz.warn(), @src()).string("what", "socket already opened").log();
+                                try cap.close_socket();
+                                cap.self.withSrcLogger(logz.warn(), @src()).string("what", "close opened socket").log();
+                                // Hopefully it won't become an infinite loop
+                                try cap.open_socket();
+                                cap.self.withSrcLogger(logz.warn(), @src()).string("what", "reopen socket").log();
+                                return;
+                            }
                             std.debug.panic("failed to open socket {}", .{sta});
                         }
                     }

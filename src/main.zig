@@ -645,187 +645,160 @@ const DeviceContext = struct {
             stack_allocator: std.mem.Allocator,
             self: *DeviceContext,
 
-            // query status
-            pub fn query_status(cap: *@This()) !void {
+            // payload should be a pointer to struct, or null
+            pub fn query_common(cap: *@This(), reqid: u32, payload: anytype) !ManagedUsbPack {
+                const P = @TypeOf(payload);
                 {
                     {
-                        var in = bb.bb_get_status_in_t{
-                            .user_bmp = SLOT_BIT_MAP_MAX,
-                        };
                         var pack = UsbPack{
-                            .reqid = bb.BB_GET_STATUS,
+                            .reqid = reqid,
                             .msgid = 0,
                             .sta = 0,
                         };
-                        try pack.fillWith(cap.stack_allocator, &in);
-                        defer pack.deinitWith(cap.stack_allocator);
+                        switch (@typeInfo(P)) {
+                            .Pointer => {
+                                try pack.fillWith(cap.stack_allocator, &payload);
+                                defer pack.deinitWith(cap.stack_allocator);
+                            },
+                            .Null => {}, // do nothing
+                            else => @compileError("expected a pointer type or null, found `" ++ @typeName(P) ++ "`"),
+                        }
                         const data = try pack.marshal(cap.stack_allocator);
                         defer cap.stack_allocator.free(data);
-                        cap.self.transmit(data) catch unreachable;
+                        try cap.self.transmit(data);
                     }
 
-                    {
-                        var mpk = try cap.self.receive();
-                        defer mpk.deinit();
-                        const status = try mpk.dataAs(bb.bb_get_status_out_t);
-                        bt.logWithStatus(cap.self.withSrcLogger(logz.info(), @src()), &status).log();
-                    }
+                    return try cap.self.receive();
                 }
+            }
+
+            // like `query_common`, but with a slice payload
+            pub fn query_common_slice(cap: *@This(), reqid: u32, payload: []const u8) !ManagedUsbPack {
+                {
+                    {
+                        var pack = UsbPack{
+                            .reqid = reqid,
+                            .msgid = 0,
+                            .sta = 0,
+                        };
+                        pack.ptr = payload.ptr;
+                        pack.len = @intCast(payload.len);
+                        const data = try pack.marshal(cap.stack_allocator);
+                        defer cap.stack_allocator.free(data);
+                        try cap.self.transmit(data);
+                    }
+
+                    return try cap.self.receive();
+                }
+            }
+
+            // query status
+            pub fn query_status(cap: *@This()) !void {
+                var in = bb.bb_get_status_in_t{
+                    .user_bmp = SLOT_BIT_MAP_MAX,
+                };
+                var mpk = try cap.query_common(bb.BB_GET_STATUS, &in);
+                defer mpk.deinit();
+                std.debug.assert(mpk.pack.sta == 0);
+                const status = try mpk.dataAs(bb.bb_get_status_out_t);
+                bt.logWithStatus(cap.self.withSrcLogger(logz.info(), @src()), &status).log();
             }
 
             // query system info (build time, version, etc.)
             pub fn query_info(cap: *@This()) !void {
-                {
-                    {
-                        var pack = UsbPack{
-                            .reqid = bb.BB_GET_SYS_INFO,
-                            .msgid = 0,
-                            .sta = 0,
-                        };
-                        const data = try pack.marshal(cap.stack_allocator);
-                        defer cap.stack_allocator.free(data);
-                        try cap.self.transmit(data);
-                    }
-
-                    {
-                        var mpk = try cap.self.receive();
-                        defer mpk.deinit();
-                        const info = try mpk.dataAs(bb.bb_get_sys_info_out_t);
-                        const compile_time: [*:0]const u8 = @ptrCast(&info.compile_time);
-                        const soft_ver: [*:0]const u8 = @ptrCast(&info.soft_ver);
-                        const hard_ver: [*:0]const u8 = @ptrCast(&info.hardware_ver);
-                        const firmware_ver: [*:0]const u8 = @ptrCast(&info.firmware_ver);
-
-                        cap.self.withSrcLogger(logz.info(), @src())
-                            .int("uptime", info.uptime)
-                            .stringSafeZ("compile_time", compile_time)
-                            .stringSafeZ("soft_ver", soft_ver)
-                            .stringSafeZ("hard_ver", hard_ver)
-                            .stringSafeZ("firmware_ver", firmware_ver).log();
-                    }
-                }
+                var mpk = try cap.query_common(bb.BB_GET_SYS_INFO, null);
+                defer mpk.deinit();
+                std.debug.assert(mpk.pack.sta == 0);
+                const info = try mpk.dataAs(bb.bb_get_sys_info_out_t);
+                const compile_time: [*:0]const u8 = @ptrCast(&info.compile_time);
+                const soft_ver: [*:0]const u8 = @ptrCast(&info.soft_ver);
+                const hard_ver: [*:0]const u8 = @ptrCast(&info.hardware_ver);
+                const firmware_ver: [*:0]const u8 = @ptrCast(&info.firmware_ver);
+                cap.self.withSrcLogger(logz.info(), @src())
+                    .int("uptime", info.uptime)
+                    .stringSafeZ("compile_time", compile_time)
+                    .stringSafeZ("soft_ver", soft_ver)
+                    .stringSafeZ("hard_ver", hard_ver)
+                    .stringSafeZ("firmware_ver", firmware_ver).log();
             }
 
             pub fn subscribe_event(cap: *@This(), event: bt.Event) !void {
-                {
-                    const req = bt.subscribeRequestId(event);
-                    {
-                        var pack = UsbPack{
-                            .reqid = req,
-                            .msgid = 0,
-                            .sta = 0,
-                        };
-                        defer pack.deinitWith(cap.stack_allocator);
-                        const data = try pack.marshal(cap.stack_allocator);
-                        defer cap.stack_allocator.free(data);
-                        try cap.self.transmit(data);
-                    }
-
-                    {
-                        var mpk = try cap.self.receive();
-                        defer mpk.deinit();
-                        const sta = mpk.pack.sta;
-                        if (sta != 0) {
-                            std.debug.panic("failed to register event {}", .{sta});
-                        }
-                        cap.self.withSrcLogger(logz.info(), @src())
-                            .string("what", "subscribed event")
-                            .string("event", @tagName(event)).log();
-                    }
-                }
+                const req = bt.subscribeRequestId(event);
+                var mpk = try cap.query_common(req, null);
+                defer mpk.deinit();
+                std.debug.assert(mpk.pack.sta == 0);
+                cap.self.withSrcLogger(logz.info(), @src())
+                    .string("what", "subscribed event")
+                    .string("event", @tagName(event)).log();
             }
 
-            pub fn close_socket(cap: *@This()) !void {
-                // open socket
-                const sel_slot = bb.BB_SLOT_AP;
-                const sel_port = 3;
-                {
-                    // note that sta == 0x101 means already opened socket
-                    const req = bt.socketRequestId(.close, @intCast(sel_slot), @intCast(sel_port));
-                    {
-                        const opt = bb.bb_sock_opt_t{ .tx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE, .rx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE };
-                        var pack = UsbPack{
-                            .reqid = req,
-                            .msgid = 0,
-                            .sta = 0,
-                        };
-                        const flags: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
-                        const opt_buf = utils.anytype2Slice(&opt);
-                        var list = std.ArrayList(u8).init(cap.stack_allocator);
-                        var writer = list.writer();
-                        try writer.writeByte(flags);
-                        _ = try writer.write(opt_buf);
-                        const payload = try list.toOwnedSlice();
-                        defer cap.stack_allocator.free(payload);
-                        try pack.fillWith(cap.stack_allocator, payload);
-                        defer pack.deinitWith(cap.stack_allocator);
-                        const data = try pack.marshal(cap.stack_allocator);
-                        defer cap.stack_allocator.free(data);
-                        try cap.self.transmit(data);
-                    }
+            const sel_slot = bb.BB_SLOT_AP;
+            const sel_port = 3;
 
-                    {
-                        var mpk = try cap.self.receive();
-                        defer mpk.deinit();
-                        const sta = mpk.pack.sta;
-                        // sta=257 seems to be the error code for already opened socket
-                        // sta=-259 seems to be error parameter or a general error, not sure
-                        if (sta != 0) {
-                            std.debug.panic("failed to open socket {}", .{sta});
-                        }
-                    }
-                }
+            pub fn close_socket(cap: *@This()) !void {
+                const req = bt.socketRequestId(.close, @intCast(sel_slot), @intCast(sel_port));
+                const flags: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
+                const opt = bb.bb_sock_opt_t{ .tx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE, .rx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE };
+                const opt_buf = utils.anytype2Slice(&opt);
+
+                var list = std.ArrayList(u8).init(cap.stack_allocator);
+                var writer = list.writer();
+                try writer.writeByte(flags);
+                _ = try writer.write(opt_buf);
+                const payload = try list.toOwnedSlice();
+                defer cap.stack_allocator.free(payload);
+
+                var mpk = try cap.query_common_slice(req, payload);
+                defer mpk.deinit();
+                std.debug.assert(mpk.pack.sta == 0);
             }
 
             pub fn open_socket(cap: *@This()) !void {
-                // open socket
-                const sel_slot = bb.BB_SLOT_AP;
-                const sel_port = 3;
-                {
-                    // note that sta == 0x101 means already opened socket
-                    const req = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
-                    {
-                        const opt = bb.bb_sock_opt_t{ .tx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE, .rx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE };
-                        var pack = UsbPack{
-                            .reqid = req,
-                            .msgid = 0,
-                            .sta = 0,
-                        };
-                        const flags: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
-                        const opt_buf = utils.anytype2Slice(&opt);
-                        var list = std.ArrayList(u8).init(cap.stack_allocator);
-                        var writer = list.writer();
-                        try writer.writeByte(flags);
-                        _ = try writer.write(opt_buf);
-                        const payload = try list.toOwnedSlice();
-                        defer cap.stack_allocator.free(payload);
-                        try pack.fillWith(cap.stack_allocator, payload);
-                        defer pack.deinitWith(cap.stack_allocator);
-                        const data = try pack.marshal(cap.stack_allocator);
-                        defer cap.stack_allocator.free(data);
-                        try cap.self.transmit(data);
-                    }
+                // note that sta == 0x0101 (i.e. 257) means already opened socket
+                const ERROR_ALREADY_OPENED_SOCKET = 257;
+                // -259 is a generic error code, I have no idea what's the exact meaning
+                const ERROR_UNKNOWN = -259;
+                _ = ERROR_UNKNOWN;
 
-                    {
-                        var mpk = try cap.self.receive();
-                        defer mpk.deinit();
-                        const sta = mpk.pack.sta;
-                        // sta=257 seems to be the error code for already opened socket
-                        // sta=-259 seems to be error parameter or a general error, not sure
-                        if (sta != 0) {
-                            if (sta == 257) {
-                                cap.self.withSrcLogger(logz.warn(), @src()).string("what", "socket already opened").log();
-                                try cap.close_socket();
-                                cap.self.withSrcLogger(logz.warn(), @src()).string("what", "close opened socket").log();
-                                // Hopefully it won't become an infinite loop
-                                try cap.open_socket();
-                                cap.self.withSrcLogger(logz.warn(), @src()).string("what", "reopen socket").log();
-                                return;
-                            }
-                            std.debug.panic("failed to open socket {}", .{sta});
-                        }
-                    }
+                const req = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
+                const flags: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
+                const opt = bb.bb_sock_opt_t{ .tx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE, .rx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE };
+                const opt_buf = utils.anytype2Slice(&opt);
+
+                var list = std.ArrayList(u8).init(cap.stack_allocator);
+                var writer = list.writer();
+                try writer.writeByte(flags);
+                _ = try writer.write(opt_buf);
+                const payload = try list.toOwnedSlice();
+                defer cap.stack_allocator.free(payload);
+
+                var mpk = try cap.query_common_slice(req, payload);
+                defer mpk.deinit();
+                const sta = mpk.pack.sta;
+                if (sta == 0) {
+                    cap.self.withSrcLogger(logz.info(), @src())
+                        .int("slot", sel_slot)
+                        .int("port", sel_port)
+                        .string("what", "socket opened")
+                        .log();
+                    return;
                 }
+                if (sta == ERROR_ALREADY_OPENED_SOCKET) {
+                    cap.self.withSrcLogger(logz.warn(), @src())
+                        .string("what", "socket already opened")
+                        .log();
+                    try cap.close_socket();
+                    cap.self.withSrcLogger(logz.warn(), @src())
+                        .string("what", "close opened socket")
+                        .log();
+                    // Hopefully it won't become an infinite loop
+                    try cap.open_socket();
+                    cap.self.withSrcLogger(logz.warn(), @src())
+                        .string("what", "reopen socket")
+                        .log();
+                    return;
+                }
+                std.debug.panic("failed to open socket, sta={d}", .{sta});
             }
         };
 

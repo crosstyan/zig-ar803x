@@ -504,6 +504,10 @@ const DeviceContext = struct {
         }
     }
 
+    pub inline fn withSrcLogger(self: *const Self, logger: logz.Logger, src: std.builtin.SourceLocation) logz.Logger {
+        return self.withLogger(utils.logWithSrc(logger, src));
+    }
+
     /// hash the device by bus, port, and ports
     pub fn xxhash(self: *const Self) u32 {
         var h = std.hash.XxHash32.init(XXHASH_SEED);
@@ -662,8 +666,7 @@ const DeviceContext = struct {
                         var mpk = try cap.self.receive();
                         defer mpk.deinit();
                         const status = try mpk.dataAs(bb.bb_get_status_out_t);
-                        cap.self.withLogger(logz.info())
-                            .fmt("status", "{any}", .{status}).log();
+                        bt.logWithStatus(cap.self.withSrcLogger(logz.info(), @src()), &status).log();
                     }
                 }
             }
@@ -691,7 +694,7 @@ const DeviceContext = struct {
                         const hard_ver: [*:0]const u8 = @ptrCast(&info.hardware_ver);
                         const firmware_ver: [*:0]const u8 = @ptrCast(&info.firmware_ver);
 
-                        cap.self.withLogger(logz.info())
+                        cap.self.withSrcLogger(logz.info(), @src())
                             .int("uptime", info.uptime)
                             .stringSafeZ("compile_time", compile_time)
                             .stringSafeZ("soft_ver", soft_ver)
@@ -701,7 +704,7 @@ const DeviceContext = struct {
                 }
             }
 
-            pub fn register_event(cap: *@This(), event: bt.Event) !void {
+            pub fn subscribe_event(cap: *@This(), event: bt.Event) !void {
                 {
                     const req = bt.subscribeRequestId(event);
                     {
@@ -723,7 +726,9 @@ const DeviceContext = struct {
                         if (sta != 0) {
                             std.debug.panic("failed to register event {}", .{sta});
                         }
-                        cap.self.withLogger(logz.info()).string("registered", @tagName(event)).log();
+                        cap.self.withSrcLogger(logz.info(), @src())
+                            .string("what", "subscribed event")
+                            .string("event", @tagName(event)).log();
                     }
                 }
             }
@@ -767,9 +772,9 @@ const DeviceContext = struct {
         };
         local.query_status() catch unreachable;
         local.query_info() catch unreachable;
-        local.register_event(.link_state) catch unreachable;
-        local.register_event(.mcs_change) catch unreachable;
-        local.register_event(.chan_change) catch unreachable;
+        local.subscribe_event(.link_state) catch unreachable;
+        local.subscribe_event(.mcs_change) catch unreachable;
+        local.subscribe_event(.chan_change) catch unreachable;
         local.open_socket() catch unreachable;
 
         utils.logWithSrc(self.withLogger(logz.info()), @src())

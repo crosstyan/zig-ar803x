@@ -28,6 +28,7 @@
         "pointee",
         "posix",
         "reqid",
+        "sbmp",
         "Sigaction",
         "sigset",
         "struct",

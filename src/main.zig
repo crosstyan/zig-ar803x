@@ -1251,7 +1251,7 @@ const TransferCallback = struct {
         self.transfer.lk.unlockShared();
         const status = transferStatusFromInt(trans.*.status) catch unreachable;
 
-        var lg = utils.logWithSrc(self.dev.withLogger(logz.info()), @src());
+        var lg = utils.logWithSrc(self.dev.withLogger(logz.debug()), @src());
         lg = self.endpoint.withLogger(lg);
         lg.string("status", @tagName(status))
             .int("flags", trans.*.flags)
@@ -1271,7 +1271,7 @@ const TransferCallback = struct {
 
         const rx_buf = self.transfer.written();
         self.transfer.lk.unlockShared();
-        var lg = utils.logWithSrc(self.dev.withLogger(logz.info()), @src());
+        var lg = utils.logWithSrc(self.dev.withLogger(logz.debug()), @src());
         lg = self.endpoint.withLogger(lg);
         lg.string("status", @tagName(status))
             .int("flags", trans.*.flags)
@@ -1282,7 +1282,7 @@ const TransferCallback = struct {
         if (rx_buf.len > 0) {
             var mpk_ = ManagedUsbPack.unmarshal(self.alloc, rx_buf);
             if (mpk_) |*mpk| {
-                lg = utils.logWithSrc(self.dev.withLogger(logz.info()), @src());
+                lg = utils.logWithSrc(self.dev.withLogger(logz.debug()), @src());
                 lg = self.endpoint.withLogger(lg);
                 mpk.pack.withLogger(lg)
                     .log();

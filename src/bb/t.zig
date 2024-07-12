@@ -490,12 +490,6 @@ pub const TxMode = enum {
     }
 };
 
-// pub const BB_RX_1T1R: c_int = 0;
-// pub const BB_RX_1T2R: c_int = 1;
-// pub const BB_RX_2T2R_STBC: c_int = 2;
-// pub const BB_RX_2T2R_MIMO: c_int = 3;
-// pub const BB_RX_MODE_MAX: c_int = 4;
-// pub const bb_rx_mode_e = c_uint;
 pub const RxMode = enum {
     rx_1t1r,
     rx_1t2r,
@@ -539,6 +533,18 @@ const PhyStatus = struct {
 
     const Self = @This();
 
+    pub inline fn default() Self {
+        return Self{
+            .mcs = PhyMcs.neg_1,
+            .rf_mode = RfMode{ .tx = TxMode.tx_1tx },
+            .tinvlv_enable = TimeIntlvEnable.off,
+            .tintlv_num = TimeIntlvNum.block_1,
+            .tintlv_len = TimeIntlvLen.len_3,
+            .bandwidth = Bandwidth.bw_1_25m,
+            .freq_hz = 0,
+        };
+    }
+
     pub fn fromC(status: *const bb.bb_phy_status_t, is_tx: bool) BadEnum!Self {
         var rf_mode: RfMode = undefined;
         if (is_tx) {
@@ -575,6 +581,14 @@ const LinkStatus = struct {
     rx_mcs: PhyMcs,
     peer_mac: MacAddr,
 
+    pub inline fn default() Self {
+        return Self{
+            .state = LinkState.idle,
+            .rx_mcs = PhyMcs.neg_1,
+            .peer_mac = [_]u8{ 0x00, 0x00, 0x00, 0x00 },
+        };
+    }
+
     const Self = @This();
     pub fn fromC(status: *const bb.bb_link_status_t) BadEnum!Self {
         return Self{
@@ -592,24 +606,6 @@ const LinkStatus = struct {
         return lg;
     }
 };
-
-pub fn logWithPhyStatus(logger: logz.Logger, status: *const bb.bb_phy_status_t, is_tx: bool) logz.Logger {
-    const st = PhyStatus.fromC(status, is_tx) catch {
-        return logger
-            .string("error", "invalid `bb_phy_status_t`")
-            .fmt("phy_status", "{any}", .{status});
-    };
-    return st.logWith(logger);
-}
-
-pub fn logWithLinkStatus(logger: logz.Logger, status: *const bb.bb_link_status_t) logz.Logger {
-    const st = LinkStatus.fromC(status) catch {
-        return logger
-            .string("error", "invalid `bb_link_status_t`")
-            .fmt("link_status", "{any}", .{status});
-    };
-    return st.logWith(logger);
-}
 
 pub fn logWithUserStatus(logger: logz.Logger, status: *const bb.bb_user_status_t) logz.Logger {
     const tx = &status.tx_status;
@@ -645,27 +641,133 @@ pub fn u8ToArray(u: u8, comptime msb_first: bool) [8]bool {
     return ret;
 }
 
-pub fn logWithStatus(logger: logz.Logger, status: *const bb.bb_get_status_out_t) logz.Logger {
-    var lg = logger.string("role", @tagName(Role.fromC(status.role) catch unreachable))
-        .string("mode", @tagName(Mode.fromC(status.mode) catch unreachable))
-        .int("sync_mode", status.sync_mode) // chip sync mode. 1: enable, 0: disable
-        .int("sync_master", status.sync_master) // 1: master, 0: slave
-        .fmt("cfg_bmp", "0x{x:0>2}", .{status.cfg_sbmp}) // config bitmap
-        .fmt("rt_bmp", "0x{x:0>2}", .{status.rt_sbmp}) // runtime bitmap
-    ;
+pub const UserStatus = struct {
+    tx_status: PhyStatus,
+    rx_status: PhyStatus,
+    const Self = @This();
 
-    const SLOT_MAX = 8;
-    const bmp = status.cfg_sbmp;
-    const bmp_arr = u8ToArray(bmp, false);
-    const user_status = status.user_status[0..SLOT_MAX];
-    const link_status = status.link_status[0..SLOT_MAX];
-    for (0..SLOT_MAX, bmp_arr, link_status, user_status) |i, ok, link, user| {
-        if (ok) {
-            lg = lg.int("slot", i);
-            lg = logWithUserStatus(lg, &user);
-            lg = logWithLinkStatus(lg, &link);
-        }
+    pub fn logWith(self: *const Self, logger: logz.Logger) logz.Logger {
+        var lg = logger.string("user", "tx");
+        lg = self.tx_status.logWith(lg);
+        lg = lg.string("user", "rx");
+        lg = self.rx_status.logWith(lg);
+        return lg;
     }
 
-    return lg;
+    pub inline fn default() Self {
+        return Self{
+            .tx_status = PhyStatus.default(),
+            .rx_status = PhyStatus.default(),
+        };
+    }
+};
+
+pub const RefStatus = struct { u8, *const UserStatus, *const LinkStatus };
+
+pub const SLOT_MAX = 8;
+pub const Status = struct {
+    role: Role,
+    mode: Mode,
+    /// 1: enable, 0: disable
+    en_sync: bool,
+    /// 1: enable, 0: disable
+    is_master: bool,
+    cfg_bmp: u8,
+    rt_bmp: u8,
+    user_status: [SLOT_MAX]UserStatus,
+    link_status: [SLOT_MAX]LinkStatus,
+    const Self = @This();
+
+    fn bmp_status(self: *const Self, alloc: std.mem.Allocator, bmp: u8) []RefStatus {
+        var list = std.ArrayList(RefStatus).init(alloc);
+        defer list.deinit();
+        const bmp_arr = u8ToArray(bmp, false);
+        const user_status = self.user_status[0..SLOT_MAX];
+        const link_status = self.link_status[0..SLOT_MAX];
+        for (0..SLOT_MAX, bmp_arr, link_status, user_status) |i, ok, *link, *user| {
+            if (ok) {
+                list.append(.{ @intCast(i), user, link }) catch @panic("OOM");
+            }
+        }
+        return list.toOwnedSlice() catch @panic("OOM");
+    }
+
+    pub fn cfg_status(self: *const Self, alloc: std.mem.Allocator) []RefStatus {
+        return self.bmp_status(alloc, self.cfg_bmp);
+    }
+
+    pub fn rt_status(self: *const Self, alloc: std.mem.Allocator) []RefStatus {
+        return self.bmp_status(alloc, self.rt_bmp);
+    }
+
+    pub fn fromC(status: *const bb.bb_get_status_out_t) BadEnum!Self {
+        var user_status: [SLOT_MAX]UserStatus = undefined;
+        var link_status: [SLOT_MAX]LinkStatus = undefined;
+        for (0..SLOT_MAX) |i| {
+            user_status[i] = UserStatus{
+                .tx_status = PhyStatus.fromC(&status.user_status[i].tx_status, true) catch continue,
+                .rx_status = PhyStatus.fromC(&status.user_status[i].rx_status, false) catch continue,
+            };
+            link_status[i] = LinkStatus.fromC(&status.link_status[i]) catch continue;
+        }
+        return Self{
+            .role = try Role.fromC(status.role),
+            .mode = try Mode.fromC(status.mode),
+            .en_sync = status.sync_mode != 0,
+            .is_master = status.sync_master != 0,
+            .cfg_bmp = status.cfg_sbmp,
+            .rt_bmp = status.rt_sbmp,
+            .user_status = user_status,
+            .link_status = link_status,
+        };
+    }
+
+    pub fn logWith(self: *const Self, logger: logz.Logger) logz.Logger {
+        var fixed_buf: [@sizeOf(RefStatus) * (SLOT_MAX + 2)]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(fixed_buf[0..]);
+        const alloc = fixed.allocator();
+
+        var lg = logger
+            .string("role", @tagName(self.role))
+            .string("mode", @tagName(self.mode))
+            .boolean("sync_mode", self.en_sync)
+            .boolean("sync_master", self.is_master)
+            .fmt("cfg_bmp", "0x{x:0>2}", .{self.cfg_bmp})
+            .fmt("rt_bmp", "0x{x:0>2}", .{self.rt_bmp});
+        const refs = self.cfg_status(alloc);
+        for (refs) |r| {
+            const i, const user, const link = r;
+            lg = lg.int("slot", i);
+            lg = user.logWith(lg);
+            lg = link.logWith(lg);
+        }
+        return lg;
+    }
+};
+
+pub fn logWithPhyStatus(logger: logz.Logger, status: *const bb.bb_phy_status_t, is_tx: bool) logz.Logger {
+    const st = PhyStatus.fromC(status, is_tx) catch {
+        return logger
+            .string("error", "invalid `bb_phy_status_t`")
+            .fmt("phy_status", "{any}", .{status});
+    };
+    return st.logWith(logger);
+}
+
+pub fn logWithLinkStatus(logger: logz.Logger, status: *const bb.bb_link_status_t) logz.Logger {
+    const st = LinkStatus.fromC(status) catch {
+        return logger
+            .string("error", "invalid `bb_link_status_t`")
+            .fmt("link_status", "{any}", .{status});
+    };
+    return st.logWith(logger);
+}
+
+pub fn logWithStatus(logger: logz.Logger, status: *const bb.bb_get_status_out_t) logz.Logger {
+    const st = Status.fromC(status) catch {
+        return logger
+            .string("error", "invalid `bb_get_status_out_t`")
+            .fmt("status", "{any}", .{status});
+    };
+    return st.logWith(logger);
 }

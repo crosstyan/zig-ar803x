@@ -15,6 +15,7 @@
         "deinit",
         "deinitialized",
         "DWORD",
+        "errc",
         "iface",
         "ifaces",
         "ldesc",

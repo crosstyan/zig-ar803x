@@ -951,11 +951,6 @@ fn refreshDevList(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator,
     defer usb.libusb_free_device_list(c_device_list, 1);
     const device_list = c_device_list[0..@intCast(sz)];
 
-    // https://www.reddit.com/r/Zig/comments/18p7w7v/making_a_struct_inside_a_function_makes_it_static/
-    // https://www.reddit.com/r/Zig/comments/ard50a/static_local_variables_in_zig/
-
-    // TODO: if we're polling this we'd better avoid allocating memory repeatedly
-    // move shit into a context and preallocate them
     const find_diff = struct {
         ctx_list: []const DeviceContext,
 
@@ -1264,7 +1259,6 @@ const TransferCallback = struct {
                     lg = utils.logWithSrc(self.dev.withLogger(logz.err()), @src());
                     lg.err(e).string("what", "failed to enqueue").log();
                     mpk.deinit();
-                    return;
                 };
             } else |err| {
                 lg = utils.logWithSrc(self.dev.withLogger(logz.err()), @src());
@@ -1277,26 +1271,29 @@ const TransferCallback = struct {
         }
 
         // resubmit the transfer
-        const err = usb.libusb_submit_transfer(trans);
-        lg = self.dev.withLogger(logz.err());
-        lg = self.endpoint.withLogger(lg);
-        switch (err) {
-            0 => self.transfer.lk.lockShared(),
-            usb.LIBUSB_ERROR_NO_DEVICE => {
-                // upstream should monitor the device list
-                // and handle the device removal
-                lg.string("err", "no device").log();
-            },
-            usb.LIBUSB_ERROR_BUSY => {
-                // should not happen, unless the transfer is be reused,
-                // which should NOT happen with lock
-                lg.string("err", "transfer is busy").log();
-                @panic("transfer is busy");
-            },
-            else => {
-                lg.int("code", err).string("err", "failed to submit transfer").log();
-                @panic("failed to submit transfer");
-            },
+        const errc = usb.libusb_submit_transfer(trans);
+        if (errc == 0) {
+            self.transfer.lk.lockShared();
+        } else {
+            const err = libusb_error_2_set(errc);
+            lg = self.dev.withLogger(logz.err());
+            lg = self.endpoint.withLogger(lg);
+            lg.string("what", "failed to resubmit transfer")
+                .err(err).log();
+            switch (err) {
+                LibUsbError.NoDevice => {
+                    // upstream should monitor the device list
+                    // and handle the device removal
+                },
+                LibUsbError.Busy => {
+                    // should not happen, unless the transfer is be reused,
+                    // which should NOT happen with lock
+                    @panic("invalid precondition: busy transfer");
+                },
+                else => {
+                    @panic("failed to resubmit transfer");
+                },
+            }
         }
     }
 };

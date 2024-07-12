@@ -648,27 +648,24 @@ const DeviceContext = struct {
             // payload should be a pointer to struct, or null
             pub fn query_common(cap: *@This(), reqid: u32, payload: anytype) !ManagedUsbPack {
                 const P = @TypeOf(payload);
-                {
-                    {
-                        var pack = UsbPack{
-                            .reqid = reqid,
-                            .msgid = 0,
-                            .sta = 0,
-                        };
-                        switch (@typeInfo(P)) {
-                            .Pointer => {
-                                try pack.fillWith(&payload);
-                            },
-                            .Null => {}, // do nothing
-                            else => @compileError("expected a pointer type or null, found `" ++ @typeName(P) ++ "`"),
-                        }
-                        const data = try pack.marshal(cap.stack_allocator);
-                        defer cap.stack_allocator.free(data);
-                        try cap.self.transmit(data);
-                    }
 
-                    return try cap.self.receive();
+                var pack = UsbPack{
+                    .reqid = reqid,
+                    .msgid = 0,
+                    .sta = 0,
+                };
+                switch (@typeInfo(P)) {
+                    .Pointer => {
+                        try pack.fillWith(payload);
+                    },
+                    .Null => {}, // do nothing
+                    else => @compileError("`payload` must be a pointer type or null, found `" ++ @typeName(P) ++ "`"),
                 }
+                const data = try pack.marshal(cap.stack_allocator);
+                defer cap.stack_allocator.free(data);
+                try cap.self.transmit(data);
+
+                return try cap.self.receive();
             }
 
             // like `query_common`, but with a slice payload
@@ -752,7 +749,7 @@ const DeviceContext = struct {
                 std.debug.assert(mpk.pack.sta == 0);
             }
 
-            fn maybe_socket_open(cap: *@This()) !ManagedUsbPack {
+            fn try_socket_open(cap: *@This()) !ManagedUsbPack {
                 const req = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
                 const flags: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
                 const opt = bb.bb_sock_opt_t{ .tx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE, .rx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE };
@@ -776,7 +773,7 @@ const DeviceContext = struct {
                 const ERROR_UNKNOWN = -259;
                 _ = ERROR_UNKNOWN;
 
-                var mpk = try cap.maybe_socket_open();
+                var mpk = try cap.try_socket_open();
                 defer mpk.deinit();
                 const sta = mpk.pack.sta;
                 if (sta == 0) {
@@ -800,7 +797,7 @@ const DeviceContext = struct {
                         .string("what", "close opened socket")
                         .log();
 
-                    var i_mpk = try cap.maybe_socket_open();
+                    var i_mpk = try cap.try_socket_open();
                     defer i_mpk.deinit();
                     const i_sta = i_mpk.pack.sta;
                     if (i_sta == 0) {

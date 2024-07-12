@@ -1,6 +1,7 @@
 const std = @import("std");
 const bb = @import("c.zig");
 const logz = @import("logz");
+const BadEnum = @import("../utils.zig").BadEnum;
 
 pub const SUBSCRIBE_REQ = 1;
 pub const SUBSCRIBE_REQ_RET = 2;
@@ -106,11 +107,11 @@ const Role = enum {
         return @intCast(r);
     }
 
-    pub fn fromC(role: c_int) Role {
+    pub fn fromC(role: c_int) BadEnum!Role {
         switch (role) {
             bb.BB_ROLE_AP => return Role.ap,
             bb.BB_ROLE_DEV => return Role.dev,
-            else => std.debug.panic("unknown C enum for `bb_role_e` {}", .{role}),
+            else => return BadEnum.BadEnum,
         }
     }
 };
@@ -132,13 +133,13 @@ const Mode = enum {
         return @intCast(m);
     }
 
-    pub fn fromC(mode: c_int) Mode {
+    pub fn fromC(mode: c_int) BadEnum!Mode {
         switch (mode) {
             bb.BB_MODE_SINGLE_USER => return Mode.single_user,
             bb.BB_MODE_MULTI_USER => return Mode.multi_user,
             bb.BB_MODE_RELAY => return Mode.relay,
             bb.BB_MODE_DIRECTOR => return Mode.director,
-            else => std.debug.panic("unknown C enum for `bb_mode_e` {}", .{mode}),
+            else => return BadEnum.BadEnum,
         }
     }
 };
@@ -246,11 +247,11 @@ const SlotMode = enum {
         return @intCast(m);
     }
 
-    pub fn fromC(mode: c_int) SlotMode {
+    pub fn fromC(mode: c_int) BadEnum!SlotMode {
         switch (mode) {
             bb.BB_SLOT_MODE_FIXED => return SlotMode.fixed,
             bb.BB_SLOT_MODE_DYNAMIC => return SlotMode.dynamic,
-            else => std.debug.panic("unknown C enum for `bb_slot_mode_e` {}", .{mode}),
+            else => return BadEnum.BadEnum,
         }
     }
 };
@@ -269,12 +270,12 @@ const LinkState = enum {
         return @intCast(s);
     }
 
-    pub fn fromC(state: c_int) LinkState {
+    pub fn fromC(state: c_int) BadEnum!LinkState {
         switch (state) {
             bb.BB_LINK_STATE_IDLE => return LinkState.idle,
             bb.BB_LINK_STATE_LOCK => return LinkState.lock,
             bb.BB_LINK_STATE_CONNECT => return LinkState.connect,
-            else => std.debug.panic("unknown C enum for `bb_link_state_e` {}", .{state}),
+            else => return BadEnum.BadEnum,
         }
     }
 };
@@ -293,12 +294,12 @@ const Band = enum {
         return @intCast(b);
     }
 
-    pub fn fromC(band: c_int) Band {
+    pub fn fromC(band: c_int) BadEnum!Band {
         switch (band) {
             bb.BB_BAND_1G => return Band.band_1g,
             bb.BB_BAND_2G => return Band.band_2g,
             bb.BB_BAND_5G => return Band.band_5g,
-            else => std.debug.panic("unknown C enum for `bb_band_e` {}", .{band}),
+            else => return BadEnum.BadEnum,
         }
     }
 };
@@ -315,11 +316,11 @@ const RFPath = enum {
         return @intCast(p);
     }
 
-    pub fn fromC(path: c_int) RFPath {
+    pub fn fromC(path: c_int) BadEnum!RFPath {
         switch (path) {
             bb.BB_RF_PATH_A => return RFPath.path_a,
             bb.BB_RF_PATH_B => return RFPath.path_b,
-            else => std.debug.panic("unknown C enum for `bb_rf_path_e` {}", .{path}),
+            else => return BadEnum.BadEnum,
         }
     }
 };
@@ -340,13 +341,13 @@ const BandMode = enum {
         return @intCast(m);
     }
 
-    pub fn fromC(mode: c_int) BandMode {
+    pub fn fromC(mode: c_int) BadEnum!BandMode {
         switch (mode) {
             bb.BB_BAND_MODE_SINGLE => return BandMode.single,
             bb.BB_BAND_MODE_2G_5G => return BandMode.band_2g_5g,
             bb.BB_BAND_MODE_1G_2G => return BandMode.band_1g_2g,
             bb.BB_BAND_MODE_1G_5G => return BandMode.band_1g_5g,
-            else => std.debug.panic("unknown C enum for `bb_band_mode_e` {}", .{mode}),
+            else => return BadEnum.BadEnum,
         }
     }
 };
@@ -371,7 +372,7 @@ const Bandwidth = enum {
         return @intCast(b);
     }
 
-    pub fn fromC(bw: c_int) Bandwidth {
+    pub fn fromC(bw: c_int) BadEnum!Bandwidth {
         switch (bw) {
             bb.BB_BW_1_25M => return Bandwidth.bw_1_25m,
             bb.BB_BW_2_5M => return Bandwidth.bw_2_5m,
@@ -379,7 +380,7 @@ const Bandwidth = enum {
             bb.BB_BW_10M => return Bandwidth.bw_10m,
             bb.BB_BW_20M => return Bandwidth.bw_20m,
             bb.BB_BW_40M => return Bandwidth.bw_40m,
-            else => std.debug.panic("unknown C enum for `bb_bandwidth_e` {}", .{bw}),
+            else => return BadEnum.BadEnum,
         }
     }
 };
@@ -402,14 +403,14 @@ const TimeIntlvLen = enum {
         return @intCast(l);
     }
 
-    pub fn fromC(len: c_int) TimeIntlvLen {
+    pub fn fromC(len: c_int) BadEnum!TimeIntlvLen {
         switch (len) {
             bb.BB_TIMEINTLV_LEN_3 => return TimeIntlvLen.len_3,
             bb.BB_TIMEINTLV_LEN_6 => return TimeIntlvLen.len_6,
             bb.BB_TIMEINTLV_LEN_12 => return TimeIntlvLen.len_12,
             bb.BB_TIMEINTLV_LEN_24 => return TimeIntlvLen.len_24,
             bb.BB_TIMEINTLV_LEN_48 => return TimeIntlvLen.len_48,
-            else => std.debug.panic("unknown C enum for `bb_timeintlv_len_e` {}", .{len}),
+            else => return BadEnum.BadEnum,
         }
     }
 };
@@ -426,11 +427,11 @@ const TimeIntlvEnable = enum {
         return @intCast(e);
     }
 
-    pub fn fromC(enable: c_int) TimeIntlvEnable {
+    pub fn fromC(enable: c_int) BadEnum!TimeIntlvEnable {
         switch (enable) {
             bb.BB_TIMEINTLV_OFF => return TimeIntlvEnable.off,
             bb.BB_TIMEINTLV_ON => return TimeIntlvEnable.on,
-            else => std.debug.panic("unknown C enum for `bb_timeintlv_enable_e` {}", .{enable}),
+            else => return BadEnum.BadEnum,
         }
     }
 };
@@ -447,11 +448,11 @@ const TimeIntlvNum = enum {
         return @intCast(n);
     }
 
-    pub fn fromC(num: c_int) TimeIntlvNum {
+    pub fn fromC(num: c_int) BadEnum!TimeIntlvNum {
         switch (num) {
             bb.BB_TIMEINTLV_1_BLOCK => return TimeIntlvNum.block_1,
             bb.BB_TIMEINTLV_2_BLOCK => return TimeIntlvNum.block_2,
-            else => std.debug.panic("unknown C enum for `bb_timeintlv_num_e` {}", .{num}),
+            else => return BadEnum.BadEnum,
         }
     }
 };
@@ -479,12 +480,12 @@ pub const TxMode = enum {
         return @intCast(m);
     }
 
-    pub fn fromC(mode: c_int) TxMode {
+    pub fn fromC(mode: c_int) BadEnum!TxMode {
         switch (mode) {
             bb.BB_TX_1TX => return TxMode.tx_1tx,
             bb.BB_TX_2TX_STBC => return TxMode.tx_2tx_stbc,
             bb.BB_TX_2TX_MIMO => return TxMode.tx_2tx_mimo,
-            else => std.debug.panic("unknown C enum for `bb_tx_mode_e` {}", .{mode}),
+            else => return BadEnum.BadEnum,
         }
     }
 };
@@ -511,13 +512,13 @@ pub const RxMode = enum {
         return @intCast(m);
     }
 
-    pub fn fromC(mode: c_int) RxMode {
+    pub fn fromC(mode: c_int) BadEnum!RxMode {
         switch (mode) {
             bb.BB_RX_1T1R => return RxMode.rx_1t1r,
             bb.BB_RX_1T2R => return RxMode.rx_1t2r,
             bb.BB_RX_2T2R_STBC => return RxMode.rx_2t2r_stbc,
             bb.BB_RX_2T2R_MIMO => return RxMode.rx_2t2r_mimo,
-            else => std.debug.panic("unknown C enum for `bb_rx_mode_e` {}", .{mode}),
+            else => return BadEnum.BadEnum,
         }
     }
 };
@@ -538,20 +539,20 @@ const PhyStatus = struct {
 
     const Self = @This();
 
-    pub fn fromC(status: *const bb.bb_phy_status_t, is_tx: bool) Self {
+    pub fn fromC(status: *const bb.bb_phy_status_t, is_tx: bool) BadEnum!Self {
         var rf_mode: RfMode = undefined;
         if (is_tx) {
-            rf_mode = RfMode{ .tx = TxMode.fromC(@intCast(status.rf_mode)) };
+            rf_mode = RfMode{ .tx = try TxMode.fromC(@intCast(status.rf_mode)) };
         } else {
-            rf_mode = RfMode{ .rx = RxMode.fromC(@intCast(status.rf_mode)) };
+            rf_mode = RfMode{ .rx = try RxMode.fromC(@intCast(status.rf_mode)) };
         }
         return Self{
             .mcs = PhyMcs.fromC(status.mcs),
             .rf_mode = rf_mode,
-            .tinvlv_enable = TimeIntlvEnable.fromC(@intCast(status.tintlv_enable)),
-            .tintlv_num = TimeIntlvNum.fromC(@intCast(status.tintlv_num)),
-            .tintlv_len = TimeIntlvLen.fromC(@intCast(status.tintlv_len)),
-            .bandwidth = Bandwidth.fromC(@intCast(status.bandwidth)),
+            .tinvlv_enable = try TimeIntlvEnable.fromC(@intCast(status.tintlv_enable)),
+            .tintlv_num = try TimeIntlvNum.fromC(@intCast(status.tintlv_num)),
+            .tintlv_len = try TimeIntlvLen.fromC(@intCast(status.tintlv_len)),
+            .bandwidth = try Bandwidth.fromC(@intCast(status.bandwidth)),
             .freq_hz = status.freq_khz,
         };
     }
@@ -575,9 +576,9 @@ const LinkStatus = struct {
     peer_mac: MacAddr,
 
     const Self = @This();
-    pub fn fromC(status: *const bb.bb_link_status_t) Self {
+    pub fn fromC(status: *const bb.bb_link_status_t) BadEnum!Self {
         return Self{
-            .state = LinkState.fromC(@intCast(status.state)),
+            .state = try LinkState.fromC(@intCast(status.state)),
             .rx_mcs = PhyMcs.fromC(@intCast(status.rx_mcs)),
             .peer_mac = status.peer_mac.addr,
         };
@@ -593,12 +594,20 @@ const LinkStatus = struct {
 };
 
 pub fn logWithPhyStatus(logger: logz.Logger, status: *const bb.bb_phy_status_t, is_tx: bool) logz.Logger {
-    const st = PhyStatus.fromC(status, is_tx);
+    const st = PhyStatus.fromC(status, is_tx) catch {
+        return logger
+            .string("error", "invalid `bb_phy_status_t`")
+            .fmt("phy_status", "{any}", .{status});
+    };
     return st.logWith(logger);
 }
 
 pub fn logWithLinkStatus(logger: logz.Logger, status: *const bb.bb_link_status_t) logz.Logger {
-    const st = LinkStatus.fromC(status);
+    const st = LinkStatus.fromC(status) catch {
+        return logger
+            .string("error", "invalid `bb_link_status_t`")
+            .fmt("link_status", "{any}", .{status});
+    };
     return st.logWith(logger);
 }
 
@@ -637,8 +646,8 @@ pub fn u8ToArray(u: u8, comptime msb_first: bool) [8]bool {
 }
 
 pub fn logWithStatus(logger: logz.Logger, status: *const bb.bb_get_status_out_t) logz.Logger {
-    var lg = logger.string("role", @tagName(Role.fromC(status.role)))
-        .string("mode", @tagName(Mode.fromC(status.mode)))
+    var lg = logger.string("role", @tagName(Role.fromC(status.role) catch unreachable))
+        .string("mode", @tagName(Mode.fromC(status.mode) catch unreachable))
         .int("sync_mode", status.sync_mode) // chip sync mode. 1: enable, 0: disable
         .int("sync_master", status.sync_master) // 1: master, 0: slave
         .fmt("cfg_bmp", "0x{x:0>2}", .{status.cfg_sbmp}) // config bitmap
@@ -648,8 +657,9 @@ pub fn logWithStatus(logger: logz.Logger, status: *const bb.bb_get_status_out_t)
     const SLOT_MAX = 8;
     const bmp = status.cfg_sbmp;
     const bmp_arr = u8ToArray(bmp, false);
-    const user_status = status.user_status[0..8];
-    for (0..SLOT_MAX, bmp_arr, status.link_status, user_status) |i, ok, link, user| {
+    const user_status = status.user_status[0..SLOT_MAX];
+    const link_status = status.link_status[0..SLOT_MAX];
+    for (0..SLOT_MAX, bmp_arr, link_status, user_status) |i, ok, link, user| {
         if (ok) {
             lg = lg.int("slot", i);
             lg = logWithUserStatus(lg, &user);

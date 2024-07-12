@@ -14,6 +14,11 @@ pub fn anytype2Slice(src: anytype) []const u8 {
     switch (@typeInfo(P)) {
         .Pointer => {
             const T = @typeInfo(P).Pointer.child;
+            switch (@typeInfo(T)) {
+                // prevent nested pointer type, usually it's not meaningful and error-prone
+                .Pointer => @compileError("nested pointer type is not allowed, found `" ++ @typeName(P) ++ "`"),
+                else => {},
+            }
             const size = @sizeOf(T);
             const ptr: [*]const u8 = @ptrCast(src);
             return ptr[0..size];
@@ -71,5 +76,5 @@ pub fn fillBytesWith(dst: []u8, src: anytype) LengthNotEqual!void {
 // https://github.com/ziglang/zig/blob/b3afba8a70af984423fc24e5b834df966693b50a/lib/std/builtin.zig#L243-L250
 pub inline fn logWithSrc(logger: logz.Logger, src: std.builtin.SourceLocation) logz.Logger {
     return logger
-        .fmt("src", "{s}:{d}@{s}", .{ src.file, src.line, src.fn_name });
+        .fmt("src", "{s}:{d} @{s}", .{ src.file, src.line, src.fn_name });
 }

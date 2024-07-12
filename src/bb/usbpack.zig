@@ -109,6 +109,10 @@ pub const UsbPack = packed struct {
             switch (@typeInfo(P)) {
                 .Pointer => {
                     const T = @typeInfo(P).Pointer.child;
+                    switch (@typeInfo(T)) {
+                        .Pointer => @compileError("nested pointer type is not allowed, found `" ++ @typeName(P) ++ "`"),
+                        else => {},
+                    }
                     const size = @sizeOf(T);
                     const buf = utils.anytype2Slice(data_ref);
                     self.ptr = buf.ptr;

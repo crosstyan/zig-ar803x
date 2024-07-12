@@ -670,22 +670,18 @@ const DeviceContext = struct {
 
             // like `query_common`, but with a slice payload
             pub fn query_common_slice(cap: *@This(), reqid: u32, payload: []const u8) !ManagedUsbPack {
-                {
-                    {
-                        var pack = UsbPack{
-                            .reqid = reqid,
-                            .msgid = 0,
-                            .sta = 0,
-                        };
-                        pack.ptr = payload.ptr;
-                        pack.len = @intCast(payload.len);
-                        const data = try pack.marshal(cap.stack_allocator);
-                        defer cap.stack_allocator.free(data);
-                        try cap.self.transmit(data);
-                    }
+                var pack = UsbPack{
+                    .reqid = reqid,
+                    .msgid = 0,
+                    .sta = 0,
+                };
+                pack.ptr = payload.ptr;
+                pack.len = @intCast(payload.len);
+                const data = try pack.marshal(cap.stack_allocator);
+                defer cap.stack_allocator.free(data);
+                try cap.self.transmit(data);
 
-                    return try cap.self.receive();
-                }
+                return try cap.self.receive();
             }
 
             // query status
@@ -731,24 +727,6 @@ const DeviceContext = struct {
             const sel_slot = bb.BB_SLOT_AP;
             const sel_port = 3;
 
-            pub fn close_socket(cap: *@This()) !void {
-                const req = bt.socketRequestId(.close, @intCast(sel_slot), @intCast(sel_port));
-                const flags: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
-                const opt = bb.bb_sock_opt_t{ .tx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE, .rx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE };
-                const opt_buf = utils.anytype2Slice(&opt);
-
-                var list = std.ArrayList(u8).init(cap.stack_allocator);
-                var writer = list.writer();
-                try writer.writeByte(flags);
-                _ = try writer.write(opt_buf);
-                const payload = try list.toOwnedSlice();
-                defer cap.stack_allocator.free(payload);
-
-                var mpk = try cap.query_common_slice(req, payload);
-                defer mpk.deinit();
-                std.debug.assert(mpk.pack.sta == 0);
-            }
-
             fn try_socket_open(cap: *@This()) !ManagedUsbPack {
                 const req = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
                 const flags: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
@@ -756,6 +734,7 @@ const DeviceContext = struct {
                 const opt_buf = utils.anytype2Slice(&opt);
 
                 var list = std.ArrayList(u8).init(cap.stack_allocator);
+                defer list.deinit();
                 var writer = list.writer();
                 try writer.writeByte(flags);
                 _ = try writer.write(opt_buf);
@@ -812,6 +791,24 @@ const DeviceContext = struct {
                     }
                 }
                 std.debug.panic("failed to open socket, sta={d}", .{sta});
+            }
+
+            pub fn close_socket(cap: *@This()) !void {
+                const req = bt.socketRequestId(.close, @intCast(sel_slot), @intCast(sel_port));
+                const flags: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
+                const opt = bb.bb_sock_opt_t{ .tx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE, .rx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE };
+                const opt_buf = utils.anytype2Slice(&opt);
+
+                var list = std.ArrayList(u8).init(cap.stack_allocator);
+                var writer = list.writer();
+                try writer.writeByte(flags);
+                _ = try writer.write(opt_buf);
+                const payload = try list.toOwnedSlice();
+                defer cap.stack_allocator.free(payload);
+
+                var mpk = try cap.query_common_slice(req, payload);
+                defer mpk.deinit();
+                std.debug.assert(mpk.pack.sta == 0);
             }
         };
 

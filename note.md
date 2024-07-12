@@ -13,3 +13,5 @@ typedef enum {
     sock_wait_usb_close,
 } SOCK_STATUS;
 ```
+
+See `05aa009b106f9c6a463c870e74570c0c483f0762`

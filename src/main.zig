@@ -974,13 +974,9 @@ fn refreshDevList(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator,
                 if (device) |val| {
                     var l_desc: usb.libusb_device_descriptor = undefined;
                     ret = usb.libusb_get_device_descriptor(val, &l_desc);
-                    if (ret != 0) {
-                        continue;
-                    }
+                    if (ret != 0) continue;
                     if (l_desc.idVendor == ARTO_RTOS_VID and l_desc.idProduct == ARTO_RTOS_PID) {
-                        const dd = DeviceDesc.fromDevice(val) catch {
-                            continue;
-                        };
+                        const dd = DeviceDesc.fromDevice(val) catch continue;
                         filtered.append(dd) catch @panic("OOM");
                     }
                 }
@@ -1140,16 +1136,12 @@ pub fn getEndpoints(alloc: std.mem.Allocator, device: *usb.libusb_device, ldesc:
     for (0..n_config) |i| {
         var config_: ?*usb.libusb_config_descriptor = undefined;
         ret = usb.libusb_get_config_descriptor(device, @intCast(i), &config_);
-        if (ret != 0) {
-            continue;
-        }
+        if (ret != 0) continue;
         if (config_) |config| {
             const ifaces = config.interface[0..@intCast(config.bNumInterfaces)];
             for (ifaces) |iface_alt| {
                 const iface_alts = iface_alt.altsetting[0..@intCast(iface_alt.num_altsetting)];
-                if (iface_alts.len == 0) {
-                    continue;
-                }
+                if (iface_alts.len == 0) continue;
 
                 // I don't really care alternate setting. Take the first one
                 const iface = iface_alts[0];

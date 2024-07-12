@@ -679,6 +679,7 @@ const DeviceContext = struct {
                 pack.len = @intCast(payload.len);
                 const data = try pack.marshal(cap.stack_allocator);
                 defer cap.stack_allocator.free(data);
+                std.debug.print("data {s}\n", .{std.fmt.fmtSliceHexLower(data)});
                 try cap.self.transmit(data);
 
                 return try cap.self.receive();
@@ -725,20 +726,22 @@ const DeviceContext = struct {
             }
 
             const sel_slot = bb.BB_SLOT_AP;
-            const sel_port = 2;
+            const sel_port = 3;
 
             fn try_socket_open(cap: *@This()) !ManagedUsbPack {
                 const req = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
                 const flags: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
-                const opt = bb.bb_sock_opt_t{ .tx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE, .rx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE };
+                const opt = bb.bb_sock_opt_t{ .tx_buf_size = bb.BB_CONFIG_MAC_TX_BUF_SIZE, .rx_buf_size = bb.BB_CONFIG_MAC_RX_BUF_SIZE };
 
                 var list = std.ArrayList(u8).init(cap.stack_allocator);
                 defer list.deinit();
                 var writer = list.writer();
                 try writer.writeByte(flags);
+                _ = try writer.write(&[_]u8{ 0, 0, 0 });
                 _ = try writer.write(utils.anytype2Slice(&opt));
                 const payload = try list.toOwnedSlice();
                 defer cap.stack_allocator.free(payload);
+                std.debug.print("payload {s}\n", .{std.fmt.fmtSliceHexLower(payload)});
 
                 const mpk = try cap.query_common_slice(req, payload);
                 return mpk;

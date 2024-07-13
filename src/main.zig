@@ -31,6 +31,7 @@ const transferStatusFromInt = helper.transferStatusFromInt;
 const dynStringDescriptorOr = helper.dynStringDescriptorOr;
 const printStrDesc = helper.printStrDesc;
 const usbSpeedToString = helper.usbSpeedToString;
+const libusb_error_2_set = helper.libusb_error_2_set;
 
 const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
@@ -41,20 +42,14 @@ const DEFAULT_THREAD_STACK_SIZE = 16 * 1024 * 1024;
 const MAX_SERIAL_SIZE = 32;
 const REFRESH_CONTAINER_DEFAULT_CAP = 4;
 
-const TransmitError = error{
-    Overflow,
-    Busy,
-};
-
-const ObserverError = error{
-    Existed,
-    NotFound,
-};
-
 /// A naive implementation of the observer pattern for `UsbPack`
 ///
 /// See also `UsbPack`
 const PackObserverList = struct {
+    pub const ObserverError = error{
+        Existed,
+        NotFound,
+    };
     pub const OnDataFnPtr = *const fn (*PackObserverList, *const UsbPack, *Observer) void;
     pub const PredicateFnPtr = *const fn (*const UsbPack, ?*anyopaque) bool;
     pub const NullableDtorPtr = ?*const fn (*anyopaque) void;
@@ -221,25 +216,6 @@ const PackObserverList = struct {
         self.list.deinit();
     }
 };
-
-pub fn libusb_error_2_set(err: c_int) LibUsbError {
-    return switch (err) {
-        usb.LIBUSB_ERROR_IO => LibUsbError.IO,
-        usb.LIBUSB_ERROR_INVALID_PARAM => LibUsbError.InvalidParam,
-        usb.LIBUSB_ERROR_ACCESS => LibUsbError.Access,
-        usb.LIBUSB_ERROR_NO_DEVICE => LibUsbError.NoDevice,
-        usb.LIBUSB_ERROR_NOT_FOUND => LibUsbError.NotFound,
-        usb.LIBUSB_ERROR_BUSY => LibUsbError.Busy,
-        usb.LIBUSB_ERROR_TIMEOUT => LibUsbError.Timeout,
-        usb.LIBUSB_ERROR_OVERFLOW => LibUsbError.Overflow,
-        usb.LIBUSB_ERROR_PIPE => LibUsbError.Pipe,
-        usb.LIBUSB_ERROR_INTERRUPTED => LibUsbError.Interrupted,
-        usb.LIBUSB_ERROR_NO_MEM => LibUsbError.NoMem,
-        usb.LIBUSB_ERROR_NOT_SUPPORTED => LibUsbError.NotSupported,
-        usb.LIBUSB_ERROR_OTHER => LibUsbError.Other,
-        else => std.debug.panic("unknown libusb error code: {}", .{err}),
-    };
-}
 
 /// DeviceDesc is a intermediate struct for device information.
 /// Note that it's different from `libusb_device_descriptor`
@@ -593,6 +569,11 @@ const DeviceContext = struct {
         );
         transfer.setCallback(cb, TransferCallback.dtorPtrTypeErased());
     }
+
+    pub const TransmitError = error{
+        Overflow,
+        Busy,
+    };
 
     /// transmit the data to tx endpoint
     ///
@@ -1086,9 +1067,9 @@ const ActionCallback = struct {
     const ERROR_ALREADY_OPENED_SOCKET = 257;
     // -259 is a generic error code, I have no idea what's the exact meaning
     const ERROR_UNKNOWN = -259;
+    const OpenRequestId = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
 
     fn try_socket_open(cap: *@This()) !void {
-        const req = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
         const flag: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
         // see `session_socket.c:232`
         // TODO: create a wrapper struct
@@ -1097,14 +1078,13 @@ const ActionCallback = struct {
             0x00, 0x08, 0x00, 0x00, // 2048 in `bb.bb_sock_opt_t.tx_buf_size`
             0x00, 0x0c, 0x00, 0x00, // 3072 in `bb.bb_sock_opt_t.rx_buf_size`
         };
-        try cap.query_common_slice(req, buf);
+        try cap.query_common_slice(OpenRequestId, buf);
     }
 
     pub fn open_socket_send(cap: *@This()) !void {
         try cap.try_socket_open();
         var subject = cap.self.rxObservable();
-        const req = comptime bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
-        const predicate = Self.make_reqid_predicate(req);
+        const predicate = Self.make_reqid_predicate(OpenRequestId);
         subject.subscribe(
             &predicate,
             &Self.open_socket_on_data,

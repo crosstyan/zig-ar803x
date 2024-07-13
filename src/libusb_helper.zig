@@ -248,3 +248,22 @@ pub fn printStrDesc(hdl: *usb.libusb_device_handle, desc: *const usb.libusb_devi
         .string("product", product)
         .string("serial", serial).log();
 }
+
+pub fn libusb_error_2_set(err: c_int) LibUsbError {
+    return switch (err) {
+        usb.LIBUSB_ERROR_IO => LibUsbError.IO,
+        usb.LIBUSB_ERROR_INVALID_PARAM => LibUsbError.InvalidParam,
+        usb.LIBUSB_ERROR_ACCESS => LibUsbError.Access,
+        usb.LIBUSB_ERROR_NO_DEVICE => LibUsbError.NoDevice,
+        usb.LIBUSB_ERROR_NOT_FOUND => LibUsbError.NotFound,
+        usb.LIBUSB_ERROR_BUSY => LibUsbError.Busy,
+        usb.LIBUSB_ERROR_TIMEOUT => LibUsbError.Timeout,
+        usb.LIBUSB_ERROR_OVERFLOW => LibUsbError.Overflow,
+        usb.LIBUSB_ERROR_PIPE => LibUsbError.Pipe,
+        usb.LIBUSB_ERROR_INTERRUPTED => LibUsbError.Interrupted,
+        usb.LIBUSB_ERROR_NO_MEM => LibUsbError.NoMem,
+        usb.LIBUSB_ERROR_NOT_SUPPORTED => LibUsbError.NotSupported,
+        usb.LIBUSB_ERROR_OTHER => LibUsbError.Other,
+        else => std.debug.panic("unknown libusb error code: {}", .{err}),
+    };
+}

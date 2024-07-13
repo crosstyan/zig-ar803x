@@ -1,5 +1,7 @@
 # Note
 
+random interesting stuff
+
 ```c
 typedef enum {
     sock_not_init = 0,

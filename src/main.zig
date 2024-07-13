@@ -779,7 +779,7 @@ const DeviceContext = struct {
         }
     }
 
-    pub fn observable(self: *@This()) *PackObserverList {
+    pub fn rxSubject(self: *@This()) *PackObserverList {
         return &self.arto.obs_queue;
     }
 
@@ -793,20 +793,24 @@ const DeviceContext = struct {
         }
     }
 
-    /// doing status query before start forward loop,
-    /// and it still NEEDS event loop running. Please call it in a separate thread.
+    /// it still NEEDS event loop running. Please call it in a separate thread.
     fn loopPrepare(self: *@This()) void {
         const local_t = struct {
             arena: std.heap.ArenaAllocator,
             /// reference ownership
             self: *DeviceContext,
 
+            const Observer = PackObserverList.Observer;
             const Capture = @This();
 
+            pub inline fn as(ud: ?*anyopaque) *Capture {
+                return @alignCast(@ptrCast(ud.?));
+            }
+
             pub fn init(alloc: std.mem.Allocator, ctx: *DeviceContext) !*Capture {
-                var _arena = std.heap.ArenaAllocator.init(alloc);
-                var ret = try _arena.allocator().create(@This());
-                ret.arena = _arena;
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                var ret = try arena.allocator().create(@This());
+                ret.arena = arena;
                 ret.self = ctx;
                 return ret;
             }
@@ -842,6 +846,7 @@ const DeviceContext = struct {
 
             // like `query_common`, but with a slice payload
             pub fn query_common_slice(cap: *@This(), reqid: u32, payload: []const u8) !void {
+                var alloc = cap.arena.allocator();
                 var pack = UsbPack{
                     .reqid = reqid,
                     .msgid = 0,
@@ -849,24 +854,41 @@ const DeviceContext = struct {
                 };
                 pack.ptr = payload.ptr;
                 pack.len = @intCast(payload.len);
-                const data = try pack.marshal(cap.stack_allocator);
-                defer cap.stack_allocator.free(data);
+                const data = try pack.marshal(alloc);
+                defer alloc.free(data);
                 std.debug.print("data {s}\n", .{std.fmt.fmtSliceHexLower(data)});
                 try cap.self.transmit(data);
             }
 
-            pub fn query_status_execute(cap: *@This()) !void {
+            // an action being two part (functions)
+            // first `*_send` should be call to push
+            // the request to the device
+            // then the subject will call `*_on_data` when
+            // when the message is received
+            //
+            // other action could be executed in `*_on_data`,
+            // like start a new subscription, etc.
+            //
+            // although it might confuse the reader,
+            // as we don't have proper async/await support
+
+            /// create a predicate that matches the request id
+            pub fn make_reqid_predicate(comptime reqid: u32) fn (*const UsbPack, ?*anyopaque) bool {
+                return (struct {
+                    pub fn call(pack: *const UsbPack, _: ?*anyopaque) bool {
+                        return pack.reqid == reqid;
+                    }
+                }).call;
+            }
+
+            pub fn query_status_send(cap: *@This()) !void {
                 var in = bb.bb_get_status_in_t{
                     .user_bmp = SLOT_BIT_MAP_MAX,
                 };
                 try cap.query_common(bb.BB_GET_STATUS, &in);
-                const predicate = (struct {
-                    pub fn call(pack: *const UsbPack, _: ?*anyopaque) bool {
-                        return pack.reqid == bb.BB_GET_STATUS;
-                    }
-                }).call;
-                var obs_list = cap.self.observable();
-                obs_list.subscribe(
+                const predicate = Capture.make_reqid_predicate(bb.BB_GET_STATUS);
+                var subject = cap.self.rxSubject();
+                subject.subscribe(
                     &predicate,
                     &Capture.query_status_on_data,
                     cap,
@@ -874,13 +896,13 @@ const DeviceContext = struct {
                 ) catch @panic("OOM");
             }
 
-            pub fn query_status_on_data(obs_list: *PackObserverList, pack: *const UsbPack, obs: *PackObserverList.Observer) void {
+            pub fn query_status_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
                 const ud = obs.userdata;
-                var cap: *Capture = @alignCast(@ptrCast(ud.?));
-                const status_ = pack.dataAs(bb.bb_get_status_out_t);
-                if (status_) |status| {
+                var cap = Capture.as(ud);
+                if (pack.dataAs(bb.bb_get_status_out_t)) |status| {
                     bt.logWithStatus(cap.self.withSrcLogger(logz.info(), @src()), &status).log();
-                    // continue chaining
+                    // ***** and_then *****
+                    cap.query_info_send() catch @panic("OOM");
                 } else |e| {
                     cap.self.withSrcLogger(logz.err(), @src())
                         .err(e)
@@ -888,41 +910,69 @@ const DeviceContext = struct {
                         .log();
                     cap.deinit();
                 }
-                obs_list.unsubscribe(obs.xxhash()) catch unreachable;
+                sbj.unsubscribe(obs.xxhash()) catch unreachable;
             }
 
-            // query system info (build time, version, etc.)
-            pub fn query_info(cap: *@This()) !void {
-                var mpk = try cap.query_common(bb.BB_GET_SYS_INFO, null);
-                defer mpk.deinit();
-                std.debug.assert(mpk.pack.sta == 0);
-                const info = try mpk.dataAs(bb.bb_get_sys_info_out_t);
-                const compile_time: [*:0]const u8 = @ptrCast(&info.compile_time);
-                const soft_ver: [*:0]const u8 = @ptrCast(&info.soft_ver);
-                const hard_ver: [*:0]const u8 = @ptrCast(&info.hardware_ver);
-                const firmware_ver: [*:0]const u8 = @ptrCast(&info.firmware_ver);
-                cap.self.withSrcLogger(logz.info(), @src())
-                    .int("uptime", info.uptime)
-                    .stringSafeZ("compile_time", compile_time)
-                    .stringSafeZ("soft_ver", soft_ver)
-                    .stringSafeZ("hard_ver", hard_ver)
-                    .stringSafeZ("firmware_ver", firmware_ver).log();
+            pub fn query_info_send(cap: *@This()) !void {
+                try cap.query_common(bb.BB_GET_SYS_INFO, null);
+                const predicate = Capture.make_reqid_predicate(bb.BB_GET_SYS_INFO);
+                var subject = cap.self.rxSubject();
+                subject.subscribe(
+                    &predicate,
+                    &Capture.query_info_on_data,
+                    cap,
+                    null,
+                ) catch @panic("OOM");
             }
 
-            pub fn subscribe_event(cap: *@This(), event: bt.Event) !void {
+            pub fn query_info_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
+                std.debug.assert(pack.sta == 0);
+                const ud = obs.userdata;
+                var cap = Capture.as(ud);
+                if (pack.dataAs(bb.bb_get_sys_info_out_t)) |info| {
+                    const compile_time: [*:0]const u8 = @ptrCast(&info.compile_time);
+                    const soft_ver: [*:0]const u8 = @ptrCast(&info.soft_ver);
+                    const hard_ver: [*:0]const u8 = @ptrCast(&info.hardware_ver);
+                    const firmware_ver: [*:0]const u8 = @ptrCast(&info.firmware_ver);
+                    cap.self.withSrcLogger(logz.info(), @src())
+                        .int("uptime", info.uptime)
+                        .stringSafeZ("compile_time", compile_time)
+                        .stringSafeZ("soft_ver", soft_ver)
+                        .stringSafeZ("hard_ver", hard_ver)
+                        .stringSafeZ("firmware_ver", firmware_ver)
+                        .log();
+                    // ***** and_then *****
+                    cap.subscribe_event_no_response(.link_state) catch unreachable;
+                    cap.subscribe_event_no_response(.mcs_change) catch unreachable;
+                    cap.subscribe_event_no_response(.chan_change) catch unreachable;
+
+                    cap.open_socket_send() catch unreachable;
+                } else |e| {
+                    cap.self.withSrcLogger(logz.err(), @src())
+                        .err(e)
+                        .string("what", "failed to parse system info")
+                        .log();
+                    cap.deinit();
+                }
+                sbj.unsubscribe(obs.xxhash()) catch unreachable;
+            }
+
+            /// subscribe an event, don't care if it's successful or not.
+            /// I don't care the response.
+            /// without closure it's become tedious.
+            pub fn subscribe_event_no_response(cap: *@This(), event: bt.Event) !void {
                 const req = bt.subscribeRequestId(event);
-                var mpk = try cap.query_common(req, null);
-                defer mpk.deinit();
-                std.debug.assert(mpk.pack.sta == 0);
-                cap.self.withSrcLogger(logz.info(), @src())
-                    .string("what", "subscribed event")
-                    .string("event", @tagName(event)).log();
+                try cap.query_common(req, null);
             }
 
             const sel_slot = bb.BB_SLOT_AP;
             const sel_port = 3;
+            // note that sta == 0x0101 (i.e. 257) means already opened socket
+            const ERROR_ALREADY_OPENED_SOCKET = 257;
+            // -259 is a generic error code, I have no idea what's the exact meaning
+            const ERROR_UNKNOWN = -259;
 
-            fn try_socket_open(cap: *@This()) !ManagedUsbPack {
+            fn try_socket_open(cap: *@This()) !void {
                 const req = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
                 const flag: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
                 // see `session_socket.c:232`
@@ -932,85 +982,61 @@ const DeviceContext = struct {
                     0x00, 0x08, 0x00, 0x00, // 2048 in `bb.bb_sock_opt_t.tx_buf_size`
                     0x00, 0x0c, 0x00, 0x00, // 3072 in `bb.bb_sock_opt_t.rx_buf_size`
                 };
-                const mpk = try cap.query_common_slice(req, buf);
-                return mpk;
+                try cap.query_common_slice(req, buf);
             }
 
-            pub fn open_socket(cap: *@This()) !void {
-                // note that sta == 0x0101 (i.e. 257) means already opened socket
-                const ERROR_ALREADY_OPENED_SOCKET = 257;
-                // -259 is a generic error code, I have no idea what's the exact meaning
-                const ERROR_UNKNOWN = -259;
-                _ = ERROR_UNKNOWN;
-
-                var mpk = try cap.try_socket_open();
-                defer mpk.deinit();
-                const sta = mpk.pack.sta;
-                if (sta == 0) {
+            pub fn open_socket_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
+                // if we must handle these shit
+                // we'd better make a state machine
+                const ud = obs.userdata;
+                var cap = Capture.as(ud);
+                if (pack.sta == 0) {
                     cap.self.withSrcLogger(logz.info(), @src())
                         .int("slot", sel_slot)
                         .int("port", sel_port)
                         .string("what", "socket opened")
                         .log();
-                    return;
-                }
-                if (sta == ERROR_ALREADY_OPENED_SOCKET) {
+                } else if (pack.sta == ERROR_ALREADY_OPENED_SOCKET) {
+                    // leave it be
                     cap.self.withSrcLogger(logz.warn(), @src())
                         .int("slot", sel_slot)
                         .int("port", sel_port)
                         .string("what", "socket already opened")
                         .log();
-                    try cap.close_socket();
-                    cap.self.withSrcLogger(logz.warn(), @src())
+                } else {
+                    cap.self.withSrcLogger(logz.err(), @src())
                         .int("slot", sel_slot)
                         .int("port", sel_port)
-                        .string("what", "close opened socket")
+                        .int("sta", pack.sta)
+                        .string("what", "failed to open socket")
                         .log();
-
-                    var i_mpk = try cap.try_socket_open();
-                    defer i_mpk.deinit();
-                    const i_sta = i_mpk.pack.sta;
-                    if (i_sta == 0) {
-                        cap.self.withSrcLogger(logz.warn(), @src())
-                            .int("slot", sel_slot)
-                            .int("port", sel_port)
-                            .string("what", "reopen socket")
-                            .log();
-                        return;
-                    } else {
-                        std.debug.panic("failed to reopen socket, sta={d}", .{i_sta});
-                    }
+                    std.debug.panic("failed to open socket, sta={d}", .{pack.sta});
                 }
-                std.debug.panic("failed to open socket, sta={d}", .{sta});
+                obs.dtor = @ptrCast(&Capture.deinit);
+                sbj.unsubscribe(obs.xxhash()) catch unreachable;
             }
 
-            pub fn close_socket(cap: *@This()) !void {
-                const req = bt.socketRequestId(.close, @intCast(sel_slot), @intCast(sel_port));
-                const flag: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
-                const buf = &[_]u8{
-                    flag, 0x00, 0x00, 0x00, // flags, with alignment
-                    0x00, 0x08, 0x00, 0x00, // 2048 in `bb.bb_sock_opt_t.tx_buf_size`
-                    0x00, 0x0c, 0x00, 0x00, // 3072 in `bb.bb_sock_opt_t.rx_buf_size`
-                };
-                var mpk = try cap.query_common_slice(req, buf);
-                defer mpk.deinit();
-                std.debug.assert(mpk.pack.sta == 0);
+            pub fn open_socket_send(cap: *@This()) !void {
+                try cap.try_socket_open();
+                var subject = cap.self.rxSubject();
+                const req = comptime bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
+                const predicate = Capture.make_reqid_predicate(req);
+                subject.subscribe(
+                    &predicate,
+                    &Capture.open_socket_on_data,
+                    cap,
+                    null,
+                ) catch @panic("OOM");
             }
         };
 
-        // finally, we start the loop thread, after querying status
-        // and set callback etc.
+        // first, we start the loop thread, for the subject
         self.initThreads();
-
         var local = local_t.init(self.allocator(), self) catch unreachable;
-        local.query_status_execute() catch unreachable;
-        // local.query_status() catch unreachable;
-        // local.query_info() catch unreachable;
-        // local.subscribe_event(.link_state) catch unreachable;
-        // local.subscribe_event(.mcs_change) catch unreachable;
-        // local.subscribe_event(.chan_change) catch unreachable;
-        // local.open_socket() catch unreachable;
 
+        // we only needs a little push to the chain
+        // query_status.than(query_info).than(open_socket)
+        local.query_status_send() catch unreachable;
         utils.logWithSrc(self.withLogger(logz.info()), @src())
             .string("what", "preparing finished").log();
     }

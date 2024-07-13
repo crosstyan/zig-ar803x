@@ -71,7 +71,7 @@ const PackObserverList = struct {
     // reference counting in dtor
     const Observer = struct {
         predicate: PredicateFnPtr,
-        /// the callback function SHOULD NOT block, and SHOULD NOT deinit the pack
+        /// the callback function SHOULD NOT block
         on_data: OnDataFnPtr,
         userdata: ?*anyopaque,
         dtor: NullableDtorPtr,
@@ -132,7 +132,7 @@ const PackObserverList = struct {
         on_data: OnDataFnPtr,
         userdata: ?*anyopaque,
         dtor: NullableDtorPtr,
-    ) ObserverError!void {
+    ) !void {
         const obs = Observer{
             .predicate = predicate,
             .on_data = on_data,
@@ -153,7 +153,7 @@ const PackObserverList = struct {
 
         self.lock.lockShared();
         defer self.lock.unlockShared();
-        self.list.append(obs) catch @panic("OOM");
+        try self.list.append(obs);
     }
 
     pub fn notifyObservers(self: *@This(), managed_pack: *const ManagedUsbPack) void {
@@ -518,15 +518,17 @@ const DeviceContext = struct {
         tx_thread: std.Thread,
         /// initialized in `initThreads`
         rx_thread: std.Thread,
-        /// obs_queue will dispatch the packet to the observers,
+        /// initialized in `initThreads`
+        ///
+        /// `rx_observable` will dispatch the packet to the observers,
         /// in rx thread
-        obs_queue: PackObserverList,
+        rx_observable: PackObserverList,
 
         pub fn deinit(self: *@This()) void {
             self.tx_transfer.deinit();
             self.rx_transfer.deinit();
             self.rx_queue.deinit();
-            self.obs_queue.deinit();
+            self.rx_observable.deinit();
             self.tx_thread.join();
             self.rx_thread.join();
         }
@@ -798,8 +800,8 @@ const DeviceContext = struct {
         }
     }
 
-    pub fn rxSubject(self: *@This()) *PackObserverList {
-        return &self.arto.obs_queue;
+    pub fn rxObservable(self: *@This()) *PackObserverList {
+        return &self.arto.rx_observable;
     }
 
     fn initEndpoints(self: *@This()) void {
@@ -906,13 +908,13 @@ const DeviceContext = struct {
                 };
                 try cap.query_common(bb.BB_GET_STATUS, &in);
                 const predicate = Capture.make_reqid_predicate(bb.BB_GET_STATUS);
-                var subject = cap.self.rxSubject();
+                var subject = cap.self.rxObservable();
                 subject.subscribe(
                     &predicate,
                     &Capture.query_status_on_data,
                     cap,
                     null,
-                ) catch @panic("OOM");
+                ) catch unreachable;
             }
 
             pub fn query_status_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
@@ -935,13 +937,13 @@ const DeviceContext = struct {
             pub fn query_info_send(cap: *@This()) !void {
                 try cap.query_common(bb.BB_GET_SYS_INFO, null);
                 const predicate = Capture.make_reqid_predicate(bb.BB_GET_SYS_INFO);
-                var subject = cap.self.rxSubject();
+                var subject = cap.self.rxObservable();
                 subject.subscribe(
                     &predicate,
                     &Capture.query_info_on_data,
                     cap,
                     null,
-                ) catch @panic("OOM");
+                ) catch unreachable;
             }
 
             pub fn query_info_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
@@ -1037,7 +1039,7 @@ const DeviceContext = struct {
 
             pub fn open_socket_send(cap: *@This()) !void {
                 try cap.try_socket_open();
-                var subject = cap.self.rxSubject();
+                var subject = cap.self.rxObservable();
                 const req = comptime bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
                 const predicate = Capture.make_reqid_predicate(req);
                 subject.subscribe(
@@ -1045,7 +1047,7 @@ const DeviceContext = struct {
                     &Capture.open_socket_on_data,
                     cap,
                     null,
-                ) catch @panic("OOM");
+                ) catch unreachable;
             }
         };
 
@@ -1081,7 +1083,7 @@ const DeviceContext = struct {
         const rx_thread = std.Thread.spawn(config, Self.recvLoop, .{self}) catch unreachable;
         self.arto.tx_thread = tx_thread;
         self.arto.rx_thread = rx_thread;
-        self.arto.obs_queue = PackObserverList.init(self.allocator());
+        self.arto.rx_observable = PackObserverList.init(self.allocator());
     }
 
     /// basically do nothing... for now
@@ -1106,7 +1108,7 @@ const DeviceContext = struct {
                 return;
             };
             defer mpk.deinit();
-            var queue = &self.arto.obs_queue;
+            var queue = &self.arto.rx_observable;
             queue.notifyObservers(&mpk);
         }
     }

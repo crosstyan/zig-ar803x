@@ -1,8 +1,12 @@
 const std = @import("std");
 const logz = @import("logz");
+const common = @import("app_common.zig");
+const Mutex = std.Thread.Mutex;
+const RwLock = std.Thread.RwLock;
 
-pub const BadEnum = error{BadEnum};
-pub const LengthNotEqual = error{LengthNotEqual};
+pub const BadEnum = common.BadEnum;
+pub const LengthNotEqual = common.LengthNotEqual;
+pub const ClosedError = common.ClosedError;
 
 /// generate a unique number for a type `T`
 ///
@@ -125,6 +129,135 @@ pub fn fillBytesWith(dst: []u8, src: anytype) LengthNotEqual!void {
 pub inline fn logWithSrc(logger: logz.Logger, src: std.builtin.SourceLocation) logz.Logger {
     return logger
         .fmt("src", "{s}:{d} @{s}", .{ src.file, src.line, src.fn_name });
+}
+
+pub fn LockedQueue(comptime T: type, comptime max_size: usize) type {
+    // TODO: https://zig.news/kprotty/simple-scalable-unbounded-queue-34c2
+    // https://www.reddit.com/r/Zig/comments/oekuxh/question_does_zig_has_workstealingsharing
+    // https://github.com/ziglang/zig/issues/8224
+    // https://github.com/magurotuna/zig-deque
+    // I don't feel like going down the rabbit hole of data structures
+    const LockedQueueImpl = struct {
+        const MAX_SIZE = max_size;
+        const Self = @This();
+
+        /// should be false until `deinit` is called
+        _has_deinit: std.atomic.Value(bool),
+        /// WARNING: don't use it directly
+        _list: std.ArrayList(T),
+        /// used when modifying the `_list`
+        lock: RwLock = RwLock{},
+
+        /// used with `cv` to signal the `dequeue`, different from `lock`
+        mutex: Mutex = Mutex{},
+        cv: std.Thread.Condition = std.Thread.Condition{},
+        /// function to call when removing an element.
+        /// Only useful when the queue is full, and needs to discard old
+        /// elements.
+        elem_dtor: ?*const fn (*T) void = null,
+
+        pub fn init(alloc: std.mem.Allocator) Self {
+            var l = std.ArrayList(T).init(alloc);
+            l.ensureTotalCapacity(max_size) catch @panic("OOM");
+            return Self{
+                ._list = l,
+                ._has_deinit = std.atomic.Value(bool).init(false),
+            };
+        }
+
+        pub fn hasDeinit(self: *const @This()) bool {
+            return self._has_deinit.load(std.builtin.AtomicOrder.unordered);
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self._has_deinit.store(true, std.builtin.AtomicOrder.unordered);
+            self.cv.broadcast();
+            self._list.deinit();
+        }
+
+        pub fn enqueue(self: *@This(), pkt: T) ClosedError!void {
+            if (self.hasDeinit()) {
+                return ClosedError.Closed;
+            }
+            {
+                self.lock.lockShared();
+                defer self.lock.unlockShared();
+                while (self.lenNoCheck() >= MAX_SIZE) {
+                    logWithSrc(logz.warn(), @src())
+                        .string("what", "full queue, discarding old element").log();
+                    var elem = self._list.orderedRemove(0);
+                    if (self.elem_dtor) |dtor| {
+                        dtor(&elem);
+                    }
+                }
+                self._list.append(pkt) catch @panic("OOM");
+            }
+            self.cv.signal();
+        }
+
+        inline fn lenNoCheck(self: *const @This()) usize {
+            return self._list.items.len;
+        }
+
+        inline fn isEmptyNoCheck(self: *const @This()) bool {
+            return self.lenNoCheck() == 0;
+        }
+
+        /// return the length of the queue
+        pub inline fn len(self: *@This()) ClosedError!usize {
+            if (self.hasDeinit()) {
+                return ClosedError.Closed;
+            }
+            self.lock.lock();
+            defer self.lock.unlock();
+            return self.lenNoCheck();
+        }
+
+        /// return whether the queue is empty
+        pub inline fn isEmpty(self: *@This()) ClosedError!bool {
+            return try self.len() == 0;
+        }
+
+        pub fn peek(self: *@This()) ClosedError!?T {
+            if (self.hasDeinit()) {
+                return ClosedError.Closed;
+            }
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self._list.len == 0) {
+                return null;
+            } else {
+                const ret = self._list.items[0];
+                return ret;
+            }
+        }
+
+        /// note that this function will block indefinitely
+        /// until the queue is not empty
+        pub fn dequeue(self: *@This()) ClosedError!T {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (self.hasDeinit()) {
+                return ClosedError.Closed;
+            }
+            while (self.isEmptyNoCheck()) {
+                if (self.hasDeinit()) {
+                    return ClosedError.Closed;
+                }
+                self.cv.wait(&self.mutex);
+            }
+            if (self.hasDeinit()) {
+                return ClosedError.Closed;
+            }
+            self.lock.lockShared();
+            defer self.lock.unlockShared();
+            const ret = self._list.items[0];
+            _ = self._list.orderedRemove(0);
+            return ret;
+        }
+    };
+    return LockedQueueImpl;
 }
 
 const expect = std.testing.expect;

@@ -6,14 +6,31 @@ const bt = @import("bb/t.zig");
 const UsbPack = @import("bb/usbpack.zig").UsbPack;
 const ManagedUsbPack = @import("bb/usbpack.zig").ManagedUsbPack;
 const utils = @import("utils.zig");
+const common = @import("app_common.zig");
 const usb = @cImport({
     @cInclude("libusb.h");
 });
 const network = @import("network");
-
-const BadEnum = utils.BadEnum;
+const helper = @import("libusb_helper.zig");
 const Mutex = std.Thread.Mutex;
 const RwLock = std.Thread.RwLock;
+
+const AppError = common.AppError;
+const BadEnum = common.BadEnum;
+const ClosedError = common.ClosedError;
+
+const LockedQueue = utils.LockedQueue;
+
+const LibUsbError = helper.LibUsbError;
+const Endpoint = helper.Endpoint;
+const Direction = helper.Direction;
+const TransferType = helper.TransferType;
+const getEndpoints = helper.getEndpoints;
+const printEndpoints = helper.printEndpoints;
+const transferStatusFromInt = helper.transferStatusFromInt;
+const dynStringDescriptorOr = helper.dynStringDescriptorOr;
+const printStrDesc = helper.printStrDesc;
+const usbSpeedToString = helper.usbSpeedToString;
 
 const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
@@ -24,37 +41,9 @@ const DEFAULT_THREAD_STACK_SIZE = 16 * 1024 * 1024;
 const MAX_SERIAL_SIZE = 32;
 const REFRESH_CONTAINER_DEFAULT_CAP = 4;
 
-const AppError = error{
-    BadDescriptor,
-    BadPortNumbers,
-    BadEnum,
-    Unknown,
-};
-
-const LibUsbError = error{
-    IO,
-    InvalidParam,
-    Access,
-    NoDevice,
-    NotFound,
-    Busy,
-    Timeout,
-    Overflow,
-    Pipe,
-    Interrupted,
-    NoMem,
-    NotSupported,
-    Other,
-    Unknown,
-};
-
 const TransmitError = error{
     Overflow,
     Busy,
-};
-
-const ClosedError = error{
-    Closed,
 };
 
 const ObserverError = error{
@@ -250,135 +239,6 @@ pub fn libusb_error_2_set(err: c_int) LibUsbError {
         usb.LIBUSB_ERROR_OTHER => LibUsbError.Other,
         else => std.debug.panic("unknown libusb error code: {}", .{err}),
     };
-}
-
-fn LockedQueue(comptime T: type, comptime max_size: usize) type {
-    // TODO: https://zig.news/kprotty/simple-scalable-unbounded-queue-34c2
-    // https://www.reddit.com/r/Zig/comments/oekuxh/question_does_zig_has_workstealingsharing
-    // https://github.com/ziglang/zig/issues/8224
-    // https://github.com/magurotuna/zig-deque
-    // I don't feel like going down the rabbit hole of data structures
-    const LockedQueueImpl = struct {
-        const MAX_SIZE = max_size;
-        const Self = @This();
-
-        /// should be false until `deinit` is called
-        _has_deinit: std.atomic.Value(bool),
-        /// WARNING: don't use it directly
-        _list: std.ArrayList(T),
-        /// used when modifying the `_list`
-        lock: RwLock = RwLock{},
-
-        /// used with `cv` to signal the `dequeue`, different from `lock`
-        mutex: Mutex = Mutex{},
-        cv: std.Thread.Condition = std.Thread.Condition{},
-        /// function to call when removing an element.
-        /// Only useful when the queue is full, and needs to discard old
-        /// elements.
-        elem_dtor: ?*const fn (*T) void = null,
-
-        pub fn init(alloc: std.mem.Allocator) Self {
-            var l = std.ArrayList(T).init(alloc);
-            l.ensureTotalCapacity(max_size) catch @panic("OOM");
-            return Self{
-                ._list = l,
-                ._has_deinit = std.atomic.Value(bool).init(false),
-            };
-        }
-
-        pub fn hasDeinit(self: *const @This()) bool {
-            return self._has_deinit.load(std.builtin.AtomicOrder.unordered);
-        }
-
-        pub fn deinit(self: *@This()) void {
-            self._has_deinit.store(true, std.builtin.AtomicOrder.unordered);
-            self.cv.broadcast();
-            self._list.deinit();
-        }
-
-        pub fn enqueue(self: *@This(), pkt: T) ClosedError!void {
-            if (self.hasDeinit()) {
-                return ClosedError.Closed;
-            }
-            {
-                self.lock.lockShared();
-                defer self.lock.unlockShared();
-                while (self.lenNoCheck() >= MAX_SIZE) {
-                    utils.logWithSrc(logz.warn(), @src())
-                        .string("what", "full queue, discarding old element").log();
-                    var elem = self._list.orderedRemove(0);
-                    if (self.elem_dtor) |dtor| {
-                        dtor(&elem);
-                    }
-                }
-                self._list.append(pkt) catch @panic("OOM");
-            }
-            self.cv.signal();
-        }
-
-        inline fn lenNoCheck(self: *const @This()) usize {
-            return self._list.items.len;
-        }
-
-        inline fn isEmptyNoCheck(self: *const @This()) bool {
-            return self.lenNoCheck() == 0;
-        }
-
-        /// return the length of the queue
-        pub inline fn len(self: *@This()) ClosedError!usize {
-            if (self.hasDeinit()) {
-                return ClosedError.Closed;
-            }
-            self.lock.lock();
-            defer self.lock.unlock();
-            return self.lenNoCheck();
-        }
-
-        /// return whether the queue is empty
-        pub inline fn isEmpty(self: *@This()) ClosedError!bool {
-            return try self.len() == 0;
-        }
-
-        pub fn peek(self: *@This()) ClosedError!?T {
-            if (self.hasDeinit()) {
-                return ClosedError.Closed;
-            }
-            self.lock.lock();
-            defer self.lock.unlock();
-            if (self._list.len == 0) {
-                return null;
-            } else {
-                const ret = self._list.items[0];
-                return ret;
-            }
-        }
-
-        /// note that this function will block indefinitely
-        /// until the queue is not empty
-        pub fn dequeue(self: *@This()) ClosedError!T {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
-            if (self.hasDeinit()) {
-                return ClosedError.Closed;
-            }
-            while (self.isEmptyNoCheck()) {
-                if (self.hasDeinit()) {
-                    return ClosedError.Closed;
-                }
-                self.cv.wait(&self.mutex);
-            }
-            if (self.hasDeinit()) {
-                return ClosedError.Closed;
-            }
-            self.lock.lockShared();
-            defer self.lock.unlockShared();
-            const ret = self._list.items[0];
-            _ = self._list.orderedRemove(0);
-            return ret;
-        }
-    };
-    return LockedQueueImpl;
 }
 
 /// DeviceDesc is a intermediate struct for device information.
@@ -834,245 +694,10 @@ const DeviceContext = struct {
 
     /// it still NEEDS event loop running. Please call it in a separate thread.
     fn loopPrepare(self: *@This()) void {
-        const local_t = struct {
-            arena: std.heap.ArenaAllocator,
-            /// reference, not OWNING
-            self: *DeviceContext,
-
-            const Observer = PackObserverList.Observer;
-            const Capture = @This();
-
-            pub inline fn as(ud: ?*anyopaque) *Capture {
-                return @alignCast(@ptrCast(ud.?));
-            }
-
-            pub fn init(alloc: std.mem.Allocator, ctx: *DeviceContext) !*Capture {
-                var arena = std.heap.ArenaAllocator.init(alloc);
-                var ret = try arena.allocator().create(@This());
-                ret.arena = arena;
-                ret.self = ctx;
-                return ret;
-            }
-
-            pub fn deinit(cap: *@This()) void {
-                var stk_arena = cap.arena;
-                stk_arena.allocator().destroy(cap);
-                _ = stk_arena.reset(.free_all);
-                stk_arena.deinit();
-            }
-
-            // payload should be a pointer to struct, or null
-            pub fn query_common(cap: *@This(), reqid: u32, payload: anytype) !void {
-                var alloc = cap.arena.allocator();
-                const P = @TypeOf(payload);
-
-                var pack = UsbPack{
-                    .reqid = reqid,
-                    .msgid = 0,
-                    .sta = 0,
-                };
-                switch (@typeInfo(P)) {
-                    .Pointer => {
-                        try pack.fillWith(payload);
-                    },
-                    .Null => {}, // do nothing
-                    else => @compileError("`payload` must be a pointer type or null, found `" ++ @typeName(P) ++ "`"),
-                }
-                const data = try pack.marshal(alloc);
-                defer alloc.free(data);
-                try cap.self.transmit(data);
-            }
-
-            // like `query_common`, but with a slice payload
-            pub fn query_common_slice(cap: *@This(), reqid: u32, payload: []const u8) !void {
-                var alloc = cap.arena.allocator();
-                var pack = UsbPack{
-                    .reqid = reqid,
-                    .msgid = 0,
-                    .sta = 0,
-                };
-                pack.ptr = payload.ptr;
-                pack.len = @intCast(payload.len);
-                const data = try pack.marshal(alloc);
-                defer alloc.free(data);
-                std.debug.print("data {s}\n", .{std.fmt.fmtSliceHexLower(data)});
-                try cap.self.transmit(data);
-            }
-
-            // an action being two part (functions)
-            // first `*_send` should be call to push
-            // the request to the device
-            // then the observable will call `*_on_data` when
-            // when the message is received
-            //
-            // other action could be executed in `*_on_data`,
-            // like start a new subscription, etc.
-            //
-            // although it might confuse the reader,
-            // as we don't have proper async/await support
-
-            /// create a predicate that matches the request id
-            pub fn make_reqid_predicate(comptime reqid: u32) fn (*const UsbPack, ?*anyopaque) bool {
-                return (struct {
-                    pub fn call(pack: *const UsbPack, _: ?*anyopaque) bool {
-                        return pack.reqid == reqid;
-                    }
-                }).call;
-            }
-
-            pub fn query_status_send(cap: *@This()) !void {
-                var in = bb.bb_get_status_in_t{
-                    .user_bmp = SLOT_BIT_MAP_MAX,
-                };
-                try cap.query_common(bb.BB_GET_STATUS, &in);
-                const predicate = Capture.make_reqid_predicate(bb.BB_GET_STATUS);
-                var subject = cap.self.rxObservable();
-                subject.subscribe(
-                    &predicate,
-                    &Capture.query_status_on_data,
-                    cap,
-                    null,
-                ) catch unreachable;
-            }
-
-            pub fn query_status_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
-                const ud = obs.userdata;
-                var cap = Capture.as(ud);
-                if (pack.dataAs(bb.bb_get_status_out_t)) |status| {
-                    bt.logWithStatus(cap.self.withSrcLogger(logz.info(), @src()), &status).log();
-                    // ***** and_then *****
-                    cap.query_info_send() catch @panic("OOM");
-                } else |e| {
-                    cap.self.withSrcLogger(logz.err(), @src())
-                        .err(e)
-                        .string("what", "failed to parse status")
-                        .log();
-                    obs.dtor = @ptrCast(&Capture.deinit);
-                }
-                sbj.unsubscribe(obs) catch unreachable;
-            }
-
-            pub fn query_info_send(cap: *@This()) !void {
-                try cap.query_common(bb.BB_GET_SYS_INFO, null);
-                const predicate = Capture.make_reqid_predicate(bb.BB_GET_SYS_INFO);
-                var subject = cap.self.rxObservable();
-                subject.subscribe(
-                    &predicate,
-                    &Capture.query_info_on_data,
-                    cap,
-                    null,
-                ) catch unreachable;
-            }
-
-            pub fn query_info_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
-                std.debug.assert(pack.sta == 0);
-                const ud = obs.userdata;
-                var cap = Capture.as(ud);
-                if (pack.dataAs(bb.bb_get_sys_info_out_t)) |info| {
-                    const compile_time: [*:0]const u8 = @ptrCast(&info.compile_time);
-                    const soft_ver: [*:0]const u8 = @ptrCast(&info.soft_ver);
-                    const hard_ver: [*:0]const u8 = @ptrCast(&info.hardware_ver);
-                    const firmware_ver: [*:0]const u8 = @ptrCast(&info.firmware_ver);
-                    cap.self.withSrcLogger(logz.info(), @src())
-                        .int("uptime", info.uptime)
-                        .stringSafeZ("compile_time", compile_time)
-                        .stringSafeZ("soft_ver", soft_ver)
-                        .stringSafeZ("hard_ver", hard_ver)
-                        .stringSafeZ("firmware_ver", firmware_ver)
-                        .log();
-                    // ***** and_then *****
-                    cap.subscribe_event_no_response(.link_state) catch unreachable;
-                    cap.subscribe_event_no_response(.mcs_change) catch unreachable;
-                    cap.subscribe_event_no_response(.chan_change) catch unreachable;
-
-                    cap.open_socket_send() catch unreachable;
-                } else |e| {
-                    cap.self.withSrcLogger(logz.err(), @src())
-                        .err(e)
-                        .string("what", "failed to parse system info")
-                        .log();
-                    obs.dtor = @ptrCast(&Capture.deinit);
-                }
-                sbj.unsubscribe(obs) catch unreachable;
-            }
-
-            /// subscribe an event, don't care if it's successful or not.
-            /// I don't care the response.
-            /// without closure it's become tedious.
-            pub fn subscribe_event_no_response(cap: *@This(), event: bt.Event) !void {
-                const req = bt.subscribeRequestId(event);
-                try cap.query_common(req, null);
-            }
-
-            const sel_slot = bb.BB_SLOT_AP;
-            const sel_port = 3;
-            // note that sta == 0x0101 (i.e. 257) means already opened socket
-            const ERROR_ALREADY_OPENED_SOCKET = 257;
-            // -259 is a generic error code, I have no idea what's the exact meaning
-            const ERROR_UNKNOWN = -259;
-
-            fn try_socket_open(cap: *@This()) !void {
-                const req = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
-                const flag: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
-                // see `session_socket.c:232`
-                // TODO: create a wrapper struct
-                const buf = &[_]u8{
-                    flag, 0x00, 0x00, 0x00, // flags, with alignment
-                    0x00, 0x08, 0x00, 0x00, // 2048 in `bb.bb_sock_opt_t.tx_buf_size`
-                    0x00, 0x0c, 0x00, 0x00, // 3072 in `bb.bb_sock_opt_t.rx_buf_size`
-                };
-                try cap.query_common_slice(req, buf);
-            }
-
-            pub fn open_socket_send(cap: *@This()) !void {
-                try cap.try_socket_open();
-                var subject = cap.self.rxObservable();
-                const req = comptime bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
-                const predicate = Capture.make_reqid_predicate(req);
-                subject.subscribe(
-                    &predicate,
-                    &Capture.open_socket_on_data,
-                    cap,
-                    null,
-                ) catch unreachable;
-            }
-
-            pub fn open_socket_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
-                // if we must handle these shit
-                // we'd better make a state machine
-                const ud = obs.userdata;
-                var cap = Capture.as(ud);
-                if (pack.sta == 0) {
-                    cap.self.withSrcLogger(logz.info(), @src())
-                        .int("slot", sel_slot)
-                        .int("port", sel_port)
-                        .string("what", "socket opened")
-                        .log();
-                } else if (pack.sta == ERROR_ALREADY_OPENED_SOCKET) {
-                    // leave it be
-                    cap.self.withSrcLogger(logz.warn(), @src())
-                        .int("slot", sel_slot)
-                        .int("port", sel_port)
-                        .string("what", "socket already opened")
-                        .log();
-                } else {
-                    cap.self.withSrcLogger(logz.err(), @src())
-                        .int("slot", sel_slot)
-                        .int("port", sel_port)
-                        .int("sta", pack.sta)
-                        .string("what", "failed to open socket")
-                        .log();
-                    std.debug.panic("failed to open socket, sta={d}", .{pack.sta});
-                }
-                obs.dtor = @ptrCast(&Capture.deinit);
-                sbj.unsubscribe(obs) catch unreachable;
-            }
-        };
-
         // first, we start the loop thread,
         // for the running of observable
         self.initThreads();
-        var local = local_t.init(self.allocator(), self) catch unreachable;
+        var local = ActionCallback.init(self.allocator(), self) catch unreachable;
 
         // it's quite hard to design a promise chain without lambda/closure.
         //
@@ -1166,18 +791,6 @@ const DeviceContext = struct {
         self.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
     }
 };
-
-pub fn logWithDevice(logger: logz.Logger, device: *usb.libusb_device, desc: *const usb.libusb_device_descriptor) logz.Logger {
-    const vid = desc.idVendor;
-    const pid = desc.idProduct;
-    const bus = usb.libusb_get_bus_number(device);
-    const port = usb.libusb_get_port_number(device);
-    return logger
-        .fmt("vid", "0x{x:0>4}", .{vid})
-        .fmt("pid", "0x{x:0>4}", .{pid})
-        .int("bus", bus)
-        .int("port", port);
-}
 
 fn refreshDevList(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator, ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceContext)) void {
     var c_device_list: [*c]?*usb.libusb_device = undefined;
@@ -1296,136 +909,255 @@ fn refreshDevList(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator,
     }
 }
 
-pub inline fn usbEndpointNum(ep_addr: u8) u8 {
-    return ep_addr & 0x07;
-}
+/// only used in `DeviceContext.loopPrepare`
+const ActionCallback = struct {
+    arena: std.heap.ArenaAllocator,
+    /// reference, not OWNING
+    self: *DeviceContext,
 
-pub inline fn usbEndpointTransferType(ep_attr: u8) u8 {
-    return ep_attr & @as(u8, usb.LIBUSB_TRANSFER_TYPE_MASK);
-}
+    const Observer = PackObserverList.Observer;
+    const Self = @This();
 
-const Direction = enum {
-    in,
-    out,
-};
-
-const TransferType = enum {
-    control,
-    isochronous,
-    bulk,
-    interrupt,
-};
-
-const Endpoint = struct {
-    /// config index
-    iConfig: u8,
-    /// interface index
-    iInterface: u8,
-    addr: u8,
-    number: u8,
-    direction: Direction,
-    transferType: TransferType,
-    maxPacketSize: u16,
-
-    pub fn fromDesc(iConfig: u8, iInterface: u8, ep: *const usb.libusb_endpoint_descriptor) AppError!Endpoint {
-        const local_t = struct {
-            pub inline fn addr_to_dir(addr: u8) BadEnum!Direction {
-                const dir = addr & usb.LIBUSB_ENDPOINT_DIR_MASK;
-                const r = switch (dir) {
-                    usb.LIBUSB_ENDPOINT_IN => Direction.in,
-                    usb.LIBUSB_ENDPOINT_OUT => Direction.out,
-                    else => return BadEnum.BadEnum,
-                };
-                return r;
-            }
-            pub inline fn attr_to_transfer_type(attr: u8) BadEnum!TransferType {
-                const r = switch (usbEndpointTransferType(attr)) {
-                    usb.LIBUSB_TRANSFER_TYPE_CONTROL => TransferType.control,
-                    usb.LIBUSB_TRANSFER_TYPE_ISOCHRONOUS => TransferType.isochronous,
-                    usb.LIBUSB_TRANSFER_TYPE_BULK => TransferType.bulk,
-                    usb.LIBUSB_TRANSFER_TYPE_INTERRUPT => TransferType.interrupt,
-                    else => return BadEnum.BadEnum,
-                };
-                return r;
-            }
-        };
-        return Endpoint{
-            .iConfig = iConfig,
-            .iInterface = iInterface,
-            .addr = ep.bEndpointAddress,
-            .number = usbEndpointNum(ep.bEndpointAddress),
-            .direction = try local_t.addr_to_dir(ep.bEndpointAddress),
-            .transferType = try local_t.attr_to_transfer_type(ep.bmAttributes),
-            .maxPacketSize = ep.wMaxPacketSize,
-        };
+    pub inline fn as(ud: ?*anyopaque) *Self {
+        return @alignCast(@ptrCast(ud.?));
     }
 
-    pub fn withLogger(self: *const Endpoint, logger: logz.Logger) logz.Logger {
-        return logger
-            .int("interface", self.iInterface)
-            .int("endpoint", self.number)
-            .fmt("address", "0x{x:0>2}", .{self.addr})
-            .string("direction", @tagName(self.direction))
-            .string("transfer_type", @tagName(self.transferType));
+    pub fn init(alloc: std.mem.Allocator, ctx: *DeviceContext) !*Self {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        var ret = try arena.allocator().create(@This());
+        ret.arena = arena;
+        ret.self = ctx;
+        return ret;
     }
-};
 
-pub fn getEndpoints(alloc: std.mem.Allocator, device: *usb.libusb_device, ldesc: *const usb.libusb_device_descriptor) []Endpoint {
-    var ret: c_int = undefined;
-    var list = std.ArrayList(Endpoint).init(alloc);
-    defer list.deinit();
-    const n_config = ldesc.bNumConfigurations;
-    for (0..n_config) |i| {
-        var config_: ?*usb.libusb_config_descriptor = undefined;
-        ret = usb.libusb_get_config_descriptor(device, @intCast(i), &config_);
-        if (ret != 0) continue;
-        if (config_) |config| {
-            const ifaces = config.interface[0..@intCast(config.bNumInterfaces)];
-            for (ifaces) |iface_alt| {
-                const iface_alts = iface_alt.altsetting[0..@intCast(iface_alt.num_altsetting)];
-                if (iface_alts.len == 0) continue;
+    pub fn deinit(self: *@This()) void {
+        var stk_arena = self.arena;
+        stk_arena.allocator().destroy(self);
+        _ = stk_arena.reset(.free_all);
+        stk_arena.deinit();
+    }
 
-                // I don't really care alternate setting. Take the first one
-                const iface = iface_alts[0];
-                const endpoints = iface.endpoint[0..@intCast(iface.bNumEndpoints)];
-                for (endpoints) |ep| {
-                    const app_ep = Endpoint.fromDesc(@intCast(i), iface.bInterfaceNumber, &ep) catch |e| {
-                        logWithDevice(logz.err(), device, ldesc).err(e).log();
-                        continue;
-                    };
-                    list.append(app_ep) catch @panic("OOM");
-                }
-            }
+    // payload should be a pointer to struct, or null
+    pub fn query_common(self: *@This(), reqid: u32, payload: anytype) !void {
+        var alloc = self.arena.allocator();
+        const P = @TypeOf(payload);
+
+        var pack = UsbPack{
+            .reqid = reqid,
+            .msgid = 0,
+            .sta = 0,
+        };
+        switch (@typeInfo(P)) {
+            .Pointer => {
+                try pack.fillWith(payload);
+            },
+            .Null => {}, // do nothing
+            else => @compileError("`payload` must be a pointer type or null, found `" ++ @typeName(P) ++ "`"),
         }
+        const data = try pack.marshal(alloc);
+        defer alloc.free(data);
+        try self.self.transmit(data);
     }
-    return list.toOwnedSlice() catch @panic("OOM");
-}
 
-pub fn printEndpoints(vid: u16, pid: u16, endpoints: []const Endpoint) void {
-    for (endpoints) |ep| {
-        logz.info()
-            .fmt("vid", "0x{x:0>4}", .{vid})
-            .fmt("pid", "0x{x:0>4}", .{pid})
-            .int("config", ep.iConfig)
-            .int("interface", ep.iInterface)
-            .int("endpoint", ep.number)
-            .fmt("address", "0x{x:0>2}", .{ep.addr})
-            .string("direction", @tagName(ep.direction))
-            .string("transfer_type", @tagName(ep.transferType))
-            .int("max_packet_size", ep.maxPacketSize).log();
+    // like `query_common`, but with a slice payload
+    pub fn query_common_slice(cap: *@This(), reqid: u32, payload: []const u8) !void {
+        var alloc = cap.arena.allocator();
+        var pack = UsbPack{
+            .reqid = reqid,
+            .msgid = 0,
+            .sta = 0,
+        };
+        pack.ptr = payload.ptr;
+        pack.len = @intCast(payload.len);
+        const data = try pack.marshal(alloc);
+        defer alloc.free(data);
+        std.debug.print("data {s}\n", .{std.fmt.fmtSliceHexLower(data)});
+        try cap.self.transmit(data);
     }
-}
 
-// libusb_fill_bulk_transfer
-// https://libusb.sourceforge.io/api-1.0/group__libusb__asyncio.html
-// https://libusb.sourceforge.io/api-1.0/libusb_io.html
-//
-// In the interest of being a lightweight library, libusb does not
-// create threads and can only operate when your application is
-// calling into it. Your application must call into libusb from it's
-// main loop when events are ready to be handled, or you must use
-// some other scheme to allow libusb to undertake whatever work
-// needs to be done.
+    // an action being two part (functions)
+    // first `*_send` should be call to push
+    // the request to the device
+    // then the observable will call `*_on_data` when
+    // when the message is received
+    //
+    // other action could be executed in `*_on_data`,
+    // like start a new subscription, etc.
+    //
+    // although it might confuse the reader,
+    // as we don't have proper async/await support
+
+    /// create a predicate that matches the request id
+    pub fn make_reqid_predicate(comptime reqid: u32) fn (*const UsbPack, ?*anyopaque) bool {
+        return (struct {
+            pub fn call(pack: *const UsbPack, _: ?*anyopaque) bool {
+                return pack.reqid == reqid;
+            }
+        }).call;
+    }
+
+    pub fn query_status_send(cap: *@This()) !void {
+        var in = bb.bb_get_status_in_t{
+            .user_bmp = SLOT_BIT_MAP_MAX,
+        };
+        try cap.query_common(bb.BB_GET_STATUS, &in);
+        const predicate = Self.make_reqid_predicate(bb.BB_GET_STATUS);
+        var subject = cap.self.rxObservable();
+        subject.subscribe(
+            &predicate,
+            &Self.query_status_on_data,
+            cap,
+            null,
+        ) catch unreachable;
+    }
+
+    pub fn query_status_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
+        const ud = obs.userdata;
+        var cap = Self.as(ud);
+        if (pack.dataAs(bb.bb_get_status_out_t)) |status| {
+            bt.logWithStatus(cap.self.withSrcLogger(logz.info(), @src()), &status).log();
+            // ***** and_then *****
+            cap.query_info_send() catch @panic("OOM");
+        } else |e| {
+            cap.self.withSrcLogger(logz.err(), @src())
+                .err(e)
+                .string("what", "failed to parse status")
+                .log();
+            obs.dtor = @ptrCast(&Self.deinit);
+        }
+        sbj.unsubscribe(obs) catch unreachable;
+    }
+
+    pub fn query_info_send(cap: *@This()) !void {
+        try cap.query_common(bb.BB_GET_SYS_INFO, null);
+        const predicate = Self.make_reqid_predicate(bb.BB_GET_SYS_INFO);
+        var subject = cap.self.rxObservable();
+        subject.subscribe(
+            &predicate,
+            &Self.query_info_on_data,
+            cap,
+            null,
+        ) catch unreachable;
+    }
+
+    pub fn query_info_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
+        std.debug.assert(pack.sta == 0);
+        const ud = obs.userdata;
+        var cap = Self.as(ud);
+        if (pack.dataAs(bb.bb_get_sys_info_out_t)) |info| {
+            const compile_time: [*:0]const u8 = @ptrCast(&info.compile_time);
+            const soft_ver: [*:0]const u8 = @ptrCast(&info.soft_ver);
+            const hard_ver: [*:0]const u8 = @ptrCast(&info.hardware_ver);
+            const firmware_ver: [*:0]const u8 = @ptrCast(&info.firmware_ver);
+            cap.self.withSrcLogger(logz.info(), @src())
+                .int("uptime", info.uptime)
+                .stringSafeZ("compile_time", compile_time)
+                .stringSafeZ("soft_ver", soft_ver)
+                .stringSafeZ("hard_ver", hard_ver)
+                .stringSafeZ("firmware_ver", firmware_ver)
+                .log();
+            // ***** and_then *****
+            cap.subscribe_event_no_response(.link_state) catch unreachable;
+            cap.subscribe_event_no_response(.mcs_change) catch unreachable;
+            cap.subscribe_event_no_response(.chan_change) catch unreachable;
+
+            cap.open_socket_send() catch unreachable;
+        } else |e| {
+            cap.self.withSrcLogger(logz.err(), @src())
+                .err(e)
+                .string("what", "failed to parse system info")
+                .log();
+            obs.dtor = @ptrCast(&Self.deinit);
+        }
+        sbj.unsubscribe(obs) catch unreachable;
+    }
+
+    /// subscribe an event, don't care if it's successful or not.
+    /// I don't care the response.
+    /// without closure it's become tedious.
+    pub fn subscribe_event_no_response(cap: *@This(), event: bt.Event) !void {
+        const req = bt.subscribeRequestId(event);
+        try cap.query_common(req, null);
+    }
+
+    const sel_slot = bb.BB_SLOT_AP;
+    const sel_port = 3;
+    // note that sta == 0x0101 (i.e. 257) means already opened socket
+    const ERROR_ALREADY_OPENED_SOCKET = 257;
+    // -259 is a generic error code, I have no idea what's the exact meaning
+    const ERROR_UNKNOWN = -259;
+
+    fn try_socket_open(cap: *@This()) !void {
+        const req = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
+        const flag: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
+        // see `session_socket.c:232`
+        // TODO: create a wrapper struct
+        const buf = &[_]u8{
+            flag, 0x00, 0x00, 0x00, // flags, with alignment
+            0x00, 0x08, 0x00, 0x00, // 2048 in `bb.bb_sock_opt_t.tx_buf_size`
+            0x00, 0x0c, 0x00, 0x00, // 3072 in `bb.bb_sock_opt_t.rx_buf_size`
+        };
+        try cap.query_common_slice(req, buf);
+    }
+
+    pub fn open_socket_send(cap: *@This()) !void {
+        try cap.try_socket_open();
+        var subject = cap.self.rxObservable();
+        const req = comptime bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
+        const predicate = Self.make_reqid_predicate(req);
+        subject.subscribe(
+            &predicate,
+            &Self.open_socket_on_data,
+            cap,
+            null,
+        ) catch unreachable;
+    }
+
+    pub fn open_socket_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
+        // if we must handle these shit
+        // we'd better make a state machine
+        const ud = obs.userdata;
+        var cap = Self.as(ud);
+        if (pack.sta == 0) {
+            cap.self.withSrcLogger(logz.info(), @src())
+                .int("slot", sel_slot)
+                .int("port", sel_port)
+                .string("what", "socket opened")
+                .log();
+        } else if (pack.sta == ERROR_ALREADY_OPENED_SOCKET) {
+            // leave it be
+            cap.self.withSrcLogger(logz.warn(), @src())
+                .int("slot", sel_slot)
+                .int("port", sel_port)
+                .string("what", "socket already opened")
+                .log();
+        } else {
+            cap.self.withSrcLogger(logz.err(), @src())
+                .int("slot", sel_slot)
+                .int("port", sel_port)
+                .int("sta", pack.sta)
+                .string("what", "failed to open socket")
+                .log();
+            std.debug.panic("failed to open socket, sta={d}", .{pack.sta});
+        }
+        obs.dtor = @ptrCast(&Self.deinit);
+        sbj.unsubscribe(obs) catch unreachable;
+    }
+};
+
+/// See `libusb_fill_bulk_transfer`
+///
+///   - https://libusb.sourceforge.io/api-1.0/group__libusb__asyncio.html
+///   - https://libusb.sourceforge.io/api-1.0/libusb_io.html
+///
+/// > In the interest of being a lightweight library, libusb does not
+/// create threads and can only operate when your application is
+/// calling into it. Your application must call into libusb from it's
+/// main loop when events are ready to be handled, or you must use
+/// some other scheme to allow libusb to undertake whatever work
+/// needs to be done.
+///
+/// Only used in `DeviceContext.initTransferTx` and `DeviceContext.initTransferRx`
 const TransferCallback = struct {
     alloc: std.mem.Allocator,
     /// reference, not OWNING
@@ -1504,7 +1236,7 @@ const TransferCallback = struct {
             }
         }
 
-        // resubmit the transfer
+        // resubmit
         const errc = usb.libusb_submit_transfer(trans);
         if (errc == 0) {
             self.transfer.lk.lockShared();
@@ -1531,95 +1263,6 @@ const TransferCallback = struct {
         }
     }
 };
-
-/// Get a string descriptor or return a default value
-pub fn dynStringDescriptorOr(alloc: std.mem.Allocator, hdl: *usb.libusb_device_handle, idx: u8, default: []const u8) []const u8 {
-    const BUF_SIZE = 128;
-    var buf: [BUF_SIZE]u8 = undefined;
-    const sz: c_int = usb.libusb_get_string_descriptor_ascii(hdl, idx, &buf, @intCast(buf.len));
-    if (sz > 0) {
-        var dyn_str = alloc.alloc(u8, @intCast(sz)) catch @panic("OOM");
-        @memcpy(dyn_str, buf[0..@intCast(sz)]);
-        dyn_str.len = @intCast(sz);
-        return dyn_str;
-    } else {
-        var dyn_str = alloc.alloc(u8, default.len) catch @panic("OOM");
-        @memcpy(dyn_str, default);
-        dyn_str.len = default.len;
-        return dyn_str;
-    }
-}
-
-/// Print the manufacturer, product, serial number of a device.
-/// If a string descriptor is not available, 'N/A' will be display.
-fn printStrDesc(hdl: *usb.libusb_device_handle, desc: *const usb.libusb_device_descriptor) void {
-    const local_t = struct {
-        /// Get string descriptor or return a default value.
-        /// Note that the caller must ensure the buffer is large enough.
-        /// The return slice will be a slice of the buffer.
-        pub fn get_string_descriptor_or(lhdl: *usb.libusb_device_handle, idx: u8, buf: []u8, default: []const u8) []const u8 {
-            var lsz: c_int = undefined;
-            lsz = usb.libusb_get_string_descriptor_ascii(lhdl, idx, buf.ptr, @intCast(buf.len));
-            if (lsz > 0) {
-                return buf[0..@intCast(lsz)];
-            } else {
-                return default;
-            }
-        }
-    };
-
-    const BUF_SIZE = 128;
-    var manufacturer_buf: [BUF_SIZE]u8 = undefined;
-    const manufacturer = local_t.get_string_descriptor_or(hdl, desc.iManufacturer, &manufacturer_buf, "N/A");
-
-    var product_buf: [BUF_SIZE]u8 = undefined;
-    const product = local_t.get_string_descriptor_or(hdl, desc.iProduct, &product_buf, "N/A");
-
-    var serial_buf: [BUF_SIZE]u8 = undefined;
-    const serial = local_t.get_string_descriptor_or(hdl, desc.iSerialNumber, &serial_buf, "N/A");
-    logz.info()
-        .fmt("vid", "0x{x:0>4}", .{desc.idVendor})
-        .fmt("pid", "0x{x:0>4}", .{desc.idProduct})
-        .string("manufacturer", manufacturer)
-        .string("product", product)
-        .string("serial", serial).log();
-}
-
-pub fn usbSpeedToString(speed: c_int) []const u8 {
-    const r = switch (speed) {
-        usb.LIBUSB_SPEED_UNKNOWN => "UNKNOWN",
-        usb.LIBUSB_SPEED_LOW => "LOW",
-        usb.LIBUSB_SPEED_FULL => "FULL",
-        usb.LIBUSB_SPEED_HIGH => "HIGH",
-        usb.LIBUSB_SPEED_SUPER => "SUPER",
-        usb.LIBUSB_SPEED_SUPER_PLUS => "SUPER_PLUS",
-        else => "INVALID",
-    };
-    return r;
-}
-
-const TransferStatus = enum {
-    completed,
-    err,
-    timed_out,
-    cancelled,
-    stall,
-    no_device,
-    overflow,
-};
-
-pub fn transferStatusFromInt(status: c_uint) BadEnum!TransferStatus {
-    return switch (status) {
-        usb.LIBUSB_TRANSFER_COMPLETED => TransferStatus.completed,
-        usb.LIBUSB_TRANSFER_ERROR => TransferStatus.err,
-        usb.LIBUSB_TRANSFER_TIMED_OUT => TransferStatus.timed_out,
-        usb.LIBUSB_TRANSFER_CANCELLED => TransferStatus.cancelled,
-        usb.LIBUSB_TRANSFER_STALL => TransferStatus.stall,
-        usb.LIBUSB_TRANSFER_NO_DEVICE => TransferStatus.no_device,
-        usb.LIBUSB_TRANSFER_OVERFLOW => TransferStatus.overflow,
-        else => return BadEnum.BadEnum,
-    };
-}
 
 pub fn main() !void {
     // Use a separate allocator for logz

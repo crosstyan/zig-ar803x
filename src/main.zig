@@ -159,15 +159,34 @@ const PackObserverList = struct {
     pub fn notifyObservers(self: *@This(), managed_pack: *const ManagedUsbPack) void {
         self.lock.lock();
         defer self.lock.unlock();
+
+        var cnt: usize = 0;
         for (self.list.items) |*o| {
             if (o.predicate(&managed_pack.pack, o.userdata)) {
                 o.on_data(self, &managed_pack.pack, o);
+                cnt += 1;
             }
+        }
+
+        if (cnt == 0) {
+            var lg = logz.warn()
+                .int("reqid", managed_pack.pack.reqid)
+                .int("sta", managed_pack.pack.sta)
+                .string("what", "no observer is notified");
+            if (managed_pack.pack.data()) |data| {
+                lg = lg.int("len", data.len)
+                    .fmt("content", "{s}", .{std.fmt.fmtSliceHexLower(data)});
+            } else |_| {}
+            lg.log();
         }
     }
 
+    pub inline fn unsubscribe(self: *@This(), obs: *const Observer) ObserverError!void {
+        return self.unsubscribeByHash(obs.xxhash());
+    }
+
     /// unsubscribe an observer by hash
-    pub fn unsubscribe(self: *@This(), hash: u32) ObserverError!void {
+    pub fn unsubscribeByHash(self: *@This(), hash: u32) ObserverError!void {
         var idx: isize = -1;
         const len = self.list.items.len;
 
@@ -910,7 +929,7 @@ const DeviceContext = struct {
                         .log();
                     cap.deinit();
                 }
-                sbj.unsubscribe(obs.xxhash()) catch unreachable;
+                sbj.unsubscribe(obs) catch unreachable;
             }
 
             pub fn query_info_send(cap: *@This()) !void {
@@ -954,7 +973,7 @@ const DeviceContext = struct {
                         .log();
                     cap.deinit();
                 }
-                sbj.unsubscribe(obs.xxhash()) catch unreachable;
+                sbj.unsubscribe(obs) catch unreachable;
             }
 
             /// subscribe an event, don't care if it's successful or not.
@@ -1013,7 +1032,7 @@ const DeviceContext = struct {
                     std.debug.panic("failed to open socket, sta={d}", .{pack.sta});
                 }
                 obs.dtor = @ptrCast(&Capture.deinit);
-                sbj.unsubscribe(obs.xxhash()) catch unreachable;
+                sbj.unsubscribe(obs) catch unreachable;
             }
 
             pub fn open_socket_send(cap: *@This()) !void {
@@ -1066,6 +1085,7 @@ const DeviceContext = struct {
     }
 
     /// basically do nothing... for now
+    /// reserve for future use
     pub fn sendLoop(self: *@This()) void {
         while (true) {
             if (self.hasDeinit()) {

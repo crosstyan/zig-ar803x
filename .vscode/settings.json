@@ -19,6 +19,7 @@
         "errc",
         "iface",
         "ifaces",
+        "isize",
         "ldesc",
         "lhdl",
         "libusb",
@@ -46,6 +47,7 @@
         "unwarp",
         "usbpack",
         "usec",
+        "userdata",
         "usize",
         "WINAPI",
         "XXHASH"

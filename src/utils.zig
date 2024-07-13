@@ -90,11 +90,11 @@ pub fn fillWithBytes(dst: anytype, src: []const u8) LengthNotEqual!void {
             if (info.is_const) {
                 @compileError("`dst` must be a mutable pointer type, found `" ++ @typeName(P) ++ "`");
             }
-            const sdst: []u8 = @constCast(anytype2Slice(dst));
-            if (sdst.len != src.len) {
+            const s_dst: []u8 = @constCast(anytype2Slice(dst));
+            if (s_dst.len != src.len) {
                 return LengthNotEqual.LengthNotEqual;
             }
-            @memcpy(sdst, src);
+            @memcpy(s_dst, src);
         },
         else => @compileError("`dst` must be a pointer type, found `" ++ @typeName(P) ++ "`"),
     }

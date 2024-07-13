@@ -57,6 +57,135 @@ const ClosedError = error{
     Closed,
 };
 
+const ObserverError = error{
+    Existed,
+    NotFound,
+};
+
+const PackObserverList = struct {
+    // Observer provider could use
+    // reference counting in dtor
+    const Observer = struct {
+        predicate: *const fn (*const ManagedUsbPack, ?*anyopaque) bool,
+        /// the callback function SHOULD NOT block, and SHOULD NOT deinit the pack
+        on_data: *const fn (*PackObserverList, *const ManagedUsbPack, ?*anyopaque) void,
+        userdata: ?*anyopaque,
+        dtor: ?*const fn (*anyopaque) void,
+
+        /// hashing the pointer, don't ask me why it's useful
+        pub fn xxhash(self: *const @This()) u32 {
+            var h = std.hash.XxHash32.init(XXHASH_SEED);
+            const predicate_addr = @intFromPtr(self.predicate);
+            h.update(utils.anytype2Slice(&predicate_addr));
+            const notify_addr = @intFromPtr(self.on_data);
+            h.update(utils.anytype2Slice(&notify_addr));
+            if (self.userdata) |ptr| {
+                const ud = @intFromPtr(ptr);
+                h.update(utils.anytype2Slice(&ud));
+            }
+            const dtor_addr = @intFromPtr(self.dtor);
+            h.update(utils.anytype2Slice(&dtor_addr));
+            return h.final();
+        }
+
+        pub fn deinit(self: *@This()) void {
+            if (self.dtor) |dtor| {
+                if (self.userdata) |ptr| {
+                    dtor(ptr);
+                }
+            }
+        }
+    };
+
+    // ******** fields ********
+    allocator: std.mem.Allocator,
+    list: std.ArrayList(Observer),
+    lock: RwLock = RwLock{},
+    // ******** end fields ********
+
+    const Self = @This();
+
+    pub fn items(self: *const Self) []const Observer {
+        return self.list.items;
+    }
+
+    pub fn init(alloc: std.mem.Allocator) Self {
+        return Self{
+            .allocator = alloc,
+            .list = std.ArrayList(Observer).init(alloc),
+        };
+    }
+
+    pub fn subscribe(
+        self: *@This(),
+        predicate: *const fn (*const ManagedUsbPack, ?*anyopaque) bool,
+        on_data: *const fn (*PackObserverList, *const ManagedUsbPack, ?*anyopaque) void,
+        userdata: ?*anyopaque,
+        dtor: ?*const fn (*anyopaque) void,
+    ) ObserverError!void {
+        const obs = Observer{
+            .predicate = predicate,
+            .on_data = on_data,
+            .userdata = userdata,
+            .dtor = dtor,
+        };
+        const h = obs.xxhash();
+
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            for (self.list.items) |*o| {
+                if (o.xxhash() == h) {
+                    return ObserverError.Existed;
+                }
+            }
+        }
+
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        self.list.append(obs) catch @panic("OOM");
+    }
+
+    pub fn notifyObservers(self: *@This(), pack: *const ManagedUsbPack) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (self.list.items) |*o| {
+            if (o.predicate(pack, o.userdata)) {
+                o.on_data(self, pack, o.userdata);
+            }
+        }
+    }
+
+    pub fn unsubscribe(self: *@This(), hash: u32) ObserverError!void {
+        var idx: isize = -1;
+        const len = self.list.items.len;
+
+        // explicit no lock here
+        for (self.list.items, 0..len) |*o, i| {
+            const h = o.xxhash();
+            if (h == hash) {
+                idx = @intCast(i);
+                break;
+            }
+        }
+        if (idx == -1) {
+            return ObserverError.NotFound;
+        }
+
+        self.lock.lockShared();
+        var el = self.list.orderedRemove(@intCast(idx));
+        self.lock.unlockShared();
+        el.deinit();
+    }
+
+    pub fn deinit(self: *@This()) void {
+        for (self.list.items) |*o| {
+            o.deinit();
+        }
+        self.list.deinit();
+    }
+};
+
 pub fn libusb_error_2_set(err: c_int) LibUsbError {
     return switch (err) {
         usb.LIBUSB_ERROR_IO => LibUsbError.IO,
@@ -348,11 +477,15 @@ const DeviceContext = struct {
         tx_thread: std.Thread,
         /// initialized in `initThreads`
         rx_thread: std.Thread,
+        /// obs_queue will dispatch the packet to the observers,
+        /// in rx thread
+        obs_queue: PackObserverList,
 
         pub fn deinit(self: *@This()) void {
             self.tx_transfer.deinit();
             self.rx_transfer.deinit();
             self.rx_queue.deinit();
+            self.obs_queue.deinit();
             self.tx_thread.join();
             self.rx_thread.join();
         }
@@ -804,6 +937,10 @@ const DeviceContext = struct {
             }
         };
 
+        // finally, we start the loop thread, after querying status
+        // and set callback etc.
+        self.initThreads();
+
         var local = local_t{
             .stack_allocator = stack_allocator,
             .self = self,
@@ -817,9 +954,6 @@ const DeviceContext = struct {
 
         utils.logWithSrc(self.withLogger(logz.info()), @src())
             .string("what", "preparing finished").log();
-        // finally, we start the loop thread, after querying status
-        // and set callback etc.
-        self.initThreads();
     }
 
     /// run `loopPrepare` in a separate thread
@@ -843,39 +977,20 @@ const DeviceContext = struct {
         const rx_thread = std.Thread.spawn(config, Self.recvLoop, .{self}) catch unreachable;
         self.arto.tx_thread = tx_thread;
         self.arto.rx_thread = rx_thread;
+        self.arto.obs_queue = PackObserverList.init(self.allocator());
     }
 
+    /// basically do nothing... for now
     pub fn sendLoop(self: *@This()) void {
-        const BUFFER_SIZE = 4096;
-        var stack_buf: [BUFFER_SIZE]u8 = undefined;
-        var fixed = std.heap.FixedBufferAllocator.init(stack_buf[0..]);
-        var stack_allocator = fixed.allocator();
         while (true) {
-            var in = bb.bb_get_status_in_t{
-                .user_bmp = SLOT_BIT_MAP_MAX,
-            };
-
-            var pack = UsbPack{
-                .reqid = bb.BB_GET_STATUS,
-                .msgid = 0,
-                .sta = 0,
-            };
-            pack.fillWith(&in) catch unreachable;
-
-            const data = pack.marshal(stack_allocator) catch unreachable;
-            defer stack_allocator.free(data);
-
-            self.transmit(data) catch |e| {
-                var lg = utils.logWithSrc(self.withLogger(logz.err()), @src());
-                lg.err(e)
-                    .string("what", "failed to transmit, exiting thread")
-                    .log();
-                return;
-            };
+            if (self.hasDeinit()) {
+                break;
+            }
             std.time.sleep(1000 * std.time.ns_per_ms);
         }
     }
 
+    /// notify every observer in the queue
     pub fn recvLoop(self: *@This()) void {
         while (true) {
             var mpk = self.receive() catch |e| {
@@ -886,9 +1001,8 @@ const DeviceContext = struct {
                 return;
             };
             defer mpk.deinit();
-            var lg = utils.logWithSrc(self.withLogger(logz.info()), @src());
-            lg.string("what", "received packet")
-                .log();
+            var queue = &self.arto.obs_queue;
+            queue.notifyObservers(&mpk);
         }
     }
 

@@ -63,9 +63,9 @@ const ObserverError = error{
 };
 
 const PackObserverList = struct {
-    pub const OnDataFnPtr = *const fn (*PackObserverList, *const ManagedUsbPack, ?*anyopaque) void;
+    pub const OnDataFnPtr = *const fn (*PackObserverList, *const ManagedUsbPack, *Observer) void;
     pub const PredicateFnPtr = *const fn (*const ManagedUsbPack, ?*anyopaque) bool;
-    pub const OptDtorPtr = ?*const fn (*anyopaque) void;
+    pub const NullableDtorPtr = ?*const fn (*anyopaque) void;
 
     // Observer provider could use
     // reference counting in dtor
@@ -74,7 +74,7 @@ const PackObserverList = struct {
         /// the callback function SHOULD NOT block, and SHOULD NOT deinit the pack
         on_data: OnDataFnPtr,
         userdata: ?*anyopaque,
-        dtor: OptDtorPtr,
+        dtor: NullableDtorPtr,
 
         /// hashing the pointer, don't ask me why it's useful
         pub fn xxhash(self: *const @This()) u32 {
@@ -120,12 +120,18 @@ const PackObserverList = struct {
         };
     }
 
+    /// subscribe an observable as an observer
+    ///
+    ///   - `predicate`: a function to determine whether the observer should be notified
+    ///   - `on_data`: the callback function when the observer is notified
+    ///   - `userdata`: closure
+    ///   - `dtor`: destructor for the closure, optional
     pub fn subscribe(
         self: *@This(),
         predicate: PredicateFnPtr,
         on_data: OnDataFnPtr,
         userdata: ?*anyopaque,
-        dtor: OptDtorPtr,
+        dtor: NullableDtorPtr,
     ) ObserverError!void {
         const obs = Observer{
             .predicate = predicate,
@@ -155,7 +161,7 @@ const PackObserverList = struct {
         defer self.lock.unlock();
         for (self.list.items) |*o| {
             if (o.predicate(pack, o.userdata)) {
-                o.on_data(self, pack, o.userdata);
+                o.on_data(self, pack, o);
             }
         }
     }
@@ -773,6 +779,10 @@ const DeviceContext = struct {
         }
     }
 
+    pub fn observable(self: *@This()) *PackObserverList {
+        return &self.arto.obs_queue;
+    }
+
     fn initEndpoints(self: *@This()) void {
         for (self.endpoints) |*ep| {
             if (ep.direction == Direction.out and ep.transferType == TransferType.bulk) {
@@ -786,16 +796,31 @@ const DeviceContext = struct {
     /// doing status query before start forward loop,
     /// and it still NEEDS event loop running. Please call it in a separate thread.
     fn loopPrepare(self: *@This()) void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator());
-        defer arena.deinit();
-        const stack_allocator = arena.allocator();
-
         const local_t = struct {
-            stack_allocator: std.mem.Allocator,
+            arena: std.heap.ArenaAllocator,
+            /// reference ownership
             self: *DeviceContext,
 
+            const Capture = @This();
+
+            pub fn init(alloc: std.mem.Allocator, ctx: *DeviceContext) !*Capture {
+                var _arena = std.heap.ArenaAllocator.init(alloc);
+                var ret = try _arena.allocator().create(@This());
+                ret.arena = _arena;
+                ret.self = ctx;
+                return ret;
+            }
+
+            pub fn deinit(cap: *@This()) void {
+                var stk_arena = cap.arena;
+                stk_arena.allocator().destroy(cap);
+                _ = stk_arena.reset(.free_all);
+                stk_arena.deinit();
+            }
+
             // payload should be a pointer to struct, or null
-            pub fn query_common(cap: *@This(), reqid: u32, payload: anytype) !ManagedUsbPack {
+            pub fn query_common(cap: *@This(), reqid: u32, payload: anytype) !void {
+                var alloc = cap.arena.allocator();
                 const P = @TypeOf(payload);
 
                 var pack = UsbPack{
@@ -810,15 +835,13 @@ const DeviceContext = struct {
                     .Null => {}, // do nothing
                     else => @compileError("`payload` must be a pointer type or null, found `" ++ @typeName(P) ++ "`"),
                 }
-                const data = try pack.marshal(cap.stack_allocator);
-                defer cap.stack_allocator.free(data);
+                const data = try pack.marshal(alloc);
+                defer alloc.free(data);
                 try cap.self.transmit(data);
-
-                return try cap.self.unsafeBlockReceive();
             }
 
             // like `query_common`, but with a slice payload
-            pub fn query_common_slice(cap: *@This(), reqid: u32, payload: []const u8) !ManagedUsbPack {
+            pub fn query_common_slice(cap: *@This(), reqid: u32, payload: []const u8) !void {
                 var pack = UsbPack{
                     .reqid = reqid,
                     .msgid = 0,
@@ -830,20 +853,42 @@ const DeviceContext = struct {
                 defer cap.stack_allocator.free(data);
                 std.debug.print("data {s}\n", .{std.fmt.fmtSliceHexLower(data)});
                 try cap.self.transmit(data);
-
-                return try cap.self.unsafeBlockReceive();
             }
 
-            // query status
-            pub fn query_status(cap: *@This()) !void {
+            pub fn query_status_execute(cap: *@This()) !void {
                 var in = bb.bb_get_status_in_t{
                     .user_bmp = SLOT_BIT_MAP_MAX,
                 };
-                var mpk = try cap.query_common(bb.BB_GET_STATUS, &in);
-                defer mpk.deinit();
-                std.debug.assert(mpk.pack.sta == 0);
-                const status = try mpk.dataAs(bb.bb_get_status_out_t);
-                bt.logWithStatus(cap.self.withSrcLogger(logz.info(), @src()), &status).log();
+                try cap.query_common(bb.BB_GET_STATUS, &in);
+                const predicate = (struct {
+                    pub fn call(mpk: *const ManagedUsbPack, _: ?*anyopaque) bool {
+                        return mpk.pack.reqid == bb.BB_GET_STATUS;
+                    }
+                }).call;
+                var obs_list = cap.self.observable();
+                obs_list.subscribe(
+                    &predicate,
+                    &Capture.query_status_on_data,
+                    cap,
+                    null,
+                ) catch @panic("OOM");
+            }
+
+            pub fn query_status_on_data(obs_list: *PackObserverList, pack: *const ManagedUsbPack, obs: *PackObserverList.Observer) void {
+                const ud = obs.userdata;
+                var cap: *Capture = @alignCast(@ptrCast(ud.?));
+                const status_ = pack.dataAs(bb.bb_get_status_out_t);
+                if (status_) |status| {
+                    bt.logWithStatus(cap.self.withSrcLogger(logz.info(), @src()), &status).log();
+                    // continue chaining
+                } else |e| {
+                    cap.self.withSrcLogger(logz.err(), @src())
+                        .err(e)
+                        .string("what", "failed to parse status")
+                        .log();
+                    cap.deinit();
+                }
+                obs_list.unsubscribe(obs.xxhash()) catch unreachable;
             }
 
             // query system info (build time, version, etc.)
@@ -957,16 +1002,14 @@ const DeviceContext = struct {
         // and set callback etc.
         self.initThreads();
 
-        var local = local_t{
-            .stack_allocator = stack_allocator,
-            .self = self,
-        };
-        local.query_status() catch unreachable;
-        local.query_info() catch unreachable;
-        local.subscribe_event(.link_state) catch unreachable;
-        local.subscribe_event(.mcs_change) catch unreachable;
-        local.subscribe_event(.chan_change) catch unreachable;
-        local.open_socket() catch unreachable;
+        var local = local_t.init(self.allocator(), self) catch unreachable;
+        local.query_status_execute() catch unreachable;
+        // local.query_status() catch unreachable;
+        // local.query_info() catch unreachable;
+        // local.subscribe_event(.link_state) catch unreachable;
+        // local.subscribe_event(.mcs_change) catch unreachable;
+        // local.subscribe_event(.chan_change) catch unreachable;
+        // local.open_socket() catch unreachable;
 
         utils.logWithSrc(self.withLogger(logz.info()), @src())
             .string("what", "preparing finished").log();

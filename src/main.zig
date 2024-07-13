@@ -206,7 +206,7 @@ const PackObserverList = struct {
         }
 
         self.lock.lockShared();
-        var el = self.list.orderedRemove(@intCast(idx));
+        var el = self.list.swapRemove(@intCast(idx));
         self.lock.unlockShared();
         el.deinit();
     }
@@ -250,6 +250,11 @@ pub fn libusb_error_2_set(err: c_int) LibUsbError {
 }
 
 fn LockedQueue(comptime T: type, comptime max_size: usize) type {
+    // TODO: https://zig.news/kprotty/simple-scalable-unbounded-queue-34c2
+    // https://www.reddit.com/r/Zig/comments/oekuxh/question_does_zig_has_workstealingsharing
+    // https://github.com/ziglang/zig/issues/8224
+    // https://github.com/magurotuna/zig-deque
+    // I don't feel like going down the rabbit hole of data structures
     const LockedQueueImpl = struct {
         const MAX_SIZE = max_size;
         const Self = @This();
@@ -649,7 +654,7 @@ const DeviceContext = struct {
         dc.arto.rx_transfer = Transfer{
             .self = rx_transfer,
         };
-        // somehow the `ctrl_queue` is not happy with allocated with allocator in
+        // somehow the `rx_queue` is not happy with allocated with allocator in
         // the `DeviceContext`, which would cause a deadlock.
         // Interestingly, the deadlock is from the internal of GPA, needs to be
         // investigated further.
@@ -1261,7 +1266,7 @@ fn refreshDevList(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator,
             if (ldc == rdc) {
                 rdc.withLogger(logz.warn().string("action", "removed")).log();
                 rdc.deinit();
-                _ = ctx_list.orderedRemove(index);
+                _ = ctx_list.swapRemove(index);
                 break :inner;
             }
         }

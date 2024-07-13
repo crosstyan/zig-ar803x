@@ -62,6 +62,9 @@ const ObserverError = error{
     NotFound,
 };
 
+/// A naive implementation of the observer pattern for `UsbPack`
+///
+/// See also `UsbPack`
 const PackObserverList = struct {
     pub const OnDataFnPtr = *const fn (*PackObserverList, *const UsbPack, *Observer) void;
     pub const PredicateFnPtr = *const fn (*const UsbPack, ?*anyopaque) bool;
@@ -530,6 +533,13 @@ const DeviceContext = struct {
         ///
         /// `rx_observable` will dispatch the packet to the observers,
         /// in rx thread
+        ///
+        /// Note that I'd use `subject` and `observable` interchangeably
+        /// here, although in ReactiveX, they are different.
+        ///
+        /// See also
+        ///   - https://rxjs.dev/guide/observable
+        ///   - https://rxjs.dev/guide/subject
         rx_observable: PackObserverList,
 
         pub fn deinit(self: *@This()) void {
@@ -826,7 +836,7 @@ const DeviceContext = struct {
     fn loopPrepare(self: *@This()) void {
         const local_t = struct {
             arena: std.heap.ArenaAllocator,
-            /// reference ownership
+            /// reference, not OWNING
             self: *DeviceContext,
 
             const Observer = PackObserverList.Observer;
@@ -892,7 +902,7 @@ const DeviceContext = struct {
             // an action being two part (functions)
             // first `*_send` should be call to push
             // the request to the device
-            // then the subject will call `*_on_data` when
+            // then the observable will call `*_on_data` when
             // when the message is received
             //
             // other action could be executed in `*_on_data`,
@@ -937,7 +947,7 @@ const DeviceContext = struct {
                         .err(e)
                         .string("what", "failed to parse status")
                         .log();
-                    cap.deinit();
+                    obs.dtor = @ptrCast(&Capture.deinit);
                 }
                 sbj.unsubscribe(obs) catch unreachable;
             }
@@ -981,7 +991,7 @@ const DeviceContext = struct {
                         .err(e)
                         .string("what", "failed to parse system info")
                         .log();
-                    cap.deinit();
+                    obs.dtor = @ptrCast(&Capture.deinit);
                 }
                 sbj.unsubscribe(obs) catch unreachable;
             }
@@ -1014,6 +1024,19 @@ const DeviceContext = struct {
                 try cap.query_common_slice(req, buf);
             }
 
+            pub fn open_socket_send(cap: *@This()) !void {
+                try cap.try_socket_open();
+                var subject = cap.self.rxObservable();
+                const req = comptime bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
+                const predicate = Capture.make_reqid_predicate(req);
+                subject.subscribe(
+                    &predicate,
+                    &Capture.open_socket_on_data,
+                    cap,
+                    null,
+                ) catch unreachable;
+            }
+
             pub fn open_socket_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
                 // if we must handle these shit
                 // we'd better make a state machine
@@ -1044,26 +1067,16 @@ const DeviceContext = struct {
                 obs.dtor = @ptrCast(&Capture.deinit);
                 sbj.unsubscribe(obs) catch unreachable;
             }
-
-            pub fn open_socket_send(cap: *@This()) !void {
-                try cap.try_socket_open();
-                var subject = cap.self.rxObservable();
-                const req = comptime bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
-                const predicate = Capture.make_reqid_predicate(req);
-                subject.subscribe(
-                    &predicate,
-                    &Capture.open_socket_on_data,
-                    cap,
-                    null,
-                ) catch unreachable;
-            }
         };
 
-        // first, we start the loop thread, for the subject
+        // first, we start the loop thread,
+        // for the running of observable
         self.initThreads();
         var local = local_t.init(self.allocator(), self) catch unreachable;
 
-        // we only needs a little push to the chain
+        // it's quite hard to design a promise chain without lambda/closure.
+        //
+        // we only needs a little push to start the chain
         // query_status.than(query_info).than(open_socket)
         local.query_status_send() catch unreachable;
         utils.logWithSrc(self.withLogger(logz.info()), @src())
@@ -1415,9 +1428,9 @@ pub fn printEndpoints(vid: u16, pid: u16, endpoints: []const Endpoint) void {
 // needs to be done.
 const TransferCallback = struct {
     alloc: std.mem.Allocator,
-    /// reference, not OWNED
+    /// reference, not OWNING
     dev: *DeviceContext,
-    /// reference, not OWNED
+    /// reference, not OWNING
     transfer: *DeviceContext.Transfer,
     endpoint: Endpoint,
 

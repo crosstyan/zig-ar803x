@@ -146,24 +146,24 @@ const PackObserverList = struct {
     }
 
     /// dispatch the packet to the observers
-    pub fn update(self: *@This(), managed_pack: *const ManagedUsbPack) void {
+    pub fn update(self: *@This(), pack: *const UsbPack) void {
         self.lock.lock();
         defer self.lock.unlock();
 
         var cnt: usize = 0;
         for (self.list.items) |*o| {
-            if (o.predicate(&managed_pack.pack, o.userdata)) {
-                o.on_data(self, &managed_pack.pack, o);
+            if (o.predicate(pack, o.userdata)) {
+                o.on_data(self, pack, o);
                 cnt += 1;
             }
         }
 
         if (cnt == 0) {
             var lg = logz.warn()
-                .int("reqid", managed_pack.pack.reqid)
-                .int("sta", managed_pack.pack.sta)
+                .int("reqid", pack.reqid)
+                .int("sta", pack.sta)
                 .string("what", "no observer is notified");
-            if (managed_pack.pack.data()) |data| {
+            if (pack.data()) |data| {
                 lg = lg.int("len", data.len)
                     .fmt("content", "{s}", .{std.fmt.fmtSliceHexLower(data)});
             } else |_| {}
@@ -736,7 +736,7 @@ const DeviceContext = struct {
             };
             defer mpk.deinit();
             var queue = &self.arto.rx_observable;
-            queue.update(&mpk);
+            queue.update(&mpk.pack);
         }
     }
 

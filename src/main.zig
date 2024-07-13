@@ -63,8 +63,8 @@ const ObserverError = error{
 };
 
 const PackObserverList = struct {
-    pub const OnDataFnPtr = *const fn (*PackObserverList, *const ManagedUsbPack, *Observer) void;
-    pub const PredicateFnPtr = *const fn (*const ManagedUsbPack, ?*anyopaque) bool;
+    pub const OnDataFnPtr = *const fn (*PackObserverList, *const UsbPack, *Observer) void;
+    pub const PredicateFnPtr = *const fn (*const UsbPack, ?*anyopaque) bool;
     pub const NullableDtorPtr = ?*const fn (*anyopaque) void;
 
     // Observer provider could use
@@ -156,12 +156,12 @@ const PackObserverList = struct {
         self.list.append(obs) catch @panic("OOM");
     }
 
-    pub fn notifyObservers(self: *@This(), pack: *const ManagedUsbPack) void {
+    pub fn notifyObservers(self: *@This(), managed_pack: *const ManagedUsbPack) void {
         self.lock.lock();
         defer self.lock.unlock();
         for (self.list.items) |*o| {
-            if (o.predicate(pack, o.userdata)) {
-                o.on_data(self, pack, o);
+            if (o.predicate(&managed_pack.pack, o.userdata)) {
+                o.on_data(self, &managed_pack.pack, o);
             }
         }
     }
@@ -861,8 +861,8 @@ const DeviceContext = struct {
                 };
                 try cap.query_common(bb.BB_GET_STATUS, &in);
                 const predicate = (struct {
-                    pub fn call(mpk: *const ManagedUsbPack, _: ?*anyopaque) bool {
-                        return mpk.pack.reqid == bb.BB_GET_STATUS;
+                    pub fn call(pack: *const UsbPack, _: ?*anyopaque) bool {
+                        return pack.reqid == bb.BB_GET_STATUS;
                     }
                 }).call;
                 var obs_list = cap.self.observable();
@@ -874,7 +874,7 @@ const DeviceContext = struct {
                 ) catch @panic("OOM");
             }
 
-            pub fn query_status_on_data(obs_list: *PackObserverList, pack: *const ManagedUsbPack, obs: *PackObserverList.Observer) void {
+            pub fn query_status_on_data(obs_list: *PackObserverList, pack: *const UsbPack, obs: *PackObserverList.Observer) void {
                 const ud = obs.userdata;
                 var cap: *Capture = @alignCast(@ptrCast(ud.?));
                 const status_ = pack.dataAs(bb.bb_get_status_out_t);

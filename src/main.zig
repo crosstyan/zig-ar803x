@@ -63,14 +63,18 @@ const ObserverError = error{
 };
 
 const PackObserverList = struct {
+    pub const OnDataFnPtr = *const fn (*PackObserverList, *const ManagedUsbPack, ?*anyopaque) void;
+    pub const PredicateFnPtr = *const fn (*const ManagedUsbPack, ?*anyopaque) bool;
+    pub const OptDtorPtr = ?*const fn (*anyopaque) void;
+
     // Observer provider could use
     // reference counting in dtor
     const Observer = struct {
-        predicate: *const fn (*const ManagedUsbPack, ?*anyopaque) bool,
+        predicate: PredicateFnPtr,
         /// the callback function SHOULD NOT block, and SHOULD NOT deinit the pack
-        on_data: *const fn (*PackObserverList, *const ManagedUsbPack, ?*anyopaque) void,
+        on_data: OnDataFnPtr,
         userdata: ?*anyopaque,
-        dtor: ?*const fn (*anyopaque) void,
+        dtor: OptDtorPtr,
 
         /// hashing the pointer, don't ask me why it's useful
         pub fn xxhash(self: *const @This()) u32 {
@@ -118,10 +122,10 @@ const PackObserverList = struct {
 
     pub fn subscribe(
         self: *@This(),
-        predicate: *const fn (*const ManagedUsbPack, ?*anyopaque) bool,
-        on_data: *const fn (*PackObserverList, *const ManagedUsbPack, ?*anyopaque) void,
+        predicate: PredicateFnPtr,
+        on_data: OnDataFnPtr,
         userdata: ?*anyopaque,
-        dtor: ?*const fn (*anyopaque) void,
+        dtor: OptDtorPtr,
     ) ObserverError!void {
         const obs = Observer{
             .predicate = predicate,
@@ -156,6 +160,7 @@ const PackObserverList = struct {
         }
     }
 
+    /// unsubscribe an observer by hash
     pub fn unsubscribe(self: *@This(), hash: u32) ObserverError!void {
         var idx: isize = -1;
         const len = self.list.items.len;
@@ -176,6 +181,17 @@ const PackObserverList = struct {
         var el = self.list.orderedRemove(@intCast(idx));
         self.lock.unlockShared();
         el.deinit();
+    }
+
+    /// unsubscribe all observers
+    pub fn unsubscribeAll(self: *@This()) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (self.list.items) |*o| {
+            o.deinit();
+        }
+        self.list.deinit();
+        self.list = std.ArrayList(Observer).init(self.allocator);
     }
 
     pub fn deinit(self: *@This()) void {
@@ -710,7 +726,10 @@ const DeviceContext = struct {
     ///
     /// Note that the consumer is responsible for freeing the memory
     /// by calling `deinit` after receiving a packet.
-    pub inline fn receive(self: *@This()) ClosedError!ManagedUsbPack {
+    ///
+    /// It's recommended to subscribe the observer to the `arto.obs_queue`, instead of
+    /// calling this function directly.
+    inline fn unsafeBlockReceive(self: *@This()) ClosedError!ManagedUsbPack {
         if (self.hasDeinit()) {
             return ClosedError.Closed;
         }
@@ -767,10 +786,7 @@ const DeviceContext = struct {
     /// doing status query before start forward loop,
     /// and it still NEEDS event loop running. Please call it in a separate thread.
     fn loopPrepare(self: *@This()) void {
-        const BUFFER_SIZE = 8192;
-        var stack_buf: [BUFFER_SIZE]u8 = undefined;
-        var fixed = std.heap.FixedBufferAllocator.init(stack_buf[0..]);
-        var arena = std.heap.ArenaAllocator.init(fixed.allocator());
+        var arena = std.heap.ArenaAllocator.init(self.allocator());
         defer arena.deinit();
         const stack_allocator = arena.allocator();
 
@@ -798,7 +814,7 @@ const DeviceContext = struct {
                 defer cap.stack_allocator.free(data);
                 try cap.self.transmit(data);
 
-                return try cap.self.receive();
+                return try cap.self.unsafeBlockReceive();
             }
 
             // like `query_common`, but with a slice payload
@@ -815,7 +831,7 @@ const DeviceContext = struct {
                 std.debug.print("data {s}\n", .{std.fmt.fmtSliceHexLower(data)});
                 try cap.self.transmit(data);
 
-                return try cap.self.receive();
+                return try cap.self.unsafeBlockReceive();
             }
 
             // query status
@@ -993,7 +1009,7 @@ const DeviceContext = struct {
     /// notify every observer in the queue
     pub fn recvLoop(self: *@This()) void {
         while (true) {
-            var mpk = self.receive() catch |e| {
+            var mpk = self.unsafeBlockReceive() catch |e| {
                 var lg = utils.logWithSrc(self.withLogger(logz.err()), @src());
                 lg.err(e)
                     .string("what", "failed to dequeue, exiting thread")

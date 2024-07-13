@@ -678,13 +678,13 @@ const DeviceContext = struct {
         // first, we start the loop thread,
         // for the running of observable
         self.initThreads();
-        var local = ActionCallback.init(self.allocator(), self) catch unreachable;
+        var action = ActionCallback.init(self.allocator(), self) catch unreachable;
 
         // it's quite hard to design a promise chain without lambda/closure.
         //
         // we only needs a little push to start the chain
         // query_status.than(query_info).than(open_socket)
-        local.query_status_send() catch unreachable;
+        action.query_status_send() catch unreachable;
         utils.logWithSrc(self.withLogger(logz.info()), @src())
             .string("what", "preparing finished").log();
     }
@@ -894,7 +894,7 @@ fn refreshDevList(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator,
 const ActionCallback = struct {
     arena: std.heap.ArenaAllocator,
     /// reference, not OWNING
-    self: *DeviceContext,
+    dev: *DeviceContext,
 
     const Observer = PackObserverList.Observer;
     const Self = @This();
@@ -903,19 +903,18 @@ const ActionCallback = struct {
         return @alignCast(@ptrCast(ud.?));
     }
 
-    pub fn init(alloc: std.mem.Allocator, ctx: *DeviceContext) !*Self {
+    pub fn init(alloc: std.mem.Allocator, dev: *DeviceContext) !*Self {
         var arena = std.heap.ArenaAllocator.init(alloc);
         var ret = try arena.allocator().create(@This());
         ret.arena = arena;
-        ret.self = ctx;
+        ret.dev = dev;
         return ret;
     }
 
     pub fn deinit(self: *@This()) void {
-        var stk_arena = self.arena;
-        stk_arena.allocator().destroy(self);
-        _ = stk_arena.reset(.free_all);
-        stk_arena.deinit();
+        var arena = self.arena;
+        _ = arena.reset(.free_all);
+        arena.deinit();
     }
 
     // payload should be a pointer to struct, or null
@@ -937,12 +936,12 @@ const ActionCallback = struct {
         }
         const data = try pack.marshal(alloc);
         defer alloc.free(data);
-        try self.self.transmit(data);
+        try self.dev.transmit(data);
     }
 
     // like `query_common`, but with a slice payload
-    pub fn query_common_slice(cap: *@This(), reqid: u32, payload: []const u8) !void {
-        var alloc = cap.arena.allocator();
+    pub fn query_common_slice(self: *@This(), reqid: u32, payload: []const u8) !void {
+        var alloc = self.arena.allocator();
         var pack = UsbPack{
             .reqid = reqid,
             .msgid = 0,
@@ -953,7 +952,7 @@ const ActionCallback = struct {
         const data = try pack.marshal(alloc);
         defer alloc.free(data);
         std.debug.print("data {s}\n", .{std.fmt.fmtSliceHexLower(data)});
-        try cap.self.transmit(data);
+        try self.dev.transmit(data);
     }
 
     // an action being two part (functions)
@@ -977,30 +976,30 @@ const ActionCallback = struct {
         }).call;
     }
 
-    pub fn query_status_send(cap: *@This()) !void {
+    pub fn query_status_send(self: *@This()) !void {
         var in = bb.bb_get_status_in_t{
             .user_bmp = SLOT_BIT_MAP_MAX,
         };
-        try cap.query_common(bb.BB_GET_STATUS, &in);
+        try self.query_common(bb.BB_GET_STATUS, &in);
         const predicate = Self.make_reqid_predicate(bb.BB_GET_STATUS);
-        var subject = cap.self.rxObservable();
+        var subject = self.dev.rxObservable();
         subject.subscribe(
             &predicate,
             &Self.query_status_on_data,
-            cap,
+            self,
             null,
         ) catch unreachable;
     }
 
     pub fn query_status_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
         const ud = obs.userdata;
-        var cap = Self.as(ud);
+        var self = Self.as(ud);
         if (pack.dataAs(bb.bb_get_status_out_t)) |status| {
-            bt.logWithStatus(cap.self.withSrcLogger(logz.info(), @src()), &status).log();
+            bt.logWithStatus(self.dev.withSrcLogger(logz.info(), @src()), &status).log();
             // ***** and_then *****
-            cap.query_info_send() catch @panic("OOM");
+            self.query_info_send() catch @panic("OOM");
         } else |e| {
-            cap.self.withSrcLogger(logz.err(), @src())
+            self.dev.withSrcLogger(logz.err(), @src())
                 .err(e)
                 .string("what", "failed to parse status")
                 .log();
@@ -1009,14 +1008,14 @@ const ActionCallback = struct {
         sbj.unsubscribe(obs) catch unreachable;
     }
 
-    pub fn query_info_send(cap: *@This()) !void {
-        try cap.query_common(bb.BB_GET_SYS_INFO, null);
+    pub fn query_info_send(self: *@This()) !void {
+        try self.query_common(bb.BB_GET_SYS_INFO, null);
         const predicate = Self.make_reqid_predicate(bb.BB_GET_SYS_INFO);
-        var subject = cap.self.rxObservable();
+        var subject = self.dev.rxObservable();
         subject.subscribe(
             &predicate,
             &Self.query_info_on_data,
-            cap,
+            self,
             null,
         ) catch unreachable;
     }
@@ -1024,13 +1023,13 @@ const ActionCallback = struct {
     pub fn query_info_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
         std.debug.assert(pack.sta == 0);
         const ud = obs.userdata;
-        var cap = Self.as(ud);
+        var self = Self.as(ud);
         if (pack.dataAs(bb.bb_get_sys_info_out_t)) |info| {
             const compile_time: [*:0]const u8 = @ptrCast(&info.compile_time);
             const soft_ver: [*:0]const u8 = @ptrCast(&info.soft_ver);
             const hard_ver: [*:0]const u8 = @ptrCast(&info.hardware_ver);
             const firmware_ver: [*:0]const u8 = @ptrCast(&info.firmware_ver);
-            cap.self.withSrcLogger(logz.info(), @src())
+            self.dev.withSrcLogger(logz.info(), @src())
                 .int("uptime", info.uptime)
                 .stringSafeZ("compile_time", compile_time)
                 .stringSafeZ("soft_ver", soft_ver)
@@ -1038,13 +1037,13 @@ const ActionCallback = struct {
                 .stringSafeZ("firmware_ver", firmware_ver)
                 .log();
             // ***** and_then *****
-            cap.subscribe_event_no_response(.link_state) catch unreachable;
-            cap.subscribe_event_no_response(.mcs_change) catch unreachable;
-            cap.subscribe_event_no_response(.chan_change) catch unreachable;
+            self.subscribe_event_no_response(.link_state) catch unreachable;
+            self.subscribe_event_no_response(.mcs_change) catch unreachable;
+            self.subscribe_event_no_response(.chan_change) catch unreachable;
 
-            cap.open_socket_send() catch unreachable;
+            self.open_socket_send() catch unreachable;
         } else |e| {
-            cap.self.withSrcLogger(logz.err(), @src())
+            self.dev.withSrcLogger(logz.err(), @src())
                 .err(e)
                 .string("what", "failed to parse system info")
                 .log();
@@ -1056,9 +1055,9 @@ const ActionCallback = struct {
     /// subscribe an event, don't care if it's successful or not.
     /// I don't care the response.
     /// without closure it's become tedious.
-    pub fn subscribe_event_no_response(cap: *@This(), event: bt.Event) !void {
+    pub fn subscribe_event_no_response(self: *@This(), event: bt.Event) !void {
         const req = bt.subscribeRequestId(event);
-        try cap.query_common(req, null);
+        try self.query_common(req, null);
     }
 
     const sel_slot = bb.BB_SLOT_AP;
@@ -1069,7 +1068,7 @@ const ActionCallback = struct {
     const ERROR_UNKNOWN = -259;
     const OpenRequestId = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
 
-    fn try_socket_open(cap: *@This()) !void {
+    fn try_socket_open(self: *@This()) !void {
         const flag: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
         // see `session_socket.c:232`
         // TODO: create a wrapper struct
@@ -1078,17 +1077,17 @@ const ActionCallback = struct {
             0x00, 0x08, 0x00, 0x00, // 2048 in `bb.bb_sock_opt_t.tx_buf_size`
             0x00, 0x0c, 0x00, 0x00, // 3072 in `bb.bb_sock_opt_t.rx_buf_size`
         };
-        try cap.query_common_slice(OpenRequestId, buf);
+        try self.query_common_slice(OpenRequestId, buf);
     }
 
-    pub fn open_socket_send(cap: *@This()) !void {
-        try cap.try_socket_open();
-        var subject = cap.self.rxObservable();
+    pub fn open_socket_send(self: *@This()) !void {
+        try self.try_socket_open();
+        var subject = self.dev.rxObservable();
         const predicate = Self.make_reqid_predicate(OpenRequestId);
         subject.subscribe(
             &predicate,
             &Self.open_socket_on_data,
-            cap,
+            self,
             null,
         ) catch unreachable;
     }
@@ -1097,22 +1096,22 @@ const ActionCallback = struct {
         // if we must handle these shit
         // we'd better make a state machine
         const ud = obs.userdata;
-        var cap = Self.as(ud);
+        var self = Self.as(ud);
         if (pack.sta == 0) {
-            cap.self.withSrcLogger(logz.info(), @src())
+            self.dev.withSrcLogger(logz.info(), @src())
                 .int("slot", sel_slot)
                 .int("port", sel_port)
                 .string("what", "socket opened")
                 .log();
         } else if (pack.sta == ERROR_ALREADY_OPENED_SOCKET) {
             // leave it be
-            cap.self.withSrcLogger(logz.warn(), @src())
+            self.dev.withSrcLogger(logz.warn(), @src())
                 .int("slot", sel_slot)
                 .int("port", sel_port)
                 .string("what", "socket already opened")
                 .log();
         } else {
-            cap.self.withSrcLogger(logz.err(), @src())
+            self.dev.withSrcLogger(logz.err(), @src())
                 .int("slot", sel_slot)
                 .int("port", sel_port)
                 .int("sta", pack.sta)

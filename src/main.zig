@@ -87,8 +87,10 @@ const PackObserverList = struct {
                 const ud = @intFromPtr(ptr);
                 h.update(utils.anytype2Slice(&ud));
             }
-            const dtor_addr = @intFromPtr(self.dtor);
-            h.update(utils.anytype2Slice(&dtor_addr));
+            if (self.dtor) |dtor| {
+                const dtor_addr = @intFromPtr(dtor);
+                h.update(utils.anytype2Slice(&dtor_addr));
+            }
             return h.final();
         }
 
@@ -156,7 +158,8 @@ const PackObserverList = struct {
         try self.list.append(obs);
     }
 
-    pub fn notifyObservers(self: *@This(), managed_pack: *const ManagedUsbPack) void {
+    /// dispatch the packet to the observers
+    pub fn update(self: *@This(), managed_pack: *const ManagedUsbPack) void {
         self.lock.lock();
         defer self.lock.unlock();
 
@@ -1109,7 +1112,7 @@ const DeviceContext = struct {
             };
             defer mpk.deinit();
             var queue = &self.arto.rx_observable;
-            queue.notifyObservers(&mpk);
+            queue.update(&mpk);
         }
     }
 

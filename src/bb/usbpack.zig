@@ -29,7 +29,7 @@ pub const UsbPack = packed struct {
 
     const Self = @This();
     // usbpack 的固定长度
-    const fixedPackBase = 1 + 4 + 4 + 4 + 4 + 1 + 1;
+    pub const fixedPackBase = 1 + 4 + 4 + 4 + 4 + 1 + 1;
 
     /// data combines the `ptr` and `len` fields into a valid byte slice
     ///

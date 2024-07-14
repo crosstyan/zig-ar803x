@@ -56,7 +56,6 @@ const BB_SEL_PORT = 3;
 const BB_ERROR_ALREADY_OPENED_SOCKET = 257;
 const BB_ERROR_UNSPECIFIED = -259;
 // See `dev_dat_so_write_proc` in `sock_node.c`.
-// Everything seems magic to me
 const BB_SOCKET_SEND_OK: i32 = -0x106;
 const BB_SOCKET_SEND_NEED_UPDATE_ADDR: i32 = -0x107;
 const BB_SOCKET_SEND_ERROR: i32 = -0x108;
@@ -158,7 +157,8 @@ const PackObserverList = struct {
     /// subscribe an observable as an observer
     ///
     ///   - `predicate`: a function to determine whether the observer should be notified
-    ///   - `on_data`: the callback function when the observer is notified
+    ///   - `on_data`: the callback function when the observer is notified, could return `anyerror`
+    ///   - `on_error`: the callback function when `on_data` returns an error
     ///   - `userdata`: closure
     ///   - `dtor`: destructor for the closure, optional
     pub fn subscribe(
@@ -768,11 +768,17 @@ const DeviceContext = struct {
     /// write to the magical socket, requires an open socket
     pub fn transmitViaSocket(self: *@This(), payload: []const u8) !void {
         const alloc = self.allocator();
+        // FIXME: dirty hack to verify the pointer logic
+        const WritePointer = struct {
+            var position: u64 = 0;
+        };
         // TODO: find out why a 8-byte prepend is needed
         var list = std.ArrayList(u8).init(alloc);
         defer list.deinit();
         const prepend = try list.addManyAsSlice(8);
-        @memset(prepend, 0);
+        const position_slice = utils.anytype2Slice(&WritePointer.position);
+        @memcpy(prepend, position_slice);
+        WritePointer.position += payload.len;
         const payload_slice = try list.addManyAsSlice(payload.len);
         @memcpy(payload_slice, payload);
         const reqid = bt.socketRequestId(.write, BB_SEL_SLOT, BB_SEL_PORT);
@@ -1117,18 +1123,50 @@ const MagicSocketCallback = struct {
             @ptrCast(&Self.deinit),
         );
     }
+    /// the device will return two message on write
+    ///
+    /// first is the status of the write operation
+    /// (BB_SOCKET_SEND_OK/BB_SOCKET_SEND_ERROR/BB_SOCKET_SEND_NEED_UPDATE_ADDR)
+    /// whose payload is the same as the write request, i.e. position (u64) and
+    /// actual data
+    ///
+    /// second is the written length as `sta`, whose payload is the position of
+    /// pointer (u64) without actual data
+    ///
+    /// I'm not sure if there's any command to query the position of the pointer (why the position is needed?)
+    ///
+    /// `position` is the data have been written since the opening of the socket,
+    /// it acts like a pointer, which moves forward after each write operation.
+    /// The original code uses a ring-buffer to write the data, but I still don't see the necessity of
+    /// this field...
+    ///
+    /// btw I'm using a static variable to store the position in `transmitViaSocket`, which
+    /// increases after each write operation. (won't work if two devices are connected)
     pub fn write_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
         const ud = obs.userdata;
         var self = Self.as(ud);
         _ = sbj;
-        if (pack.sta != BB_STA_OK) {
-            self.dev.withSrcLogger(logz.err(), @src())
-                .fmt("what", "bad socket write slot {} port {}", .{ BB_SEL_SLOT, BB_SEL_PORT })
-                .int("sta", pack.sta).log();
-            return;
+        if (pack.sta >= 0) {
+            const len = pack.sta;
+            const txBuf = self.dev.xfer.tx_transfer.txBuf();
+            // pack header, pointer (u64), and actual data
+            std.debug.assert(len == (txBuf.len - 8 - UsbPack.fixedPackBase));
+            self.dev.withSrcLogger(logz.info(), @src())
+                .fmt("what", "written socket slot {} port {} len {}", .{ BB_SEL_SLOT, BB_SEL_PORT, len })
+                .log();
+        } else {
+            switch (pack.sta) {
+                BB_SOCKET_SEND_OK => {
+                    // do nothing
+                },
+                BB_SOCKET_SEND_NEED_UPDATE_ADDR => {
+                    // idk, do nothing for now
+                },
+                // TODO: find a way to recover from this error
+                BB_SOCKET_SEND_ERROR => std.debug.panic("failed to write to socket. sta={d}", .{pack.sta}),
+                else => std.debug.panic("unknown status from socket write. sta={d}", .{pack.sta}),
+            }
         }
-        self.dev.withSrcLogger(logz.debug(), @src())
-            .fmt("what", "written socket slot {} port {}", .{ BB_SEL_SLOT, BB_SEL_PORT }).log();
     }
 
     pub fn subscribe_read(self: *@This(), subject: *PackObserverList) !void {

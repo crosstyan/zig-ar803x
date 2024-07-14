@@ -61,6 +61,10 @@ const BB_SOCKET_SEND_NEED_UPDATE_ADDR: i32 = -0x107; // 强制更新写入地址
 const BB_SOCKET_SEND_ERROR: i32 = -0x108;
 // TODO: investigate reqid=0x05'00'00'01
 // looks like debug related packet
+const BB_REQID_DEBUG_ENABLE = 0x05000000;
+const BB_REQID_DEBUG_WRITE = 0x05000001;
+
+const is_log_content: bool = false;
 
 const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
     .thread_safe = true,
@@ -885,12 +889,17 @@ const DeviceContext = struct {
         // first, we start the loop thread,
         // for the running of observable
         self.initThreads();
-        var action = ActionCallback.init(self.allocator(), self) catch unreachable;
+
+        var debug_cb = MagicSocketCallback.init(self.allocator(), self) catch unreachable;
+        debug_cb.subscribe_debug() catch unreachable;
+        self.transmitWithPack(self.allocator(), BB_REQID_DEBUG_ENABLE, null) catch unreachable;
+        self.waitForTxComplete();
 
         // it's quite hard to design a promise chain without lambda/closure.
         //
         // we only needs a little push to start the chain
         // query_status.than(query_info).than(open_socket)
+        var action = ActionCallback.init(self.allocator(), self) catch unreachable;
         action.query_status_send() catch unreachable;
     }
 
@@ -1115,7 +1124,8 @@ const MagicSocketCallback = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn subscribe_write(self: *@This(), subject: *PackObserverList) !void {
+    pub fn subscribe_write(self: *@This()) !void {
+        const subject = self.dev.rxObservable();
         const predicate = ActionCallback.make_reqid_predicate(WriteSocketReqid);
         try subject.subscribe(
             &predicate,
@@ -1187,7 +1197,8 @@ const MagicSocketCallback = struct {
         }
     }
 
-    pub fn subscribe_read(self: *@This(), subject: *PackObserverList) !void {
+    pub fn subscribe_read(self: *@This()) !void {
+        const subject = self.dev.rxObservable();
         const predicate = ActionCallback.make_reqid_predicate(ReadSocketReqid);
         try subject.subscribe(
             &predicate,
@@ -1214,6 +1225,29 @@ const MagicSocketCallback = struct {
                 .fmt("what", "read socket slot {} port {}", .{ BB_SEL_SLOT, BB_SEL_PORT })
                 .string("data", data)
                 .log();
+        } else |_| {}
+    }
+
+    /// to enable debug mode one should write `BB_REQID_DEBUG_ENABLE` to the device
+    pub fn subscribe_debug(self: *@This()) !void {
+        const subject = self.dev.rxObservable();
+        const predicate = ActionCallback.make_reqid_predicate(BB_REQID_DEBUG_WRITE);
+        try subject.subscribe(
+            &predicate,
+            &Self.debug_on_data,
+            null,
+            self,
+            @ptrCast(&Self.deinit),
+        );
+    }
+    pub fn debug_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
+        const ud = obs.userdata;
+        const self = Self.as(ud);
+        _ = self;
+        _ = sbj;
+        std.debug.assert(pack.sta == BB_STA_OK);
+        if (pack.data()) |data| {
+            std.debug.print("{s}", .{data});
         } else |_| {}
     }
 };
@@ -1275,11 +1309,10 @@ const ActionCallback = struct {
 
     /// listen to the magic socket write/read by creating callbacks
     pub fn listen_to_socket(self: *@This()) !void {
-        const sbj = self.dev.rxObservable();
         var socket_cb_write = try MagicSocketCallback.init(self.dev.allocator(), self.dev);
         var socket_cb_read = try MagicSocketCallback.init(self.dev.allocator(), self.dev);
-        try socket_cb_write.subscribe_write(sbj);
-        try socket_cb_read.subscribe_read(sbj);
+        try socket_cb_write.subscribe_write();
+        try socket_cb_read.subscribe_read();
     }
 
     // an action being two part (functions)
@@ -1487,12 +1520,14 @@ const TransferCallback = struct {
         const tx_buf = self.transfer.txBuf();
         var lg = utils.logWithSrc(self.dev.withLogger(logz.debug()), @src());
         lg = self.endpoint.withLogger(lg);
-        lg.string("status", @tagName(status))
+        lg = lg.string("status", @tagName(status))
             .int("flags", trans.*.flags)
             .string("action", "transmit")
-            .int("len", tx_buf.len)
-            .fmt("content", "{s}", .{std.fmt.fmtSliceHexLower(tx_buf)})
-            .log();
+            .int("len", tx_buf.len);
+        if (is_log_content) {
+            lg = lg.fmt("content", "{s}", .{std.fmt.fmtSliceHexLower(tx_buf)});
+        }
+        lg.log();
         std.debug.assert(status == .completed);
         var sync = &self.dev.xfer.tx_sync;
         {
@@ -1516,12 +1551,14 @@ const TransferCallback = struct {
         self.transfer.lk.unlockShared();
         var lg = utils.logWithSrc(self.dev.withLogger(logz.debug()), @src());
         lg = self.endpoint.withLogger(lg);
-        lg.string("status", @tagName(status))
+        lg = lg.string("status", @tagName(status))
             .int("flags", trans.*.flags)
             .string("action", "receive")
-            .int("len", rx_buf.len)
-            .fmt("content", "{s}", .{std.fmt.fmtSliceHexLower(rx_buf)})
-            .log();
+            .int("len", rx_buf.len);
+        if (is_log_content) {
+            lg = lg.fmt("content", "{s}", .{std.fmt.fmtSliceHexLower(rx_buf)});
+        }
+        lg.log();
 
         if (rx_buf.len > 0) {
             var mpk_ = ManagedUsbPack.unmarshal(self.alloc, rx_buf);

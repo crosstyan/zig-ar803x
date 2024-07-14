@@ -375,11 +375,22 @@ const DeviceContext = struct {
         }
     };
 
-    const TxSync = struct { mutex: Mutex = Mutex{}, cv: Condition = Condition{} };
+    const TxSync = struct {
+        _is_free: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+        mutex: Mutex = Mutex{},
+        cv: Condition = Condition{},
 
-    /// Artosyn specific context.
-    /// like network, transfer, etc.
-    const ArtoContext = struct {
+        pub inline fn setFree(self: *@This(), free: bool) void {
+            self._is_free.store(free, std.builtin.AtomicOrder.unordered);
+        }
+
+        pub inline fn isFree(self: *const @This()) bool {
+            return self._is_free.load(std.builtin.AtomicOrder.unordered);
+        }
+    };
+
+    /// Transfer related context
+    const TransferContext = struct {
         tx_transfer: Transfer,
         rx_transfer: Transfer,
 
@@ -426,7 +437,7 @@ const DeviceContext = struct {
     port: u8,
     /// managed by `alloc`
     endpoints: []Endpoint,
-    arto: ArtoContext,
+    xfer: TransferContext,
 
     _ports_buf: [USB_MAX_PORTS]u8 = undefined,
     _ports_len: usize = 0,
@@ -508,7 +519,7 @@ const DeviceContext = struct {
             ._ports_buf = d._ports_buf,
             ._ports_len = d._ports_len,
             .endpoints = eps,
-            .arto = undefined,
+            .xfer = undefined,
         };
 
         if (sn.len > MAX_SERIAL_SIZE) {
@@ -522,17 +533,17 @@ const DeviceContext = struct {
         if (tx_transfer == null or rx_transfer == null) {
             std.debug.panic("device at bus {} port {} failed to allocate transfer, might be OOM", .{ d.bus, d.port });
         }
-        dc.arto.tx_transfer = Transfer{
+        dc.xfer.tx_transfer = Transfer{
             .self = tx_transfer,
         };
-        dc.arto.rx_transfer = Transfer{
+        dc.xfer.rx_transfer = Transfer{
             .self = rx_transfer,
         };
         // somehow the `rx_queue` is not happy with allocated with allocator in
         // the `DeviceContext`, which would cause a deadlock.
         // Interestingly, the deadlock is from the internal of GPA, needs to be
         // investigated further.
-        dc.arto.rx_queue = UsbPackQueue.init(alloc);
+        dc.xfer.rx_queue = UsbPackQueue.init(alloc);
         return dc;
     }
 
@@ -540,7 +551,7 @@ const DeviceContext = struct {
         self._has_deinit.store(true, std.builtin.AtomicOrder.unordered);
         self.core.deinit();
         self.allocator().free(self.endpoints);
-        self.arto.deinit();
+        self.xfer.deinit();
         const chk = self.gpa.deinit();
         if (chk != .ok) {
             std.debug.print("GPA thinks there are memory leaks when destroying device bus {} port {}\n", .{ self.bus, self.port });
@@ -580,7 +591,7 @@ const DeviceContext = struct {
     fn initTransferTx(self: *@This(), ep: *Endpoint) void {
         const alloc = self.allocator();
         var cb = alloc.create(TransferCallback) catch @panic("OOM");
-        var transfer: *Transfer = &self.arto.tx_transfer;
+        var transfer: *Transfer = &self.xfer.tx_transfer;
         cb.alloc = alloc;
         cb.dev = self;
         cb.transfer = transfer;
@@ -617,14 +628,15 @@ const DeviceContext = struct {
         if (self.hasDeinit()) {
             return ClosedError.Closed;
         }
-        const transfer = &self.arto.tx_transfer;
+        const transfer = &self.xfer.tx_transfer;
+        if (data.len > transfer.buf.len) {
+            return TransmitError.Overflow;
+        }
         const ok = transfer.lk.tryLockShared();
         if (!ok) {
             return TransmitError.Busy;
         }
-        if (data.len > transfer.buf.len) {
-            return TransmitError.Overflow;
-        }
+        errdefer transfer.lk.unlockShared();
         const target_slice = transfer.buf[0..data.len];
         @memcpy(target_slice, data);
         transfer.self.length = @intCast(data.len);
@@ -632,6 +644,7 @@ const DeviceContext = struct {
         if (ret != 0) {
             return libusb_error_2_set(ret);
         }
+        self.xfer.tx_sync.setFree(false);
     }
 
     /// receive message from the IN endpoint (RX transfer)
@@ -645,14 +658,31 @@ const DeviceContext = struct {
         if (self.hasDeinit()) {
             return ClosedError.Closed;
         }
-        return self.arto.rx_queue.dequeue();
+        return self.xfer.rx_queue.dequeue();
+    }
+
+    /// Wait for the completion of the TX transfer.
+    /// It will keeps blocking until the transfer is completed
+    pub fn waitForTxComplete(self: *@This()) void {
+        if (self.hasDeinit()) {
+            return;
+        }
+        var sync = &self.xfer.tx_sync;
+        if (sync.isFree()) {
+            return;
+        }
+        sync.mutex.lock();
+        defer sync.mutex.unlock();
+        while (!sync.isFree()) {
+            sync.cv.wait(&sync.mutex);
+        }
     }
 
     fn initTransferRx(self: *DeviceContext, ep: *Endpoint) void {
         var ret: c_int = undefined;
         const l_alloc = self.allocator();
         var cb = l_alloc.create(TransferCallback) catch @panic("OOM");
-        var transfer: *Transfer = &self.arto.rx_transfer;
+        var transfer: *Transfer = &self.xfer.rx_transfer;
         cb.alloc = l_alloc;
         cb.dev = self;
         cb.transfer = transfer;
@@ -686,7 +716,7 @@ const DeviceContext = struct {
     }
 
     pub fn rxObservable(self: *@This()) *PackObserverList {
-        return &self.arto.rx_observable;
+        return &self.xfer.rx_observable;
     }
 
     fn initEndpoints(self: *@This()) void {
@@ -734,9 +764,9 @@ const DeviceContext = struct {
         };
         const tx_thread = std.Thread.spawn(config, Self.sendLoop, .{self}) catch unreachable;
         const rx_thread = std.Thread.spawn(config, Self.recvLoop, .{self}) catch unreachable;
-        self.arto.tx_thread = tx_thread;
-        self.arto.rx_thread = rx_thread;
-        self.arto.rx_observable = PackObserverList.init(self.allocator());
+        self.xfer.tx_thread = tx_thread;
+        self.xfer.rx_thread = rx_thread;
+        self.xfer.rx_observable = PackObserverList.init(self.allocator());
     }
 
     /// basically do nothing... for now
@@ -761,7 +791,7 @@ const DeviceContext = struct {
                 return;
             };
             defer mpk.deinit();
-            var queue = &self.arto.rx_observable;
+            var queue = &self.xfer.rx_observable;
             queue.update(&mpk.pack);
         }
     }
@@ -1082,11 +1112,11 @@ const ActionCallback = struct {
 
         // TODO: get rid of the ugly sleep for synchronization (have to wait the transmission complete)
         try self.subscribe_event_no_response(.link_state);
-        std.time.sleep(1 * std.time.ns_per_ms);
+        self.dev.waitForTxComplete();
         try self.subscribe_event_no_response(.mcs_change);
-        std.time.sleep(1 * std.time.ns_per_ms);
+        self.dev.waitForTxComplete();
         try self.subscribe_event_no_response(.chan_change);
-        std.time.sleep(1 * std.time.ns_per_ms);
+        self.dev.waitForTxComplete();
         try self.open_socket_send();
 
         sbj.unsubscribe(obs) catch unreachable;
@@ -1207,6 +1237,13 @@ const TransferCallback = struct {
             .string("action", "transmit")
             .log();
         std.debug.assert(status == .completed);
+        var sync = &self.dev.xfer.tx_sync;
+        {
+            sync.mutex.lock();
+            defer sync.mutex.unlock();
+            sync.setFree(true);
+        }
+        sync.cv.signal();
     }
 
     /// basically it checks & unmarshal the packet received from the endpoint,
@@ -1235,7 +1272,7 @@ const TransferCallback = struct {
                 lg = self.endpoint.withLogger(lg);
                 mpk.pack.withLogger(lg)
                     .log();
-                self.dev.arto.rx_queue.enqueue(mpk.*) catch |e| {
+                self.dev.xfer.rx_queue.enqueue(mpk.*) catch |e| {
                     lg = utils.logWithSrc(self.dev.withLogger(logz.err()), @src());
                     lg.err(e).string("what", "failed to enqueue").log();
                     mpk.deinit();

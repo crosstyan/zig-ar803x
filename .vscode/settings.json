@@ -18,6 +18,7 @@
         "deinitialized",
         "DWORD",
         "errc",
+        "errdefer",
         "iface",
         "ifaces",
         "isize",
@@ -51,6 +52,7 @@
         "userdata",
         "usize",
         "WINAPI",
+        "xfer",
         "XXHASH"
     ]
 }

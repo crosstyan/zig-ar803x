@@ -3,6 +3,7 @@ const bb = @import("c.zig");
 const logz = @import("logz");
 const BadEnum = @import("../utils.zig").BadEnum;
 
+pub const STA_OK: c_int = 0;
 pub const SUBSCRIBE_REQ = 1;
 pub const SUBSCRIBE_REQ_RET = 2;
 pub const SUBSCRIBE_DAT_RET = 3;

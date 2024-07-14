@@ -11,6 +11,8 @@ const BadEnum = common.BadEnum;
 const LengthNotEqual = common.LengthNotEqual;
 const ClosedError = common.ClosedError;
 
+pub const LIBUSB_OK = usb.LIBUSB_SUCCESS;
+
 pub const LibUsbError = error{
     IO,
     InvalidParam,

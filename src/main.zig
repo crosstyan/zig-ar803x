@@ -41,8 +41,15 @@ const TRANSFER_BUF_SIZE = 2048;
 const DEFAULT_THREAD_STACK_SIZE = 16 * 1024 * 1024;
 const MAX_SERIAL_SIZE = 32;
 const REFRESH_CONTAINER_DEFAULT_CAP = 4;
+const BB_STA_OK = bt.STA_OK;
+const LIBUSB_OK = helper.LIBUSB_OK;
 
 /// A naive implementation of the observer pattern for `UsbPack`
+///
+/// See also
+///   - https://wiki.commonjs.org/wiki/Promises
+///   - https://promisesaplus.com/
+///   - https://reactivex.io/intro.html
 ///
 /// See also `UsbPack`
 const PackObserverList = struct {
@@ -50,9 +57,19 @@ const PackObserverList = struct {
         Existed,
         NotFound,
     };
-    pub const OnDataFnPtr = *const fn (*PackObserverList, *const UsbPack, *Observer) void;
-    pub const PredicateFnPtr = *const fn (*const UsbPack, ?*anyopaque) bool;
-    pub const NullableDtorPtr = ?*const fn (*anyopaque) void;
+
+    pub const OnDataFn = fn (*PackObserverList, *const UsbPack, *Observer) anyerror!void;
+    pub const OnDataFnPtr = *const OnDataFn;
+
+    pub const OnErrorFn = fn (*PackObserverList, *const UsbPack, *Observer, err: anyerror) void;
+    pub const OnErrorFnPtr = *const OnErrorFn;
+    pub const NullableOnErrorFnPtr = ?OnErrorFnPtr;
+
+    pub const PredicateFn = fn (*const UsbPack, ?*anyopaque) bool;
+    pub const PredicateFnPtr = *const PredicateFn;
+
+    pub const Dtor = fn (*anyopaque) void;
+    pub const NullableDtorPtr = ?*const Dtor;
 
     // Observer provider could use
     // reference counting in dtor
@@ -60,6 +77,7 @@ const PackObserverList = struct {
         predicate: PredicateFnPtr,
         /// the callback function SHOULD NOT block
         on_data: OnDataFnPtr,
+        on_error: NullableOnErrorFnPtr,
         userdata: ?*anyopaque,
         dtor: NullableDtorPtr,
 
@@ -70,6 +88,10 @@ const PackObserverList = struct {
             h.update(utils.anytype2Slice(&predicate_addr));
             const notify_addr = @intFromPtr(self.on_data);
             h.update(utils.anytype2Slice(&notify_addr));
+            if (self.on_error) |ptr| {
+                const on_error_addr = @intFromPtr(ptr);
+                h.update(utils.anytype2Slice(&on_error_addr));
+            }
             if (self.userdata) |ptr| {
                 const ud = @intFromPtr(ptr);
                 h.update(utils.anytype2Slice(&ud));
@@ -119,12 +141,14 @@ const PackObserverList = struct {
         self: *@This(),
         predicate: PredicateFnPtr,
         on_data: OnDataFnPtr,
+        on_error: NullableOnErrorFnPtr,
         userdata: ?*anyopaque,
         dtor: NullableDtorPtr,
     ) !void {
         const obs = Observer{
             .predicate = predicate,
             .on_data = on_data,
+            .on_error = on_error,
             .userdata = userdata,
             .dtor = dtor,
         };
@@ -153,21 +177,20 @@ const PackObserverList = struct {
         var cnt: usize = 0;
         for (self.list.items) |*o| {
             if (o.predicate(pack, o.userdata)) {
-                o.on_data(self, pack, o);
+                o.on_data(self, pack, o) catch |e| {
+                    if (o.on_error) |on_err| {
+                        on_err(self, pack, o, e);
+                    } else {
+                        const h = o.xxhash();
+                        pack.withLogger(logz.warn().fmt("what", "unhandled observer(0x{x:0>4}) error", .{h})).err(e).log();
+                    }
+                };
                 cnt += 1;
             }
         }
 
         if (cnt == 0) {
-            var lg = logz.warn()
-                .int("reqid", pack.reqid)
-                .int("sta", pack.sta)
-                .string("what", "no observer is notified");
-            if (pack.data()) |data| {
-                lg = lg.int("len", data.len)
-                    .fmt("content", "{s}", .{std.fmt.fmtSliceHexLower(data)});
-            } else |_| {}
-            lg.log();
+            pack.withLogger(logz.warn().string("what", "no observer is notified")).log();
         }
     }
 
@@ -747,7 +770,7 @@ const DeviceContext = struct {
         if (!is_windows) {
             // https://libusb.sourceforge.io/api-1.0/group__libusb__self.html#gac35b26fef01271eba65c60b2b3ce1cbf
             ret = usb.libusb_set_auto_detach_kernel_driver(self.mutHdl(), 1);
-            if (ret != 0) {
+            if (ret != LIBUSB_OK) {
                 self.withLogger(logz.err())
                     .int("code", ret)
                     .string("err", "failed to set auto detach kernel driver")
@@ -756,7 +779,7 @@ const DeviceContext = struct {
             }
         }
         ret = usb.libusb_claim_interface(self.mutHdl(), 0);
-        if (ret != 0) {
+        if (ret != LIBUSB_OK) {
             self.withLogger(logz.err())
                 .int("code", ret)
                 .string("err", "failed to claim interface")
@@ -955,6 +978,34 @@ const ActionCallback = struct {
         try self.dev.transmit(data);
     }
 
+    /// create a predicate that matches the request id
+    pub fn make_reqid_predicate(comptime reqid: u32) PackObserverList.PredicateFn {
+        return (struct {
+            pub fn call(pack: *const UsbPack, _: ?*anyopaque) bool {
+                return pack.reqid == reqid;
+            }
+        }).call;
+    }
+
+    /// make a generic short circuit error handler
+    ///
+    /// it will log the error and unsubscribe the observer, and than destroy the closure
+    pub fn make_generic_error_handler(comptime what: []const u8) PackObserverList.OnErrorFn {
+        return (struct {
+            pub fn call(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer, err: anyerror) void {
+                _ = pack;
+                const ud = obs.userdata;
+                var self = Self.as(ud);
+                self.dev.withSrcLogger(logz.err(), @src())
+                    .err(err)
+                    .string("what", what)
+                    .log();
+                obs.dtor = @ptrCast(&Self.deinit);
+                sbj.unsubscribe(obs) catch unreachable;
+            }
+        }).call;
+    }
+
     // an action being two part (functions)
     // first `*_send` should be call to push
     // the request to the device
@@ -967,15 +1018,6 @@ const ActionCallback = struct {
     // although it might confuse the reader,
     // as we don't have proper async/await support
 
-    /// create a predicate that matches the request id
-    pub fn make_reqid_predicate(comptime reqid: u32) fn (*const UsbPack, ?*anyopaque) bool {
-        return (struct {
-            pub fn call(pack: *const UsbPack, _: ?*anyopaque) bool {
-                return pack.reqid == reqid;
-            }
-        }).call;
-    }
-
     pub fn query_status_send(self: *@This()) !void {
         var in = bb.bb_get_status_in_t{
             .user_bmp = SLOT_BIT_MAP_MAX,
@@ -986,25 +1028,20 @@ const ActionCallback = struct {
         subject.subscribe(
             &predicate,
             &Self.query_status_on_data,
+            &Self.query_status_on_error,
             self,
             null,
         ) catch unreachable;
     }
-
-    pub fn query_status_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
+    pub const query_status_on_error = Self.make_generic_error_handler("failed to query status");
+    pub fn query_status_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
         const ud = obs.userdata;
         var self = Self.as(ud);
-        if (pack.dataAs(bb.bb_get_status_out_t)) |status| {
-            bt.logWithStatus(self.dev.withSrcLogger(logz.info(), @src()), &status).log();
-            // ***** and_then *****
-            self.query_info_send() catch @panic("OOM");
-        } else |e| {
-            self.dev.withSrcLogger(logz.err(), @src())
-                .err(e)
-                .string("what", "failed to parse status")
-                .log();
-            obs.dtor = @ptrCast(&Self.deinit);
-        }
+        const status = try pack.dataAs(bb.bb_get_status_out_t);
+        bt.logWithStatus(self.dev.withSrcLogger(logz.info(), @src()), &status).log();
+        // ***** and_then *****
+        try self.query_info_send();
+
         sbj.unsubscribe(obs) catch unreachable;
     }
 
@@ -1015,40 +1052,35 @@ const ActionCallback = struct {
         subject.subscribe(
             &predicate,
             &Self.query_info_on_data,
+            &Self.query_info_on_error,
             self,
             null,
         ) catch unreachable;
     }
-
-    pub fn query_info_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
-        std.debug.assert(pack.sta == 0);
+    pub const query_info_on_error = Self.make_generic_error_handler("failed to query info");
+    pub fn query_info_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
+        std.debug.assert(pack.sta == BB_STA_OK);
         const ud = obs.userdata;
         var self = Self.as(ud);
-        if (pack.dataAs(bb.bb_get_sys_info_out_t)) |info| {
-            const compile_time: [*:0]const u8 = @ptrCast(&info.compile_time);
-            const soft_ver: [*:0]const u8 = @ptrCast(&info.soft_ver);
-            const hard_ver: [*:0]const u8 = @ptrCast(&info.hardware_ver);
-            const firmware_ver: [*:0]const u8 = @ptrCast(&info.firmware_ver);
-            self.dev.withSrcLogger(logz.info(), @src())
-                .int("uptime", info.uptime)
-                .stringSafeZ("compile_time", compile_time)
-                .stringSafeZ("soft_ver", soft_ver)
-                .stringSafeZ("hard_ver", hard_ver)
-                .stringSafeZ("firmware_ver", firmware_ver)
-                .log();
-            // ***** and_then *****
-            self.subscribe_event_no_response(.link_state) catch unreachable;
-            self.subscribe_event_no_response(.mcs_change) catch unreachable;
-            self.subscribe_event_no_response(.chan_change) catch unreachable;
+        const info = try pack.dataAs(bb.bb_get_sys_info_out_t);
 
-            self.open_socket_send() catch unreachable;
-        } else |e| {
-            self.dev.withSrcLogger(logz.err(), @src())
-                .err(e)
-                .string("what", "failed to parse system info")
-                .log();
-            obs.dtor = @ptrCast(&Self.deinit);
-        }
+        const compile_time: [*:0]const u8 = @ptrCast(&info.compile_time);
+        const soft_ver: [*:0]const u8 = @ptrCast(&info.soft_ver);
+        const hard_ver: [*:0]const u8 = @ptrCast(&info.hardware_ver);
+        const firmware_ver: [*:0]const u8 = @ptrCast(&info.firmware_ver);
+        self.dev.withSrcLogger(logz.info(), @src())
+            .int("uptime", info.uptime)
+            .stringSafeZ("compile_time", compile_time)
+            .stringSafeZ("soft_ver", soft_ver)
+            .stringSafeZ("hard_ver", hard_ver)
+            .stringSafeZ("firmware_ver", firmware_ver)
+            .log();
+        // ***** and_then *****
+        try self.subscribe_event_no_response(.link_state);
+        try self.subscribe_event_no_response(.mcs_change);
+        try self.subscribe_event_no_response(.chan_change);
+        try self.open_socket_send();
+
         sbj.unsubscribe(obs) catch unreachable;
     }
 
@@ -1063,10 +1095,14 @@ const ActionCallback = struct {
     const sel_slot = bb.BB_SLOT_AP;
     const sel_port = 3;
     // note that sta == 0x0101 (i.e. 257) means already opened socket
-    const ERROR_ALREADY_OPENED_SOCKET = 257;
+    const BB_ERROR_ALREADY_OPENED_SOCKET = 257;
     // -259 is a generic error code, I have no idea what's the exact meaning
-    const ERROR_UNKNOWN = -259;
+    const BB_ERROR_Unspecified = -259;
     const OpenRequestId = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
+    const OpenSocketError = error{
+        AlreadyOpened,
+        Unspecified,
+    };
 
     fn try_socket_open(self: *@This()) !void {
         const flag: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
@@ -1087,37 +1123,28 @@ const ActionCallback = struct {
         subject.subscribe(
             &predicate,
             &Self.open_socket_on_data,
+            &Self.open_socket_on_error,
             self,
             null,
         ) catch unreachable;
     }
-
-    pub fn open_socket_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) void {
+    pub const open_socket_on_error = Self.make_generic_error_handler("failed to open socket");
+    pub fn open_socket_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) OpenSocketError!void {
         // if we must handle these shit
         // we'd better make a state machine
         const ud = obs.userdata;
         var self = Self.as(ud);
-        if (pack.sta == 0) {
-            self.dev.withSrcLogger(logz.info(), @src())
-                .int("slot", sel_slot)
-                .int("port", sel_port)
-                .string("what", "socket opened")
-                .log();
-        } else if (pack.sta == ERROR_ALREADY_OPENED_SOCKET) {
-            // leave it be
-            self.dev.withSrcLogger(logz.warn(), @src())
-                .int("slot", sel_slot)
-                .int("port", sel_port)
-                .string("what", "socket already opened")
-                .log();
-        } else {
-            self.dev.withSrcLogger(logz.err(), @src())
-                .int("slot", sel_slot)
-                .int("port", sel_port)
-                .int("sta", pack.sta)
-                .string("what", "failed to open socket")
-                .log();
-            std.debug.panic("failed to open socket, sta={d}", .{pack.sta});
+        switch (pack.sta) {
+            BB_STA_OK => {
+                self.dev.withSrcLogger(logz.info(), @src())
+                    .int("slot", sel_slot)
+                    .int("port", sel_port)
+                    .string("what", "socket opened")
+                    .log();
+            },
+            BB_ERROR_ALREADY_OPENED_SOCKET => return OpenSocketError.AlreadyOpened,
+            BB_ERROR_Unspecified => return OpenSocketError.Unspecified,
+            else => std.debug.panic("unexpected status {d}", .{pack.sta}),
         }
         obs.dtor = @ptrCast(&Self.deinit);
         sbj.unsubscribe(obs) catch unreachable;
@@ -1217,7 +1244,7 @@ const TransferCallback = struct {
 
         // resubmit
         const errc = usb.libusb_submit_transfer(trans);
-        if (errc == 0) {
+        if (errc == LIBUSB_OK) {
             self.transfer.lk.lockShared();
         } else {
             const err = libusb_error_2_set(errc);
@@ -1286,7 +1313,7 @@ pub fn main() !void {
     var ret: c_int = undefined;
     // https://libusb.sourceforge.io/api-1.0/libusb_contexts.html
     ret = usb.libusb_init_context(&ctx_, null, 0);
-    if (ret != 0) {
+    if (ret != LIBUSB_OK) {
         return std.debug.panic("libusb_init_context failed: {}", .{ret});
     }
     const ctx = ctx_.?;

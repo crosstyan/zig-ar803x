@@ -55,6 +55,11 @@ const BB_SEL_SLOT = bb.BB_SLOT_0;
 const BB_SEL_PORT = 3;
 const BB_ERROR_ALREADY_OPENED_SOCKET = 257;
 const BB_ERROR_UNSPECIFIED = -259;
+// See `dev_dat_so_write_proc` in `sock_node.c`.
+// Everything seems magic to me
+const BB_SOCKET_SEND_OK: i32 = -0x106;
+const BB_SOCKET_SEND_NEED_UPDATE_ADDR: i32 = -0x107;
+const BB_SOCKET_SEND_ERROR: i32 = -0x108;
 
 const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
     .thread_safe = true,
@@ -366,9 +371,16 @@ const DeviceContext = struct {
         _closure: ?*anyopaque = null,
         _closure_dtor: ?*const fn (*anyopaque) void = null,
 
-        /// ONLY used in RX transfer
-        pub inline fn written(self: *@This()) []const u8 {
+        /// ONLY used in RX transfer, use `actual_length`
+        /// as the length of slice
+        pub inline fn rxBuf(self: *@This()) []const u8 {
             return self.buf[0..@intCast(self.self.actual_length)];
+        }
+
+        /// ONLY used in TX transfer, use `length` as
+        /// the length of slice
+        pub inline fn txBuf(self: *@This()) []const u8 {
+            return self.buf[0..@intCast(self.self.length)];
         }
 
         pub inline fn setCallback(self: *@This(), cb: *anyopaque, destructor: *const fn (*anyopaque) void) void {
@@ -756,8 +768,15 @@ const DeviceContext = struct {
     /// write to the magical socket, requires an open socket
     pub fn transmitViaSocket(self: *@This(), payload: []const u8) !void {
         const alloc = self.allocator();
+        // TODO: find out why a 8-byte prepend is needed
+        var list = std.ArrayList(u8).init(alloc);
+        defer list.deinit();
+        const prepend = try list.addManyAsSlice(8);
+        @memset(prepend, 0);
+        const payload_slice = try list.addManyAsSlice(payload.len);
+        @memcpy(payload_slice, payload);
         const reqid = bt.socketRequestId(.write, BB_SEL_SLOT, BB_SEL_PORT);
-        return self.transmitSliceWithPack(alloc, reqid, payload);
+        return self.transmitSliceWithPack(alloc, reqid, list.items);
     }
 
     /// Wait for the completion of the TX transfer.
@@ -1409,11 +1428,14 @@ const TransferCallback = struct {
         self.transfer.lk.unlockShared();
         const status = transferStatusFromInt(trans.*.status) catch unreachable;
 
+        const tx_buf = self.transfer.txBuf();
         var lg = utils.logWithSrc(self.dev.withLogger(logz.debug()), @src());
         lg = self.endpoint.withLogger(lg);
         lg.string("status", @tagName(status))
             .int("flags", trans.*.flags)
             .string("action", "transmit")
+            .int("len", tx_buf.len)
+            .fmt("content", "{s}", .{std.fmt.fmtSliceHexLower(tx_buf)})
             .log();
         std.debug.assert(status == .completed);
         var sync = &self.dev.xfer.tx_sync;
@@ -1434,7 +1456,7 @@ const TransferCallback = struct {
         const self: *@This() = @alignCast(@ptrCast(trans.*.user_data.?));
         const status = transferStatusFromInt(trans.*.status) catch unreachable;
 
-        const rx_buf = self.transfer.written();
+        const rx_buf = self.transfer.rxBuf();
         self.transfer.lk.unlockShared();
         var lg = utils.logWithSrc(self.dev.withLogger(logz.debug()), @src());
         lg = self.endpoint.withLogger(lg);
@@ -1442,6 +1464,7 @@ const TransferCallback = struct {
             .int("flags", trans.*.flags)
             .string("action", "receive")
             .int("len", rx_buf.len)
+            .fmt("content", "{s}", .{std.fmt.fmtSliceHexLower(rx_buf)})
             .log();
 
         if (rx_buf.len > 0) {

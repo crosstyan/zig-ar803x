@@ -28,6 +28,7 @@
         "logfmt",
         "logz",
         "memcpy",
+        "memset",
         "mimo",
         "msgid",
         "orelse",

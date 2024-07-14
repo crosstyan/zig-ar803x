@@ -24,6 +24,3 @@ See [the Hacker News on it](https://news.ycombinator.com/item?id=40065821)
 
 - [marler8997/netpunch](https://github.com/marler8997/netpunch)
 - [unique type id in zig](https://zig.news/xq/cool-zig-patterns-type-identifier-3mfd)
-
-
-

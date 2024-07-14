@@ -182,7 +182,7 @@ const PackObserverList = struct {
                         on_err(self, pack, o, e);
                     } else {
                         const h = o.xxhash();
-                        pack.withLogger(logz.warn().fmt("what", "unhandled observer(0x{x:0>4}) error", .{h})).err(e).log();
+                        pack.withLogger(utils.logWithSrc(logz.warn(), @src()).fmt("what", "unhandled observer(0x{x:0>4}) error", .{h})).err(e).log();
                     }
                 };
                 cnt += 1;
@@ -190,7 +190,7 @@ const PackObserverList = struct {
         }
 
         if (cnt == 0) {
-            pack.withLogger(logz.warn().string("what", "no observer is notified")).log();
+            pack.withLogger(utils.logWithSrc(logz.warn(), @src())).string("what", "no observer is notified").log();
         }
     }
 
@@ -741,8 +741,6 @@ const DeviceContext = struct {
         // we only needs a little push to start the chain
         // query_status.than(query_info).than(open_socket)
         action.query_status_send() catch unreachable;
-        utils.logWithSrc(self.withLogger(logz.info()), @src())
-            .string("what", "preparing finished").log();
     }
 
     /// run `loopPrepare` in a separate thread
@@ -1007,7 +1005,6 @@ const ActionCallback = struct {
         pack.len = @intCast(payload.len);
         const data = try pack.marshal(alloc);
         defer alloc.free(data);
-        std.debug.print("data {s}\n", .{std.fmt.fmtSliceHexLower(data)});
         try self.dev.transmit(data);
     }
 
@@ -1108,9 +1105,10 @@ const ActionCallback = struct {
             .stringSafeZ("hard_ver", hard_ver)
             .stringSafeZ("firmware_ver", firmware_ver)
             .log();
-        // ***** and_then *****
 
-        // TODO: get rid of the ugly sleep for synchronization (have to wait the transmission complete)
+        sbj.unsubscribe(obs) catch unreachable;
+
+        // ***** and_then *****
         try self.subscribe_event_no_response(.link_state);
         self.dev.waitForTxComplete();
         try self.subscribe_event_no_response(.mcs_change);
@@ -1118,8 +1116,6 @@ const ActionCallback = struct {
         try self.subscribe_event_no_response(.chan_change);
         self.dev.waitForTxComplete();
         try self.open_socket_send();
-
-        sbj.unsubscribe(obs) catch unreachable;
     }
 
     /// subscribe an event, don't care if it's successful or not.

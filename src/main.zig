@@ -38,12 +38,16 @@ const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
 const XXHASH_SEED: u32 = 0x0;
 const USB_MAX_PORTS = 8;
-const TRANSFER_BUF_SIZE = 2048;
+const TRANSFER_BUF_SIZE = 3072;
 const DEFAULT_THREAD_STACK_SIZE = 16 * 1024 * 1024;
 const MAX_SERIAL_SIZE = 32;
 const REFRESH_CONTAINER_DEFAULT_CAP = 4;
 const BB_STA_OK = bt.STA_OK;
 const LIBUSB_OK = helper.LIBUSB_OK;
+const BB_SEL_SLOT = bb.BB_SLOT_0;
+const BB_SEL_PORT = 3;
+const BB_ERROR_ALREADY_OPENED_SOCKET = 257;
+const BB_ERROR_UNSPECIFIED = -259;
 
 /// A naive implementation of the observer pattern for `UsbPack`
 ///
@@ -336,6 +340,17 @@ const DeviceContext = struct {
     /// but with a closure and a closure destructor
     const Transfer = struct {
         self: *usb.libusb_transfer,
+        /// [Packets and overflows](https://libusb.sourceforge.io/api-1.0/libusb_packetoverflow.html)
+        ///
+        /// > libusb and the underlying OS abstract out the packet concept,
+        /// allowing you to request transfers of any size. Internally, the
+        /// request will be divided up into correctly-sized packets. You do not
+        /// have to be concerned with packet sizes, but there is one exception
+        /// when considering overflows.
+        ///
+        /// > You will never see an overflow if your transfer buffer size is a
+        /// multiple of the endpoint's packet size: the final packet will either
+        /// fill up completely or will be only partially filled.
         buf: [TRANSFER_BUF_SIZE]u8 = undefined,
 
         /// lock when `libusb_submit_transfer` is called.
@@ -643,6 +658,7 @@ const DeviceContext = struct {
         errdefer transfer.lk.unlockShared();
         const target_slice = transfer.buf[0..data.len];
         @memcpy(target_slice, data);
+        // `actual_length` is only useful for receiving data
         transfer.self.length = @intCast(data.len);
         const ret = usb.libusb_submit_transfer(transfer.self);
         if (ret != 0) {
@@ -1026,7 +1042,7 @@ const ActionCallback = struct {
     /// it will log the error and unsubscribe the observer, and than destroy the closure
     pub fn make_generic_error_handler(comptime what: []const u8) PackObserverList.OnErrorFn {
         return (struct {
-            pub fn genericErrorHandler(sbj: *PackObserverList, _: *const UsbPack, obs: *Observer, err: anyerror) void {
+            pub fn GenericErrorHandler(sbj: *PackObserverList, _: *const UsbPack, obs: *Observer, err: anyerror) void {
                 const ud = obs.userdata;
                 var self = Self.as(ud);
                 self.dev.withSrcLogger(logz.err(), @src())
@@ -1037,7 +1053,7 @@ const ActionCallback = struct {
                 obs.dtor = @ptrCast(&Self.deinit);
                 sbj.unsubscribe(obs) catch unreachable;
             }
-        }).genericErrorHandler;
+        }).GenericErrorHandler;
     }
 
     // an action being two part (functions)
@@ -1130,13 +1146,7 @@ const ActionCallback = struct {
         try self.dev.sendWithPack(self.arena.allocator(), req, null);
     }
 
-    const sel_slot = bb.BB_SLOT_AP;
-    const sel_port = 3;
-    // note that sta == 0x0101 (i.e. 257) means already opened socket
-    const BB_ERROR_ALREADY_OPENED_SOCKET = 257;
-    // -259 is a generic error code, I have no idea what's the exact meaning
-    const BB_ERROR_Unspecified = -259;
-    const OpenRequestId = bt.socketRequestId(.open, @intCast(sel_slot), @intCast(sel_port));
+    const OpenRequestId = bt.socketRequestId(.open, @intCast(BB_SEL_SLOT), @intCast(BB_SEL_PORT));
     const OpenSocketError = error{
         AlreadyOpened,
         Unspecified,
@@ -1175,13 +1185,13 @@ const ActionCallback = struct {
         switch (pack.sta) {
             BB_STA_OK => {
                 self.dev.withSrcLogger(logz.info(), @src())
-                    .int("slot", sel_slot)
-                    .int("port", sel_port)
+                    .int("slot", BB_SEL_SLOT)
+                    .int("port", BB_SEL_PORT)
                     .string("what", "socket opened")
                     .log();
             },
             BB_ERROR_ALREADY_OPENED_SOCKET => return OpenSocketError.AlreadyOpened,
-            BB_ERROR_Unspecified => return OpenSocketError.Unspecified,
+            BB_ERROR_UNSPECIFIED => return OpenSocketError.Unspecified,
             else => std.debug.panic("unexpected status {d}", .{pack.sta}),
         }
         obs.dtor = @ptrCast(&Self.deinit);
@@ -1315,10 +1325,10 @@ const TransferCallback = struct {
                 LibUsbError.Busy => {
                     // should not happen, unless the transfer is be reused,
                     // which should NOT happen with lock
-                    @panic("invalid precondition: busy transfer");
+                    std.debug.panic("failed to resubmit transfer: {}", .{err});
                 },
                 else => {
-                    @panic("failed to resubmit transfer");
+                    std.debug.panic("failed to resubmit transfer: {}", .{err});
                 },
             }
         }

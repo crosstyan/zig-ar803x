@@ -1247,7 +1247,8 @@ const MagicSocketCallback = struct {
         _ = sbj;
         std.debug.assert(pack.sta == BB_STA_OK);
         if (pack.data()) |data| {
-            std.debug.print("{s}", .{data});
+            const stdout = std.io.getStdOut();
+            try stdout.writer().print("{s}", .{data});
         } else |_| {}
     }
 };

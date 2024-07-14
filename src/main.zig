@@ -590,12 +590,13 @@ const DeviceContext = struct {
 
     fn initTransferTx(self: *@This(), ep: *Endpoint) void {
         const alloc = self.allocator();
-        var cb = alloc.create(TransferCallback) catch @panic("OOM");
         var transfer: *Transfer = &self.xfer.tx_transfer;
-        cb.alloc = alloc;
-        cb.dev = self;
-        cb.transfer = transfer;
-        cb.endpoint = ep.*;
+        const cb = TransferCallback.init(
+            alloc,
+            self,
+            transfer,
+            ep.*,
+        ) catch @panic("OOM");
         usb.libusb_fill_bulk_transfer(
             transfer.self,
             self.mutHdl(),
@@ -680,14 +681,14 @@ const DeviceContext = struct {
 
     fn initTransferRx(self: *DeviceContext, ep: *Endpoint) void {
         var ret: c_int = undefined;
-        const l_alloc = self.allocator();
-        var cb = l_alloc.create(TransferCallback) catch @panic("OOM");
+        const alloc = self.allocator();
         var transfer: *Transfer = &self.xfer.rx_transfer;
-        cb.alloc = l_alloc;
-        cb.dev = self;
-        cb.transfer = transfer;
-        cb.endpoint = ep.*;
-        // timeout 0
+        const cb = TransferCallback.init(
+            alloc,
+            self,
+            transfer,
+            ep.*,
+        ) catch @panic("OOM");
         // callback won't be called because of timeout
         usb.libusb_fill_bulk_transfer(
             transfer.self,
@@ -1205,6 +1206,16 @@ const TransferCallback = struct {
     /// reference, not OWNING
     transfer: *DeviceContext.Transfer,
     endpoint: Endpoint,
+    const Self = @This();
+
+    pub fn init(alloc: std.mem.Allocator, dev: *DeviceContext, transfer: *DeviceContext.Transfer, endpoint: Endpoint) !*Self {
+        var ret = try alloc.create(@This());
+        ret.alloc = alloc;
+        ret.dev = dev;
+        ret.transfer = transfer;
+        ret.endpoint = endpoint;
+        return ret;
+    }
 
     pub fn deinit(self: *@This()) void {
         self.alloc.destroy(self);

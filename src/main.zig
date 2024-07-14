@@ -625,6 +625,9 @@ const DeviceContext = struct {
     /// `TransmitError.Overflow` if the data is too large. (See `TRANSFER_BUF_SIZE`)
     ///
     /// use `arto.ctrl_queue` to receive the data coming from the device
+    ///
+    /// If you needs `UsbPack` to be sent, you should use `sendWithPack` or `sendSliceWithPack`,
+    /// instead of calling this function directly.
     pub fn transmit(self: *@This(), data: []const u8) !void {
         if (self.hasDeinit()) {
             return ClosedError.Closed;
@@ -646,6 +649,43 @@ const DeviceContext = struct {
             return libusb_error_2_set(ret);
         }
         self.xfer.tx_sync.setFree(false);
+    }
+
+    /// wrap `payload` into `UsbPack` and `transmit` it.
+    ///
+    /// `payload` should be a pointer to struct, or null
+    pub fn sendWithPack(self: *@This(), alloc: std.mem.Allocator, reqid: u32, payload: anytype) !void {
+        const P = @TypeOf(payload);
+        var pack = UsbPack{
+            .reqid = reqid,
+            .msgid = 0,
+            .sta = 0,
+        };
+        switch (@typeInfo(P)) {
+            .Pointer => {
+                try pack.fillWith(payload);
+            },
+            .Null => {}, // do nothing
+            else => @compileError("`payload` must be a pointer type or null, found `" ++ @typeName(P) ++ "`"),
+        }
+        const data = try pack.marshal(alloc);
+        defer alloc.free(data);
+        try self.transmit(data);
+    }
+
+    /// wrap `payload` into `UsbPack` and `transmit` it.
+    /// `payload` should be a slice.
+    pub fn sendSliceWithPack(self: *@This(), alloc: std.mem.Allocator, reqid: u32, payload: []const u8) !void {
+        var pack = UsbPack{
+            .reqid = reqid,
+            .msgid = 0,
+            .sta = 0,
+        };
+        pack.ptr = payload.ptr;
+        pack.len = @intCast(payload.len);
+        const data = try pack.marshal(alloc);
+        defer alloc.free(data);
+        try self.transmit(data);
     }
 
     /// receive message from the IN endpoint (RX transfer)
@@ -972,43 +1012,6 @@ const ActionCallback = struct {
         arena.deinit();
     }
 
-    /// payload should be a pointer to struct, or null
-    pub fn query_common(self: *@This(), reqid: u32, payload: anytype) !void {
-        var alloc = self.arena.allocator();
-        const P = @TypeOf(payload);
-
-        var pack = UsbPack{
-            .reqid = reqid,
-            .msgid = 0,
-            .sta = 0,
-        };
-        switch (@typeInfo(P)) {
-            .Pointer => {
-                try pack.fillWith(payload);
-            },
-            .Null => {}, // do nothing
-            else => @compileError("`payload` must be a pointer type or null, found `" ++ @typeName(P) ++ "`"),
-        }
-        const data = try pack.marshal(alloc);
-        defer alloc.free(data);
-        try self.dev.transmit(data);
-    }
-
-    /// like `query_common`, but with a slice payload
-    pub fn query_common_slice(self: *@This(), reqid: u32, payload: []const u8) !void {
-        var alloc = self.arena.allocator();
-        var pack = UsbPack{
-            .reqid = reqid,
-            .msgid = 0,
-            .sta = 0,
-        };
-        pack.ptr = payload.ptr;
-        pack.len = @intCast(payload.len);
-        const data = try pack.marshal(alloc);
-        defer alloc.free(data);
-        try self.dev.transmit(data);
-    }
-
     /// create a predicate that matches the request id
     pub fn make_reqid_predicate(comptime reqid: u32) PackObserverList.PredicateFn {
         return (struct {
@@ -1053,7 +1056,7 @@ const ActionCallback = struct {
         var in = bb.bb_get_status_in_t{
             .user_bmp = SLOT_BIT_MAP_MAX,
         };
-        try self.query_common(bb.BB_GET_STATUS, &in);
+        try self.dev.sendWithPack(self.arena.allocator(), bb.BB_GET_STATUS, &in);
         const predicate = Self.make_reqid_predicate(bb.BB_GET_STATUS);
         var subject = self.dev.rxObservable();
         subject.subscribe(
@@ -1077,7 +1080,7 @@ const ActionCallback = struct {
     }
 
     pub fn query_info_send(self: *@This()) !void {
-        try self.query_common(bb.BB_GET_SYS_INFO, null);
+        try self.dev.sendWithPack(self.arena.allocator(), bb.BB_GET_SYS_INFO, null);
         const predicate = Self.make_reqid_predicate(bb.BB_GET_SYS_INFO);
         var subject = self.dev.rxObservable();
         subject.subscribe(
@@ -1124,7 +1127,7 @@ const ActionCallback = struct {
     /// without closure it's become tedious.
     pub fn subscribe_event_no_response(self: *@This(), event: bt.Event) !void {
         const req = bt.subscribeRequestId(event);
-        try self.query_common(req, null);
+        try self.dev.sendWithPack(self.arena.allocator(), req, null);
     }
 
     const sel_slot = bb.BB_SLOT_AP;
@@ -1148,7 +1151,7 @@ const ActionCallback = struct {
             0x00, 0x08, 0x00, 0x00, // 2048 in `bb.bb_sock_opt_t.tx_buf_size`
             0x00, 0x0c, 0x00, 0x00, // 3072 in `bb.bb_sock_opt_t.rx_buf_size`
         };
-        try self.query_common_slice(OpenRequestId, buf);
+        try self.dev.sendSliceWithPack(self.arena.allocator(), OpenRequestId, buf);
     }
 
     pub fn open_socket_send(self: *@This()) !void {

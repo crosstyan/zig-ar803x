@@ -121,12 +121,12 @@ const PackObserverList = struct {
     allocator: std.mem.Allocator,
     /// WARNING: DO NOT access this field directly
     _list: std.ArrayList(Observer),
-    lock: RwLock = RwLock{},
+    lk: RwLock = RwLock{},
     // ******** end fields ********
 
     const Self = @This();
 
-    pub fn items(self: *const Self) []const Observer {
+    inline fn items(self: *const Self) []const Observer {
         return self._list.items;
     }
 
@@ -161,8 +161,8 @@ const PackObserverList = struct {
         const h = obs.xxhash();
 
         {
-            self.lock.lock();
-            defer self.lock.unlock();
+            self.lk.lock();
+            defer self.lk.unlock();
             for (self._list.items) |*o| {
                 if (o.xxhash() == h) {
                     return ObserverError.Existed;
@@ -170,8 +170,8 @@ const PackObserverList = struct {
             }
         }
 
-        self.lock.lockShared();
-        defer self.lock.unlockShared();
+        self.lk.lockShared();
+        defer self.lk.unlockShared();
         try self._list.append(obs);
     }
 
@@ -219,16 +219,16 @@ const PackObserverList = struct {
             return ObserverError.NotFound;
         }
 
-        self.lock.lockShared();
+        self.lk.lockShared();
         var el = self._list.swapRemove(@intCast(idx));
-        self.lock.unlockShared();
+        self.lk.unlockShared();
         el.deinit();
     }
 
     /// unsubscribe all observers
     pub fn unsubscribeAll(self: *@This()) void {
-        self.lock.lockShared();
-        defer self.lock.lockShared();
+        self.lk.lockShared();
+        defer self.lk.lockShared();
         for (self._list.items) |*o| {
             o.deinit();
         }
@@ -632,14 +632,13 @@ const DeviceContext = struct {
 
     /// transmit the data to tx endpoint
     ///
-    /// `init_transfer_tx` should be called before this
-    /// and the event loop should have started (you can't call this in the event
-    /// loop thread)
+    /// Tx transfer should be initialized (with `initTransferTx`) before calling this function.
+    /// libusb event loop should have been started.
     ///
     /// Note that the data will be copy to the internal buffer, and will return
     /// `TransmitError.Overflow` if the data is too large. (See `TRANSFER_BUF_SIZE`)
     ///
-    /// use `arto.ctrl_queue` to receive the data coming from the device
+    /// use `DeviceContext.unsafeBlockReceive` to receive the data coming from the device
     ///
     /// If you needs `UsbPack` to be sent, you should use `sendWithPack` or `sendSliceWithPack`,
     /// instead of calling this function directly.
@@ -668,8 +667,8 @@ const DeviceContext = struct {
     }
 
     /// wrap `payload` into `UsbPack` and `transmit` it.
-    ///
-    /// `payload` should be a pointer to struct, or null
+    /// `payload` should be a pointer to struct, or null.
+    /// Require `DeviceContext.transmit` could be called.
     pub fn sendWithPack(self: *@This(), alloc: std.mem.Allocator, reqid: u32, payload: anytype) !void {
         const P = @TypeOf(payload);
         var pack = UsbPack{
@@ -691,6 +690,7 @@ const DeviceContext = struct {
 
     /// wrap `payload` into `UsbPack` and `transmit` it.
     /// `payload` should be a slice.
+    /// Require `DeviceContext.transmit` could be called.
     pub fn sendSliceWithPack(self: *@This(), alloc: std.mem.Allocator, reqid: u32, payload: []const u8) !void {
         var pack = UsbPack{
             .reqid = reqid,
@@ -1016,7 +1016,7 @@ const ActionCallback = struct {
 
     pub fn init(alloc: std.mem.Allocator, dev: *DeviceContext) !*Self {
         var arena = std.heap.ArenaAllocator.init(alloc);
-        var ret = try arena.allocator().create(@This());
+        var ret = try arena.allocator().create(Self);
         ret.arena = arena;
         ret.dev = dev;
         return ret;

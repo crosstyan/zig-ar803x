@@ -10,7 +10,11 @@ pub const ClosedError = common.ClosedError;
 
 /// generate a unique number for a type `T`
 ///
-/// See https://zig.news/xq/cool-zig-patterns-type-identifier-3mfd
+/// See also
+///
+///   - https://zig.news/xq/cool-zig-patterns-type-identifier-3mfd
+///   - https://github.com/ziglang/zig/issues/19858
+///   - https://github.com/ziglang/zig/issues/5459
 pub fn typeId(comptime T: type) usize {
     // https://ziglang.org/documentation/0.13.0/#Static-Local-Variables
     // https://www.reddit.com/r/Zig/comments/ard50a/static_local_variables_in_zig/

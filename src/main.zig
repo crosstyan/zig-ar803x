@@ -14,6 +14,7 @@ const network = @import("network");
 const helper = @import("libusb_helper.zig");
 const Mutex = std.Thread.Mutex;
 const RwLock = std.Thread.RwLock;
+const Condition = std.Thread.Condition;
 
 const AppError = common.AppError;
 const BadEnum = common.BadEnum;
@@ -114,20 +115,21 @@ const PackObserverList = struct {
 
     // ******** fields ********
     allocator: std.mem.Allocator,
-    list: std.ArrayList(Observer),
+    /// WARNING: DO NOT access this field directly
+    _list: std.ArrayList(Observer),
     lock: RwLock = RwLock{},
     // ******** end fields ********
 
     const Self = @This();
 
     pub fn items(self: *const Self) []const Observer {
-        return self.list.items;
+        return self._list.items;
     }
 
     pub fn init(alloc: std.mem.Allocator) Self {
         return Self{
             .allocator = alloc,
-            .list = std.ArrayList(Observer).init(alloc),
+            ._list = std.ArrayList(Observer).init(alloc),
         };
     }
 
@@ -157,7 +159,7 @@ const PackObserverList = struct {
         {
             self.lock.lock();
             defer self.lock.unlock();
-            for (self.list.items) |*o| {
+            for (self._list.items) |*o| {
                 if (o.xxhash() == h) {
                     return ObserverError.Existed;
                 }
@@ -166,16 +168,14 @@ const PackObserverList = struct {
 
         self.lock.lockShared();
         defer self.lock.unlockShared();
-        try self.list.append(obs);
+        try self._list.append(obs);
     }
 
     /// dispatch the packet to the observers
     pub fn update(self: *@This(), pack: *const UsbPack) void {
-        self.lock.lock();
-        defer self.lock.unlock();
-
+        // explicit no lock here
         var cnt: usize = 0;
-        for (self.list.items) |*o| {
+        for (self._list.items) |*o| {
             if (o.predicate(pack, o.userdata)) {
                 o.on_data(self, pack, o) catch |e| {
                     if (o.on_error) |on_err| {
@@ -201,10 +201,10 @@ const PackObserverList = struct {
     /// unsubscribe an observer by hash
     pub fn unsubscribeByHash(self: *@This(), hash: u32) ObserverError!void {
         var idx: isize = -1;
-        const len = self.list.items.len;
+        const len = self._list.items.len;
 
         // explicit no lock here
-        for (self.list.items, 0..len) |*o, i| {
+        for (self._list.items, 0..len) |*o, i| {
             const h = o.xxhash();
             if (h == hash) {
                 idx = @intCast(i);
@@ -216,27 +216,27 @@ const PackObserverList = struct {
         }
 
         self.lock.lockShared();
-        var el = self.list.swapRemove(@intCast(idx));
+        var el = self._list.swapRemove(@intCast(idx));
         self.lock.unlockShared();
         el.deinit();
     }
 
     /// unsubscribe all observers
     pub fn unsubscribeAll(self: *@This()) void {
-        self.lock.lock();
-        defer self.lock.unlock();
-        for (self.list.items) |*o| {
+        self.lock.lockShared();
+        defer self.lock.lockShared();
+        for (self._list.items) |*o| {
             o.deinit();
         }
-        self.list.deinit();
-        self.list = std.ArrayList(Observer).init(self.allocator);
+        self._list.deinit();
+        self._list = std.ArrayList(Observer).init(self.allocator);
     }
 
     pub fn deinit(self: *@This()) void {
-        for (self.list.items) |*o| {
+        for (self._list.items) |*o| {
             o.deinit();
         }
-        self.list.deinit();
+        self._list.deinit();
     }
 };
 
@@ -375,11 +375,16 @@ const DeviceContext = struct {
         }
     };
 
+    const TxSync = struct { mutex: Mutex = Mutex{}, cv: Condition = Condition{} };
+
     /// Artosyn specific context.
     /// like network, transfer, etc.
     const ArtoContext = struct {
         tx_transfer: Transfer,
         rx_transfer: Transfer,
+
+        /// use to notify the completion of the transfer
+        tx_sync: TxSync,
         /// Note that the consumer should be responsible for
         /// RELEASING the packet after consuming it.
         rx_queue: UsbPackQueue,
@@ -627,8 +632,6 @@ const DeviceContext = struct {
         if (ret != 0) {
             return libusb_error_2_set(ret);
         }
-        var lg = utils.logWithSrc(self.withLogger(logz.debug()), @src());
-        lg.string("what", "submitted transmit").log();
     }
 
     /// receive message from the IN endpoint (RX transfer)
@@ -992,7 +995,7 @@ const ActionCallback = struct {
     /// it will log the error and unsubscribe the observer, and than destroy the closure
     pub fn make_generic_error_handler(comptime what: []const u8) PackObserverList.OnErrorFn {
         return (struct {
-            pub fn call(sbj: *PackObserverList, _: *const UsbPack, obs: *Observer, err: anyerror) void {
+            pub fn genericErrorHandler(sbj: *PackObserverList, _: *const UsbPack, obs: *Observer, err: anyerror) void {
                 const ud = obs.userdata;
                 var self = Self.as(ud);
                 self.dev.withSrcLogger(logz.err(), @src())
@@ -1003,7 +1006,7 @@ const ActionCallback = struct {
                 obs.dtor = @ptrCast(&Self.deinit);
                 sbj.unsubscribe(obs) catch unreachable;
             }
-        }).call;
+        }).genericErrorHandler;
     }
 
     // an action being two part (functions)
@@ -1076,9 +1079,14 @@ const ActionCallback = struct {
             .stringSafeZ("firmware_ver", firmware_ver)
             .log();
         // ***** and_then *****
+
+        // TODO: get rid of the ugly sleep for synchronization (have to wait the transmission complete)
         try self.subscribe_event_no_response(.link_state);
+        std.time.sleep(1 * std.time.ns_per_ms);
         try self.subscribe_event_no_response(.mcs_change);
+        std.time.sleep(1 * std.time.ns_per_ms);
         try self.subscribe_event_no_response(.chan_change);
+        std.time.sleep(1 * std.time.ns_per_ms);
         try self.open_socket_send();
 
         sbj.unsubscribe(obs) catch unreachable;

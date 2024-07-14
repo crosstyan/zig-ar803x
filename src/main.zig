@@ -34,6 +34,13 @@ const printStrDesc = helper.printStrDesc;
 const usbSpeedToString = helper.usbSpeedToString;
 const libusb_error_2_set = helper.libusb_error_2_set;
 
+const ArtoStatus = bt.Status;
+
+/// Select every possible slot (14 slot?).
+/// Anyway it's a magic number.
+///
+/// `0b0011_1111_1111_1111`
+const SLOT_BIT_MAP_MAX = 0x3fff;
 const ARTO_RTOS_VID: u16 = 0x1d6b;
 const ARTO_RTOS_PID: u16 = 0x8030;
 const XXHASH_SEED: u32 = 0x0;
@@ -48,6 +55,12 @@ const BB_SEL_SLOT = bb.BB_SLOT_0;
 const BB_SEL_PORT = 3;
 const BB_ERROR_ALREADY_OPENED_SOCKET = 257;
 const BB_ERROR_UNSPECIFIED = -259;
+
+const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
+    .thread_safe = true,
+});
+const UsbPackQueue = LockedQueue(ManagedUsbPack, 8);
+const is_windows = builtin.os.tag == .windows;
 
 /// A naive implementation of the observer pattern for `UsbPack`
 ///
@@ -204,7 +217,8 @@ const PackObserverList = struct {
 
     /// unsubscribe an observer by hash
     pub fn unsubscribeByHash(self: *@This(), hash: u32) ObserverError!void {
-        var idx: isize = -1;
+        const NOT_FOUND: isize = -1;
+        var idx: isize = NOT_FOUND;
         const len = self._list.items.len;
 
         // explicit no lock here
@@ -215,7 +229,7 @@ const PackObserverList = struct {
                 break;
             }
         }
-        if (idx == -1) {
+        if (idx == NOT_FOUND) {
             return ObserverError.NotFound;
         }
 
@@ -285,7 +299,7 @@ const DeviceDesc = struct {
         return ret;
     }
 
-    /// the same as calling `DeviceContext.from_device_desc`
+    /// the same as calling `DeviceContext.fromDeviceDesc`
     pub inline fn toContext(self: @This(), alloc: std.mem.Allocator) LibUsbError!DeviceContext {
         return DeviceContext.fromDeviceDesc(alloc, self);
     }
@@ -321,19 +335,6 @@ const DeviceHandles = struct {
         usb.libusb_close(self.hdl);
     }
 };
-
-/// Select every possible slot (14 slot?).
-/// Anyway it's a magic number.
-///
-/// `0b0011_1111_1111_1111`
-const SLOT_BIT_MAP_MAX = 0x3fff;
-const is_windows = builtin.os.tag == .windows;
-
-const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
-    .thread_safe = true,
-});
-
-const UsbPackQueue = LockedQueue(ManagedUsbPack, 8);
 
 const DeviceContext = struct {
     /// Transfer is a wrapper of `libusb_transfer`
@@ -442,6 +443,30 @@ const DeviceContext = struct {
         }
     };
 
+    const ArtoContext = struct {
+        const NEVER_UPDATED = 0;
+        _status: ArtoStatus = undefined,
+        /// seconds UNIX timestamp when the status is updated
+        _last_status_updated: i64 = NEVER_UPDATED,
+
+        pub inline fn status(self: *const @This()) ?*const ArtoStatus {
+            if (self._last_status_updated == NEVER_UPDATED) {
+                return null;
+            }
+            return &self._status;
+        }
+
+        pub inline fn setWithBBStatus(self: *@This(), new_bb_status: *const bb.bb_get_status_out_t) !void {
+            const new_status = try bt.Status.fromC(new_bb_status);
+            self.setStatus(&new_status);
+        }
+
+        pub inline fn setStatus(self: *@This(), new_status: *const ArtoStatus) void {
+            self._status = new_status.*;
+            self._last_status_updated = std.time.timestamp();
+        }
+    };
+
     const Self = @This();
 
     // ****** fields ******
@@ -453,6 +478,7 @@ const DeviceContext = struct {
     /// managed by `alloc`
     endpoints: []Endpoint,
     xfer: TransferContext,
+    arto: ArtoContext,
 
     _ports_buf: [USB_MAX_PORTS]u8 = undefined,
     _ports_len: usize = 0,
@@ -497,20 +523,33 @@ const DeviceContext = struct {
         return self._has_deinit.load(std.builtin.AtomicOrder.unordered);
     }
 
+    pub inline fn isTxReady(self: *const @This()) bool {
+        return self.xfer.tx_sync.isFree();
+    }
+
+    pub inline fn status(self: *const @This()) ?*const ArtoStatus {
+        return self.arto.status();
+    }
+
+    pub inline fn rxObservable(self: *@This()) *PackObserverList {
+        return &self.xfer.rx_observable;
+    }
+
     /// See `DeviceDesc`
     pub fn fromDeviceDesc(alloc: std.mem.Allocator, d: DeviceDesc) LibUsbError!@This() {
         var ret: c_int = undefined;
         var l_hdl: ?*usb.libusb_device_handle = null;
         // Internally, this function adds a reference
         ret = usb.libusb_open(d.dev, &l_hdl);
-        if (ret != 0 or l_hdl == null) {
+        if (ret != LIBUSB_OK) {
             const e = libusb_error_2_set(ret);
             d.withLogger(logz.err().string("err", "failed to open device").err(e)).log();
             return e;
         }
+        std.debug.assert(l_hdl != null);
         var l_desc: usb.libusb_device_descriptor = undefined;
         ret = usb.libusb_get_device_descriptor(d.dev, &l_desc);
-        if (ret != 0) {
+        if (ret != LIBUSB_OK) {
             const e = libusb_error_2_set(ret);
             d.withLogger(logz.err().err(e)).string("err", "failed to get device descriptor").log();
             return e;
@@ -535,19 +574,17 @@ const DeviceContext = struct {
             ._ports_len = d._ports_len,
             .endpoints = eps,
             .xfer = undefined,
+            .arto = ArtoContext{},
         };
 
-        if (sn.len > MAX_SERIAL_SIZE) {
-            std.debug.panic("unexpected serial number {s} (len={d}, max={d})", .{ sn, sn.len, MAX_SERIAL_SIZE });
-        }
+        std.debug.assert(sn.len <= MAX_SERIAL_SIZE);
         @memcpy(dc._serial_buf[0..sn.len], sn);
         dc._serial_len = sn.len;
 
         const tx_transfer = usb.libusb_alloc_transfer(0);
         const rx_transfer = usb.libusb_alloc_transfer(0);
-        if (tx_transfer == null or rx_transfer == null) {
-            std.debug.panic("device at bus {} port {} failed to allocate transfer, might be OOM", .{ d.bus, d.port });
-        }
+        std.debug.assert(tx_transfer != null);
+        std.debug.assert(rx_transfer != null);
         dc.xfer.tx_transfer = Transfer{
             .self = tx_transfer,
         };
@@ -560,6 +597,38 @@ const DeviceContext = struct {
         // investigated further.
         dc.xfer.rx_queue = UsbPackQueue.init(alloc);
         return dc;
+    }
+
+    pub fn initialize(self: *@This()) LibUsbError!void {
+        var ret: c_int = undefined;
+        printStrDesc(self.mutHdl(), self.desc());
+        printEndpoints(self.desc().idVendor, self.desc().idProduct, self.endpoints);
+        if (!is_windows) {
+            // https://libusb.sourceforge.io/api-1.0/group__libusb__self.html#gac35b26fef01271eba65c60b2b3ce1cbf
+            ret = usb.libusb_set_auto_detach_kernel_driver(self.mutHdl(), 1);
+            if (ret != LIBUSB_OK) {
+                self.withLogger(logz.err())
+                    .int("code", ret)
+                    .string("err", "failed to set auto detach kernel driver")
+                    .log();
+                return libusb_error_2_set(ret);
+            }
+        }
+        ret = usb.libusb_claim_interface(self.mutHdl(), 0);
+        if (ret != LIBUSB_OK) {
+            self.withLogger(logz.err())
+                .int("code", ret)
+                .string("err", "failed to claim interface")
+                .log();
+            return libusb_error_2_set(ret);
+        }
+        self.initEndpoints();
+        self._has_deinit.store(false, std.builtin.AtomicOrder.unordered);
+        // we could call transmit/receive from now on, as long as the event loop is running
+
+        self.runLoopPrepare();
+        const speed = usb.libusb_get_device_speed(self.mutDev());
+        self.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
     }
 
     pub fn deinit(self: *Self) void {
@@ -576,16 +645,16 @@ const DeviceContext = struct {
     /// attach the device information to the logger
     pub inline fn withLogger(self: *const Self, logger: logz.Logger) logz.Logger {
         const s = self.serial();
+        var lg = logger;
         if (s.len != 0) {
-            return logger
-                .string("serial_number", s)
-                .int("bus", self.bus)
-                .int("port", self.port);
-        } else {
-            return logger
-                .int("bus", self.bus)
-                .int("port", self.port);
+            lg = lg.string("serial_number", s);
         }
+        if (self.status()) |sta| {
+            lg = lg.string("role", @tagName(sta.role));
+        }
+        lg = lg.int("bus", self.bus)
+            .int("port", self.port);
+        return lg;
     }
 
     pub inline fn withSrcLogger(self: *const Self, logger: logz.Logger, src: std.builtin.SourceLocation) logz.Logger {
@@ -601,6 +670,125 @@ const DeviceContext = struct {
         h.update(utils.anytype2Slice(&self.port));
         h.update(self.ports());
         return h.final();
+    }
+
+    pub const TransmitError = error{
+        Overflow,
+        Busy,
+    };
+
+    /// transmit the data to tx endpoint
+    ///
+    /// Tx transfer should be initialized (with `initTransferTx`) before calling this function.
+    /// libusb event loop should have been started.
+    ///
+    /// Note that the data will be copy to the internal buffer, and will return
+    /// `TransmitError.Overflow` if the data is too large. (See `TRANSFER_BUF_SIZE`)
+    ///
+    /// use `DeviceContext.unsafeBlockReceive` to receive the data coming from the device
+    ///
+    /// If you needs `UsbPack` to be sent, you should use `transmitWithPack` or `transmitSliceWithPack`,
+    /// instead of calling this function directly.
+    ///
+    /// TODO: use a ring buffer to provide a queued transmit (useful for burst data)
+    pub fn transmit(self: *@This(), data: []const u8) !void {
+        if (self.hasDeinit()) {
+            return ClosedError.Closed;
+        }
+        const transfer = &self.xfer.tx_transfer;
+        if (data.len > transfer.buf.len) {
+            return TransmitError.Overflow;
+        }
+        const ok = transfer.lk.tryLockShared();
+        if (!ok) {
+            return TransmitError.Busy;
+        }
+        errdefer transfer.lk.unlockShared();
+        const target_slice = transfer.buf[0..data.len];
+        @memcpy(target_slice, data);
+        // `actual_length` is only useful for receiving data
+        transfer.self.length = @intCast(data.len);
+        const ret = usb.libusb_submit_transfer(transfer.self);
+        if (ret != LIBUSB_OK) {
+            return libusb_error_2_set(ret);
+        }
+        self.xfer.tx_sync.setFree(false);
+    }
+
+    /// wrap `payload` into `UsbPack` and `transmit` it.
+    /// `payload` should be a pointer to struct, or null.
+    /// Require `DeviceContext.transmit` could be called.
+    pub fn transmitWithPack(self: *@This(), alloc: std.mem.Allocator, reqid: u32, payload: anytype) !void {
+        const P = @TypeOf(payload);
+        var pack = UsbPack{
+            .reqid = reqid,
+            .msgid = 0,
+            .sta = 0,
+        };
+        switch (@typeInfo(P)) {
+            .Pointer => {
+                try pack.fillWith(payload);
+            },
+            .Null => {}, // do nothing
+            else => @compileError("`payload` must be a pointer type or null, found `" ++ @typeName(P) ++ "`"),
+        }
+        const data = try pack.marshal(alloc);
+        defer alloc.free(data);
+        try self.transmit(data);
+    }
+
+    /// wrap `payload` into `UsbPack` and `transmit` it.
+    /// `payload` should be a slice.
+    /// Require `DeviceContext.transmit` could be called.
+    pub fn transmitSliceWithPack(self: *@This(), alloc: std.mem.Allocator, reqid: u32, payload: []const u8) !void {
+        var pack = UsbPack{
+            .reqid = reqid,
+            .msgid = 0,
+            .sta = 0,
+        };
+        pack.ptr = payload.ptr;
+        pack.len = @intCast(payload.len);
+        const data = try pack.marshal(alloc);
+        defer alloc.free(data);
+        try self.transmit(data);
+    }
+
+    /// write to the magical socket, requires an open socket
+    pub fn transmitViaSocket(self: *@This(), payload: []const u8) !void {
+        const alloc = self.allocator();
+        const reqid = bt.socketRequestId(.write, BB_SEL_SLOT, BB_SEL_PORT);
+        return self.transmitSliceWithPack(alloc, reqid, payload);
+    }
+
+    /// Wait for the completion of the TX transfer.
+    /// It will keeps blocking until the transfer is completed
+    pub fn waitForTxComplete(self: *@This()) void {
+        if (self.hasDeinit()) {
+            return;
+        }
+        var sync = &self.xfer.tx_sync;
+        if (sync.isFree()) {
+            return;
+        }
+        sync.mutex.lock();
+        defer sync.mutex.unlock();
+        while (!sync.isFree()) {
+            sync.cv.wait(&sync.mutex);
+        }
+    }
+
+    /// receive message from the IN endpoint (RX transfer)
+    ///
+    /// Note that the consumer is responsible for freeing the memory
+    /// by calling `deinit` after receiving a packet.
+    ///
+    /// It's recommended to subscribe the observer to the `arto.obs_queue`, instead of
+    /// calling this function directly.
+    inline fn unsafeBlockReceive(self: *@This()) ClosedError!ManagedUsbPack {
+        if (self.hasDeinit()) {
+            return ClosedError.Closed;
+        }
+        return self.xfer.rx_queue.dequeue();
     }
 
     fn initTransferTx(self: *@This(), ep: *Endpoint) void {
@@ -623,116 +811,6 @@ const DeviceContext = struct {
             100,
         );
         transfer.setCallback(cb, TransferCallback.dtorPtrTypeErased());
-    }
-
-    pub const TransmitError = error{
-        Overflow,
-        Busy,
-    };
-
-    /// transmit the data to tx endpoint
-    ///
-    /// Tx transfer should be initialized (with `initTransferTx`) before calling this function.
-    /// libusb event loop should have been started.
-    ///
-    /// Note that the data will be copy to the internal buffer, and will return
-    /// `TransmitError.Overflow` if the data is too large. (See `TRANSFER_BUF_SIZE`)
-    ///
-    /// use `DeviceContext.unsafeBlockReceive` to receive the data coming from the device
-    ///
-    /// If you needs `UsbPack` to be sent, you should use `sendWithPack` or `sendSliceWithPack`,
-    /// instead of calling this function directly.
-    pub fn transmit(self: *@This(), data: []const u8) !void {
-        if (self.hasDeinit()) {
-            return ClosedError.Closed;
-        }
-        const transfer = &self.xfer.tx_transfer;
-        if (data.len > transfer.buf.len) {
-            return TransmitError.Overflow;
-        }
-        const ok = transfer.lk.tryLockShared();
-        if (!ok) {
-            return TransmitError.Busy;
-        }
-        errdefer transfer.lk.unlockShared();
-        const target_slice = transfer.buf[0..data.len];
-        @memcpy(target_slice, data);
-        // `actual_length` is only useful for receiving data
-        transfer.self.length = @intCast(data.len);
-        const ret = usb.libusb_submit_transfer(transfer.self);
-        if (ret != 0) {
-            return libusb_error_2_set(ret);
-        }
-        self.xfer.tx_sync.setFree(false);
-    }
-
-    /// wrap `payload` into `UsbPack` and `transmit` it.
-    /// `payload` should be a pointer to struct, or null.
-    /// Require `DeviceContext.transmit` could be called.
-    pub fn sendWithPack(self: *@This(), alloc: std.mem.Allocator, reqid: u32, payload: anytype) !void {
-        const P = @TypeOf(payload);
-        var pack = UsbPack{
-            .reqid = reqid,
-            .msgid = 0,
-            .sta = 0,
-        };
-        switch (@typeInfo(P)) {
-            .Pointer => {
-                try pack.fillWith(payload);
-            },
-            .Null => {}, // do nothing
-            else => @compileError("`payload` must be a pointer type or null, found `" ++ @typeName(P) ++ "`"),
-        }
-        const data = try pack.marshal(alloc);
-        defer alloc.free(data);
-        try self.transmit(data);
-    }
-
-    /// wrap `payload` into `UsbPack` and `transmit` it.
-    /// `payload` should be a slice.
-    /// Require `DeviceContext.transmit` could be called.
-    pub fn sendSliceWithPack(self: *@This(), alloc: std.mem.Allocator, reqid: u32, payload: []const u8) !void {
-        var pack = UsbPack{
-            .reqid = reqid,
-            .msgid = 0,
-            .sta = 0,
-        };
-        pack.ptr = payload.ptr;
-        pack.len = @intCast(payload.len);
-        const data = try pack.marshal(alloc);
-        defer alloc.free(data);
-        try self.transmit(data);
-    }
-
-    /// receive message from the IN endpoint (RX transfer)
-    ///
-    /// Note that the consumer is responsible for freeing the memory
-    /// by calling `deinit` after receiving a packet.
-    ///
-    /// It's recommended to subscribe the observer to the `arto.obs_queue`, instead of
-    /// calling this function directly.
-    inline fn unsafeBlockReceive(self: *@This()) ClosedError!ManagedUsbPack {
-        if (self.hasDeinit()) {
-            return ClosedError.Closed;
-        }
-        return self.xfer.rx_queue.dequeue();
-    }
-
-    /// Wait for the completion of the TX transfer.
-    /// It will keeps blocking until the transfer is completed
-    pub fn waitForTxComplete(self: *@This()) void {
-        if (self.hasDeinit()) {
-            return;
-        }
-        var sync = &self.xfer.tx_sync;
-        if (sync.isFree()) {
-            return;
-        }
-        sync.mutex.lock();
-        defer sync.mutex.unlock();
-        while (!sync.isFree()) {
-            sync.cv.wait(&sync.mutex);
-        }
     }
 
     fn initTransferRx(self: *DeviceContext, ep: *Endpoint) void {
@@ -760,20 +838,9 @@ const DeviceContext = struct {
 
         ret = usb.libusb_submit_transfer(transfer.self);
         switch (ret) {
-            0 => transfer.lk.lockShared(),
-            else => {
-                var lg = self.withLogger(logz.err());
-                lg = utils.logWithSrc(ep.withLogger(lg), @src());
-                lg.int("code", ret)
-                    .string("what", "failed to submit transfer")
-                    .log();
-                @panic("failed to submit transfer");
-            },
+            LIBUSB_OK => transfer.lk.lockShared(),
+            else => std.debug.panic("failed to submit transfer, code={d}", .{ret}),
         }
-    }
-
-    pub fn rxObservable(self: *@This()) *PackObserverList {
-        return &self.xfer.rx_observable;
     }
 
     fn initEndpoints(self: *@This()) void {
@@ -826,17 +893,40 @@ const DeviceContext = struct {
 
     /// basically do nothing... for now
     /// reserve for future use
-    pub fn sendLoop(self: *@This()) void {
+    fn sendLoop(self: *@This()) void {
         while (true) {
             if (self.hasDeinit()) {
                 break;
             }
-            std.time.sleep(1000 * std.time.ns_per_ms);
+            if (self.status()) |sta| {
+                switch (sta.role) {
+                    .ap => {
+                        self.transmitViaSocket("hello from AP") catch |e| {
+                            const lg = self.withSrcLogger(logz.err(), @src());
+                            lg.err(e)
+                                .string("what", "failed to transmit via socket")
+                                .log();
+                        };
+                        std.time.sleep(1500 * std.time.ns_per_ms);
+                    },
+                    .dev => {
+                        self.transmitViaSocket("hello from DEV") catch |e| {
+                            const lg = self.withSrcLogger(logz.err(), @src());
+                            lg.err(e)
+                                .string("what", "failed to transmit via socket")
+                                .log();
+                        };
+                        std.time.sleep(500 * std.time.ns_per_ms);
+                    },
+                }
+            } else {
+                std.time.sleep(1000 * std.time.ns_per_ms);
+            }
         }
     }
 
     /// notify every observer in the queue
-    pub fn recvLoop(self: *@This()) void {
+    fn recvLoop(self: *@This()) void {
         while (true) {
             var mpk = self.unsafeBlockReceive() catch |e| {
                 var lg = utils.logWithSrc(self.withLogger(logz.err()), @src());
@@ -850,40 +940,11 @@ const DeviceContext = struct {
             queue.update(&mpk.pack);
         }
     }
-
-    pub fn init(self: *@This()) LibUsbError!void {
-        var ret: c_int = undefined;
-        printStrDesc(self.mutHdl(), self.desc());
-        printEndpoints(self.desc().idVendor, self.desc().idProduct, self.endpoints);
-        if (!is_windows) {
-            // https://libusb.sourceforge.io/api-1.0/group__libusb__self.html#gac35b26fef01271eba65c60b2b3ce1cbf
-            ret = usb.libusb_set_auto_detach_kernel_driver(self.mutHdl(), 1);
-            if (ret != LIBUSB_OK) {
-                self.withLogger(logz.err())
-                    .int("code", ret)
-                    .string("err", "failed to set auto detach kernel driver")
-                    .log();
-                return libusb_error_2_set(ret);
-            }
-        }
-        ret = usb.libusb_claim_interface(self.mutHdl(), 0);
-        if (ret != LIBUSB_OK) {
-            self.withLogger(logz.err())
-                .int("code", ret)
-                .string("err", "failed to claim interface")
-                .log();
-            return libusb_error_2_set(ret);
-        }
-        self.initEndpoints();
-        self._has_deinit.store(false, std.builtin.AtomicOrder.unordered);
-        // we could call transmit/receive from now on, as long as the event loop is running
-
-        self.runLoopPrepare();
-        const speed = usb.libusb_get_device_speed(self.mutDev());
-        self.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
-    }
 };
 
+/// allocator for `DeviceContext` that would persist and `arena` for the temporary memory.
+///
+/// will mutate `ctx_list` in place.
 fn refreshDevList(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator, ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceContext)) void {
     var c_device_list: [*c]?*usb.libusb_device = undefined;
     const sz = usb.libusb_get_device_list(ctx, &c_device_list);
@@ -1001,6 +1062,87 @@ fn refreshDevList(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator,
     }
 }
 
+const MagicSocketCallback = struct {
+    allocator: std.mem.Allocator,
+    /// reference, not OWNING
+    dev: *DeviceContext,
+    const Self = @This();
+
+    const WriteSocketReqid = bt.socketRequestId(.write, BB_SEL_SLOT, BB_SEL_PORT);
+    const ReadSocketReqid = bt.socketRequestId(.read, BB_SEL_SLOT, BB_SEL_PORT);
+
+    const Observer = PackObserverList.Observer;
+
+    pub fn as(ud: ?*anyopaque) *Self {
+        return @alignCast(@ptrCast(ud.?));
+    }
+
+    pub fn init(alloc: std.mem.Allocator, dev: *DeviceContext) !*Self {
+        var ret = try alloc.create(Self);
+        ret.allocator = alloc;
+        ret.dev = dev;
+        return ret;
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.allocator.destroy(self);
+    }
+
+    pub fn subscribe_write(self: *@This(), subject: *PackObserverList) !void {
+        const predicate = ActionCallback.make_reqid_predicate(WriteSocketReqid);
+        try subject.subscribe(
+            &predicate,
+            &Self.write_on_data,
+            null,
+            self,
+            @ptrCast(&Self.deinit),
+        );
+    }
+    pub fn write_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
+        const ud = obs.userdata;
+        var self = Self.as(ud);
+        _ = sbj;
+        if (pack.sta != BB_STA_OK) {
+            self.dev.withSrcLogger(logz.err(), @src())
+                .fmt("what", "bad socket write slot {} port {}", .{ BB_SEL_SLOT, BB_SEL_PORT })
+                .int("sta", pack.sta).log();
+            return;
+        }
+        self.dev.withSrcLogger(logz.debug(), @src())
+            .fmt("what", "written socket slot {} port {}", .{ BB_SEL_SLOT, BB_SEL_PORT }).log();
+    }
+
+    pub fn subscribe_read(self: *@This(), subject: *PackObserverList) !void {
+        const predicate = ActionCallback.make_reqid_predicate(ReadSocketReqid);
+        try subject.subscribe(
+            &predicate,
+            &Self.read_on_data,
+            null,
+            self,
+            @ptrCast(&Self.deinit),
+        );
+    }
+    pub fn read_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
+        const ud = obs.userdata;
+        var self = Self.as(ud);
+        _ = sbj;
+        if (pack.sta != BB_STA_OK) {
+            self.dev.withSrcLogger(logz.err(), @src())
+                .fmt("what", "bad socket read slot {} port {}", .{ BB_SEL_SLOT, BB_SEL_PORT })
+                .int("sta", pack.sta)
+                .log();
+            return;
+        }
+
+        if (pack.data()) |data| {
+            self.dev.withSrcLogger(logz.info(), @src())
+                .fmt("what", "read socket slot {} port {}", .{ BB_SEL_SLOT, BB_SEL_PORT })
+                .string("data", data)
+                .log();
+        } else |_| {}
+    }
+};
+
 /// only used in `DeviceContext.loopPrepare`
 const ActionCallback = struct {
     arena: std.heap.ArenaAllocator,
@@ -1056,6 +1198,15 @@ const ActionCallback = struct {
         }).GenericErrorHandler;
     }
 
+    /// listen to the magic socket write/read by creating callbacks
+    pub fn listen_to_socket(self: *@This()) !void {
+        const sbj = self.dev.rxObservable();
+        var socket_cb_write = try MagicSocketCallback.init(self.dev.allocator(), self.dev);
+        var socket_cb_read = try MagicSocketCallback.init(self.dev.allocator(), self.dev);
+        try socket_cb_write.subscribe_write(sbj);
+        try socket_cb_read.subscribe_read(sbj);
+    }
+
     // an action being two part (functions)
     // first `*_send` should be call to push
     // the request to the device
@@ -1072,7 +1223,7 @@ const ActionCallback = struct {
         var in = bb.bb_get_status_in_t{
             .user_bmp = SLOT_BIT_MAP_MAX,
         };
-        try self.dev.sendWithPack(self.arena.allocator(), bb.BB_GET_STATUS, &in);
+        try self.dev.transmitWithPack(self.arena.allocator(), bb.BB_GET_STATUS, &in);
         const predicate = Self.make_reqid_predicate(bb.BB_GET_STATUS);
         var subject = self.dev.rxObservable();
         subject.subscribe(
@@ -1089,6 +1240,7 @@ const ActionCallback = struct {
         var self = Self.as(ud);
         const status = try pack.dataAs(bb.bb_get_status_out_t);
         bt.logWithStatus(self.dev.withSrcLogger(logz.info(), @src()), &status).log();
+        try self.dev.arto.setWithBBStatus(&status);
         // ***** and_then *****
         try self.query_info_send();
 
@@ -1096,7 +1248,7 @@ const ActionCallback = struct {
     }
 
     pub fn query_info_send(self: *@This()) !void {
-        try self.dev.sendWithPack(self.arena.allocator(), bb.BB_GET_SYS_INFO, null);
+        try self.dev.transmitWithPack(self.arena.allocator(), bb.BB_GET_SYS_INFO, null);
         const predicate = Self.make_reqid_predicate(bb.BB_GET_SYS_INFO);
         var subject = self.dev.rxObservable();
         subject.subscribe(
@@ -1143,7 +1295,7 @@ const ActionCallback = struct {
     /// without closure it's become tedious.
     pub fn subscribe_event_no_response(self: *@This(), event: bt.Event) !void {
         const req = bt.subscribeRequestId(event);
-        try self.dev.sendWithPack(self.arena.allocator(), req, null);
+        try self.dev.transmitWithPack(self.arena.allocator(), req, null);
     }
 
     const OpenRequestId = bt.socketRequestId(.open, @intCast(BB_SEL_SLOT), @intCast(BB_SEL_PORT));
@@ -1155,13 +1307,12 @@ const ActionCallback = struct {
     fn try_socket_open(self: *@This()) !void {
         const flag: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
         // see `session_socket.c:232`
-        // TODO: create a wrapper struct
         const buf = &[_]u8{
             flag, 0x00, 0x00, 0x00, // flags, with alignment
             0x00, 0x08, 0x00, 0x00, // 2048 in `bb.bb_sock_opt_t.tx_buf_size`
             0x00, 0x0c, 0x00, 0x00, // 3072 in `bb.bb_sock_opt_t.rx_buf_size`
         };
-        try self.dev.sendSliceWithPack(self.arena.allocator(), OpenRequestId, buf);
+        try self.dev.transmitSliceWithPack(self.arena.allocator(), OpenRequestId, buf);
     }
 
     pub fn open_socket_send(self: *@This()) !void {
@@ -1177,20 +1328,28 @@ const ActionCallback = struct {
         ) catch unreachable;
     }
     pub const open_socket_on_error = Self.make_generic_error_handler("failed to open socket");
-    pub fn open_socket_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) OpenSocketError!void {
+    pub fn open_socket_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
         // if we must handle these shit
         // we'd better make a state machine
         const ud = obs.userdata;
         var self = Self.as(ud);
         switch (pack.sta) {
             BB_STA_OK => {
+                try self.listen_to_socket();
                 self.dev.withSrcLogger(logz.info(), @src())
                     .int("slot", BB_SEL_SLOT)
                     .int("port", BB_SEL_PORT)
                     .string("what", "socket opened")
                     .log();
             },
-            BB_ERROR_ALREADY_OPENED_SOCKET => return OpenSocketError.AlreadyOpened,
+            BB_ERROR_ALREADY_OPENED_SOCKET => {
+                try self.listen_to_socket();
+                self.dev.withSrcLogger(logz.info(), @src())
+                    .int("slot", BB_SEL_SLOT)
+                    .int("port", BB_SEL_PORT)
+                    .string("what", "reuse opened socket")
+                    .log();
+            },
             BB_ERROR_UNSPECIFIED => return OpenSocketError.Unspecified,
             else => std.debug.panic("unexpected status {d}", .{pack.sta}),
         }
@@ -1289,9 +1448,7 @@ const TransferCallback = struct {
             var mpk_ = ManagedUsbPack.unmarshal(self.alloc, rx_buf);
             if (mpk_) |*mpk| {
                 lg = utils.logWithSrc(self.dev.withLogger(logz.debug()), @src());
-                lg = self.endpoint.withLogger(lg);
-                mpk.pack.withLogger(lg)
-                    .log();
+                mpk.pack.withLogger(lg).log();
                 self.dev.xfer.rx_queue.enqueue(mpk.*) catch |e| {
                     lg = utils.logWithSrc(self.dev.withLogger(logz.err()), @src());
                     lg.err(e).string("what", "failed to enqueue").log();
@@ -1299,7 +1456,6 @@ const TransferCallback = struct {
                 };
             } else |err| {
                 lg = utils.logWithSrc(self.dev.withLogger(logz.err()), @src());
-                lg = self.endpoint.withLogger(lg);
                 lg.string("what", "failed to unmarshal")
                     .fmt("data", "{any}", .{rx_buf})
                     .err(err)
@@ -1406,7 +1562,7 @@ pub fn main() !void {
     }
 
     for (device_list.items) |*dev| {
-        dev.init() catch |e| {
+        dev.initialize() catch |e| {
             dev.withLogger(logz.err()).err(e).log();
         };
     }

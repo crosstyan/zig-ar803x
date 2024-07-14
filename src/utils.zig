@@ -264,6 +264,30 @@ pub fn LockedQueue(comptime T: type, comptime max_size: usize) type {
     return LockedQueueImpl;
 }
 
+pub fn u8ToArray(u: u8, comptime msb_first: bool) [8]bool {
+    var ret: [8]bool = undefined;
+    if (msb_first) {
+        ret[0] = (u & 0x80) != 0x00;
+        ret[1] = (u & 0x40) != 0x00;
+        ret[2] = (u & 0x20) != 0x00;
+        ret[3] = (u & 0x10) != 0x00;
+        ret[4] = (u & 0x08) != 0x00;
+        ret[5] = (u & 0x04) != 0x00;
+        ret[6] = (u & 0x02) != 0x00;
+        ret[7] = (u & 0x01) != 0x00;
+    } else {
+        ret[0] = (u & 0x01) != 0x00;
+        ret[1] = (u & 0x02) != 0x00;
+        ret[2] = (u & 0x04) != 0x00;
+        ret[3] = (u & 0x08) != 0x00;
+        ret[4] = (u & 0x10) != 0x00;
+        ret[5] = (u & 0x20) != 0x00;
+        ret[6] = (u & 0x40) != 0x00;
+        ret[7] = (u & 0x80) != 0x00;
+    }
+    return ret;
+}
+
 const expect = std.testing.expect;
 test "typeId" {
     const T = struct {

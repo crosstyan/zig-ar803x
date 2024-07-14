@@ -1,8 +1,10 @@
 const std = @import("std");
 const bb = @import("c.zig");
 const logz = @import("logz");
-const BadEnum = @import("../utils.zig").BadEnum;
+const utils = @import("../utils.zig");
+const BadEnum = utils.BadEnum;
 
+const u8ToArray = utils.u8ToArray;
 pub const STA_OK: c_int = 0;
 pub const SUBSCRIBE_REQ = 1;
 pub const SUBSCRIBE_REQ_RET = 2;
@@ -616,30 +618,6 @@ pub fn logWithUserStatus(logger: logz.Logger, status: *const bb.bb_user_status_t
     lg = lg.string("user", "rx");
     lg = logWithPhyStatus(lg, rx, false);
     return lg;
-}
-
-pub fn u8ToArray(u: u8, comptime msb_first: bool) [8]bool {
-    var ret: [8]bool = undefined;
-    if (msb_first) {
-        ret[0] = (u & 0x80) != 0x00;
-        ret[1] = (u & 0x40) != 0x00;
-        ret[2] = (u & 0x20) != 0x00;
-        ret[3] = (u & 0x10) != 0x00;
-        ret[4] = (u & 0x08) != 0x00;
-        ret[5] = (u & 0x04) != 0x00;
-        ret[6] = (u & 0x02) != 0x00;
-        ret[7] = (u & 0x01) != 0x00;
-    } else {
-        ret[0] = (u & 0x01) != 0x00;
-        ret[1] = (u & 0x02) != 0x00;
-        ret[2] = (u & 0x04) != 0x00;
-        ret[3] = (u & 0x08) != 0x00;
-        ret[4] = (u & 0x10) != 0x00;
-        ret[5] = (u & 0x20) != 0x00;
-        ret[6] = (u & 0x40) != 0x00;
-        ret[7] = (u & 0x80) != 0x00;
-    }
-    return ret;
 }
 
 pub const UserStatus = struct {

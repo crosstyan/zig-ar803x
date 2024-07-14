@@ -1127,11 +1127,19 @@ const MagicSocketCallback = struct {
     ///
     /// first is the status of the write operation
     /// (BB_SOCKET_SEND_OK/BB_SOCKET_SEND_ERROR/BB_SOCKET_SEND_NEED_UPDATE_ADDR)
-    /// whose payload is the same as the write request, i.e. position (u64) and
-    /// actual data
+    /// whose payload is
+    ///
+    /// ```c
+    /// struct socket_msg_ret {
+    ///     uint64_t pos;
+    ///     uint32_t len;
+    /// };
+    /// ```
+    ///
+    /// with a few bytes of gibberish in the end (not sure why).
     ///
     /// second is the written length as `sta`, whose payload is the position of
-    /// pointer (u64) without actual data
+    /// pointer (u64)
     ///
     /// I'm not sure if there's any command to query the position of the pointer (why the position is needed?)
     ///
@@ -1142,6 +1150,8 @@ const MagicSocketCallback = struct {
     ///
     /// btw I'm using a static variable to store the position in `transmitViaSocket`, which
     /// increases after each write operation. (won't work if two devices are connected)
+    ///
+    /// What's `wr_cpl_max` and `wr_cpl_init`?
     pub fn write_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
         const ud = obs.userdata;
         var self = Self.as(ud);

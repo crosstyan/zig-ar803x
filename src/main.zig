@@ -940,7 +940,7 @@ const ActionCallback = struct {
         arena.deinit();
     }
 
-    // payload should be a pointer to struct, or null
+    /// payload should be a pointer to struct, or null
     pub fn query_common(self: *@This(), reqid: u32, payload: anytype) !void {
         var alloc = self.arena.allocator();
         const P = @TypeOf(payload);
@@ -962,7 +962,7 @@ const ActionCallback = struct {
         try self.dev.transmit(data);
     }
 
-    // like `query_common`, but with a slice payload
+    /// like `query_common`, but with a slice payload
     pub fn query_common_slice(self: *@This(), reqid: u32, payload: []const u8) !void {
         var alloc = self.arena.allocator();
         var pack = UsbPack{
@@ -992,14 +992,14 @@ const ActionCallback = struct {
     /// it will log the error and unsubscribe the observer, and than destroy the closure
     pub fn make_generic_error_handler(comptime what: []const u8) PackObserverList.OnErrorFn {
         return (struct {
-            pub fn call(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer, err: anyerror) void {
-                _ = pack;
+            pub fn call(sbj: *PackObserverList, _: *const UsbPack, obs: *Observer, err: anyerror) void {
                 const ud = obs.userdata;
                 var self = Self.as(ud);
                 self.dev.withSrcLogger(logz.err(), @src())
                     .err(err)
                     .string("what", what)
                     .log();
+                std.debug.assert(obs.dtor == null);
                 obs.dtor = @ptrCast(&Self.deinit);
                 sbj.unsubscribe(obs) catch unreachable;
             }

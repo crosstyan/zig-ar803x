@@ -57,8 +57,10 @@ const BB_ERROR_ALREADY_OPENED_SOCKET = 257;
 const BB_ERROR_UNSPECIFIED = -259;
 // See `dev_dat_so_write_proc` in `sock_node.c`.
 const BB_SOCKET_SEND_OK: i32 = -0x106;
-const BB_SOCKET_SEND_NEED_UPDATE_ADDR: i32 = -0x107;
+const BB_SOCKET_SEND_NEED_UPDATE_ADDR: i32 = -0x107; // 强制更新写入地址
 const BB_SOCKET_SEND_ERROR: i32 = -0x108;
+// TODO: investigate reqid=0x05'00'00'01
+// looks like debug related packet
 
 const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
     .thread_safe = true,
@@ -1123,6 +1125,7 @@ const MagicSocketCallback = struct {
             @ptrCast(&Self.deinit),
         );
     }
+
     /// the device will return two message on write
     ///
     /// first is the status of the write operation
@@ -1150,6 +1153,11 @@ const MagicSocketCallback = struct {
     ///
     /// btw I'm using a static variable to store the position in `transmitViaSocket`, which
     /// increases after each write operation. (won't work if two devices are connected)
+    ///
+    /// If `BB_SOCKET_SEND_ERROR` is the status, than
+    /// `socket_msg_ret.pos` means the position given to device (which made the device not happy),
+    /// `socket_msg_ret.len` is the position expected
+    /// (what if the position is overflown uint32_t? The expected position will be WRONG!)
     ///
     /// What's `wr_cpl_max` and `wr_cpl_init`?
     pub fn write_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {

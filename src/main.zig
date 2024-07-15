@@ -1357,20 +1357,20 @@ const MagicSocketCallback = struct {
     pub fn read_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
         const ud = obs.userdata;
         var self = Self.as(ud);
+        var socket = self.dev.magicSocket();
         _ = sbj;
-        if (pack.sta != BB_STA_OK) {
-            self.dev.withSrcLogger(logz.err(), @src())
-                .fmt("what", "bad socket read slot {} port {}", .{ BB_SEL_SLOT, BB_SEL_PORT })
-                .int("sta", pack.sta)
-                .log();
-            return;
-        }
-
+        // the magic sta, no idea what it means
+        // 305419896=0x12345678
+        // You're fucking kidding me?
+        std.debug.assert(pack.sta == 0x12345678);
         if (pack.data()) |data| {
-            self.dev.withSrcLogger(logz.info(), @src())
-                .fmt("what", "read socket slot {} port {}", .{ BB_SEL_SLOT, BB_SEL_PORT })
+            socket.withLogger(self.dev.withSrcLogger(logz.info(), @src()))
+                .int("sta", pack.sta)
+                .string("what", "read")
                 .string("data", data)
+                .fmt("hex", "{s}", .{std.fmt.fmtSliceHexLower(data)})
                 .log();
+            // TODO: to downstream
         } else |_| {}
     }
 

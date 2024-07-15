@@ -67,7 +67,7 @@ const BB_REQID_DEBUG_ENABLE = 0x05000000;
 const BB_REQID_DEBUG_WRITE = 0x05000001;
 
 /// whether log the content when `tx`/`rx` involve
-const is_log_content: bool = true;
+const is_log_content: bool = false;
 /// whether log the content when logging the `UsbPack`
 const is_log_packet_content: bool = false;
 
@@ -787,9 +787,19 @@ const DeviceContext = struct {
 
     /// transmit with `data` copy to the internal buffer
     ///
+    /// Tx transfer should be initialized (with `initTransferTx`) before calling this function.
+    /// libusb event loop should have been started.
+    ///
     /// Note that the data will be copy to the internal buffer, and will return
     /// `TransmitError.Overflow` if the data is too large. (See `TRANSFER_BUF_SIZE`)
-    pub fn transmitWith(self: *@This(), data: []const u8) !void {
+    ///
+    /// use `DeviceContext.unsafeBlockReceive` to receive the data coming from the device
+    ///
+    /// If you needs `UsbPack` to be sent, you should use `transmitWithPack` or `transmitSliceWithPack`,
+    /// instead of calling this function directly.
+    ///
+    /// TODO: use a ring buffer to provide a queued transmit (useful for burst data)
+    pub fn transmitSlice(self: *@This(), data: []const u8) !void {
         if (self.hasDeinit()) {
             return ClosedError.Closed;
         }
@@ -813,34 +823,6 @@ const DeviceContext = struct {
         self.xfer.tx_sync.setFree(false);
     }
 
-    /// transmit with current buffer
-    ///
-    /// Tx transfer should be initialized (with `initTransferTx`) before calling this function.
-    /// libusb event loop should have been started.
-    ///
-    /// use `DeviceContext.unsafeBlockReceive` to receive the data coming from the device
-    ///
-    /// If you needs `UsbPack` to be sent, you should use `transmitWithPack` or `transmitSliceWithPack`,
-    /// instead of calling this function directly.
-    ///
-    /// TODO: use a ring buffer to provide a queued transmit (useful for burst data)
-    pub fn transmit(self: *@This()) !void {
-        if (self.hasDeinit()) {
-            return ClosedError.Closed;
-        }
-        const transfer = &self.xfer.tx_transfer;
-        const ok = transfer.lk.tryLockShared();
-        if (!ok) {
-            return TransmitError.Busy;
-        }
-        errdefer transfer.lk.unlockShared();
-        const ret = usb.libusb_submit_transfer(transfer.self);
-        if (ret != LIBUSB_OK) {
-            return libusb_error_2_set(ret);
-        }
-        self.xfer.tx_sync.setFree(false);
-    }
-
     /// Write to the magical socket, requires an open socket
     pub fn transmitViaSocket(self: *@This(), payload: []const u8) !void {
         var socket = self.magicSocket();
@@ -852,17 +834,17 @@ const DeviceContext = struct {
         }
 
         const transfer = &self.xfer.tx_transfer;
+        const payload_len_required = payload.len + @sizeOf(u64);
+        const total_len_required = UsbPack.fixed_pack_base + payload_len_required;
+        if (total_len_required > transfer.buf.len) {
+            return TransmitError.Overflow;
+        }
         const tx_buf = self.mutTxBuffer();
         var pack = UsbPack{
             .reqid = socket.requestId(.write),
             .msgid = 0,
             .sta = 0,
         };
-        const payload_len_required = payload.len + @sizeOf(u64);
-        const total_len_required = UsbPack.fixed_pack_base + payload_len_required;
-        if (total_len_required > transfer.buf.len) {
-            return TransmitError.Overflow;
-        }
 
         const ok = transfer.lk.tryLockShared();
         if (!ok) {
@@ -905,7 +887,7 @@ const DeviceContext = struct {
         }
         const data = try pack.marshalAlloc(alloc);
         defer alloc.free(data);
-        try self.transmitWith(data);
+        try self.transmitSlice(data);
     }
 
     /// wrap `payload` into `UsbPack` and `transmit` it.
@@ -921,7 +903,7 @@ const DeviceContext = struct {
         pack.len = @intCast(payload.len);
         const data = try pack.marshalAlloc(alloc);
         defer alloc.free(data);
-        try self.transmitWith(data);
+        try self.transmitSlice(data);
     }
 
     /// Wait for the completion of the TX transfer.

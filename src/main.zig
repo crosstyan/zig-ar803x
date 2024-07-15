@@ -59,15 +59,17 @@ const BB_ERROR_UNSPECIFIED = -259;
 const BB_SOCKET_SEND_OK: i32 = -0x106;
 const BB_SOCKET_SEND_NEED_UPDATE_ADDR: i32 = -0x107; // 强制更新写入地址
 const BB_SOCKET_SEND_ERROR: i32 = -0x108;
+const BB_SOCKET_TX_BUFFER = 2048;
+const BB_SOCKET_RX_BUFFER = 3072;
 // TODO: investigate reqid=0x05'00'00'01
 // looks like debug related packet
 const BB_REQID_DEBUG_ENABLE = 0x05000000;
 const BB_REQID_DEBUG_WRITE = 0x05000001;
 
 /// whether log the content when `tx`/`rx` involve
-const is_log_content: bool = false;
+const is_log_content: bool = true;
 /// whether log the content when logging the `UsbPack`
-const is_log_packet_content: bool = true;
+const is_log_packet_content: bool = false;
 
 const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
     .thread_safe = true,
@@ -383,6 +385,13 @@ const DeviceContext = struct {
         _closure: ?*anyopaque = null,
         _closure_dtor: ?*const fn (*anyopaque) void = null,
 
+        pub inline fn setLength(self: *@This(), len: u32) AppError!void {
+            if (len > TRANSFER_BUF_SIZE) {
+                return AppError.Overflow;
+            }
+            self.self.length = @intCast(len);
+        }
+
         /// ONLY used in RX transfer, use `actual_length`
         /// as the length of slice
         pub inline fn rxBuf(self: *@This()) []const u8 {
@@ -523,8 +532,7 @@ const DeviceContext = struct {
         pub fn withLogger(self: *const @This(), logger: logz.Logger) logz.Logger {
             return logger
                 .int("slot", self._slot)
-                .int("port", self._port)
-                .int("position", self._position);
+                .int("port", self._port);
         }
 
         pub inline fn initialize(self: *@This(), arg_dev: *DeviceContext, slot: u8, port: u8) void {
@@ -629,6 +637,10 @@ const DeviceContext = struct {
 
     pub inline fn magicSocket(self: *@This()) *MagicSocket {
         return &self.arto._magic_socket;
+    }
+
+    pub inline fn mutTxBuffer(self: *@This()) []u8 {
+        return self.xfer.tx_transfer.buf[0..];
     }
 
     /// See `DeviceDesc`
@@ -773,21 +785,11 @@ const DeviceContext = struct {
         Busy,
     };
 
-    /// transmit the data to tx endpoint
-    ///
-    /// Tx transfer should be initialized (with `initTransferTx`) before calling this function.
-    /// libusb event loop should have been started.
+    /// transmit with `data` copy to the internal buffer
     ///
     /// Note that the data will be copy to the internal buffer, and will return
     /// `TransmitError.Overflow` if the data is too large. (See `TRANSFER_BUF_SIZE`)
-    ///
-    /// use `DeviceContext.unsafeBlockReceive` to receive the data coming from the device
-    ///
-    /// If you needs `UsbPack` to be sent, you should use `transmitWithPack` or `transmitSliceWithPack`,
-    /// instead of calling this function directly.
-    ///
-    /// TODO: use a ring buffer to provide a queued transmit (useful for burst data)
-    pub fn transmit(self: *@This(), data: []const u8) !void {
+    pub fn transmitWith(self: *@This(), data: []const u8) !void {
         if (self.hasDeinit()) {
             return ClosedError.Closed;
         }
@@ -804,6 +806,78 @@ const DeviceContext = struct {
         @memcpy(target_slice, data);
         // `actual_length` is only useful for receiving data
         transfer.self.length = @intCast(data.len);
+        const ret = usb.libusb_submit_transfer(transfer.self);
+        if (ret != LIBUSB_OK) {
+            return libusb_error_2_set(ret);
+        }
+        self.xfer.tx_sync.setFree(false);
+    }
+
+    /// transmit with current buffer
+    ///
+    /// Tx transfer should be initialized (with `initTransferTx`) before calling this function.
+    /// libusb event loop should have been started.
+    ///
+    /// use `DeviceContext.unsafeBlockReceive` to receive the data coming from the device
+    ///
+    /// If you needs `UsbPack` to be sent, you should use `transmitWithPack` or `transmitSliceWithPack`,
+    /// instead of calling this function directly.
+    ///
+    /// TODO: use a ring buffer to provide a queued transmit (useful for burst data)
+    pub fn transmit(self: *@This()) !void {
+        if (self.hasDeinit()) {
+            return ClosedError.Closed;
+        }
+        const transfer = &self.xfer.tx_transfer;
+        const ok = transfer.lk.tryLockShared();
+        if (!ok) {
+            return TransmitError.Busy;
+        }
+        errdefer transfer.lk.unlockShared();
+        const ret = usb.libusb_submit_transfer(transfer.self);
+        if (ret != LIBUSB_OK) {
+            return libusb_error_2_set(ret);
+        }
+        self.xfer.tx_sync.setFree(false);
+    }
+
+    /// write to the magical socket, requires an open socket
+    pub fn transmitViaSocket(self: *@This(), payload: []const u8) !void {
+        var socket = self.magicSocket();
+        if (self.hasDeinit()) {
+            return ClosedError.Closed;
+        }
+        if (!socket.isOpen()) {
+            return ClosedError.Closed;
+        }
+
+        const transfer = &self.xfer.tx_transfer;
+        const tx_buf = self.mutTxBuffer();
+        var pack = UsbPack{
+            .reqid = socket.requestId(.write),
+            .msgid = 0,
+            .sta = 0,
+        };
+        const payload_len_required = payload.len + @sizeOf(u64);
+        const total_len_required = UsbPack.fixed_pack_base + payload_len_required;
+        if (total_len_required > transfer.buf.len) {
+            return TransmitError.Overflow;
+        }
+
+        const ok = transfer.lk.tryLockShared();
+        if (!ok) {
+            return TransmitError.Busy;
+        }
+        errdefer transfer.lk.unlockShared();
+        var stream = std.io.fixedBufferStream(tx_buf);
+        var writer = stream.writer();
+        var any_writer = writer.any();
+        try pack.writeHeaderOnly(&any_writer, @intCast(payload_len_required));
+        try writer.writeInt(u64, socket.position(), .little);
+        _ = try writer.write(payload);
+        try writer.writeByte(0xbb);
+        try transfer.setLength(@intCast(try stream.getPos()));
+
         const ret = usb.libusb_submit_transfer(transfer.self);
         if (ret != LIBUSB_OK) {
             return libusb_error_2_set(ret);
@@ -828,9 +902,9 @@ const DeviceContext = struct {
             .Null => {}, // do nothing
             else => @compileError("`payload` must be a pointer type or null, found `" ++ @typeName(P) ++ "`"),
         }
-        const data = try pack.marshal(alloc);
+        const data = try pack.marshalAlloc(alloc);
         defer alloc.free(data);
-        try self.transmit(data);
+        try self.transmitWith(data);
     }
 
     /// wrap `payload` into `UsbPack` and `transmit` it.
@@ -844,28 +918,9 @@ const DeviceContext = struct {
         };
         pack.ptr = payload.ptr;
         pack.len = @intCast(payload.len);
-        const data = try pack.marshal(alloc);
+        const data = try pack.marshalAlloc(alloc);
         defer alloc.free(data);
-        try self.transmit(data);
-    }
-
-    /// write to the magical socket, requires an open socket
-    pub fn transmitViaSocket(self: *@This(), payload: []const u8) !void {
-        const alloc = self.allocator();
-        var socket = self.magicSocket();
-        if (!socket.isOpen()) {
-            return ClosedError.Closed;
-        }
-        var list = std.ArrayList(u8).init(alloc);
-        defer list.deinit();
-        const prepend = try list.addManyAsSlice(@sizeOf(u64));
-        const position_slice = utils.anytype2Slice(&socket._position);
-        @memcpy(prepend, position_slice);
-        socket.movePosition(payload.len);
-        const payload_slice = try list.addManyAsSlice(payload.len);
-        @memcpy(payload_slice, payload);
-        const reqid = bb.socketRequestId(.write, BB_SEL_SLOT, BB_SEL_PORT);
-        return self.transmitSliceWithPack(alloc, reqid, list.items);
+        try self.transmitWith(data);
     }
 
     /// Wait for the completion of the TX transfer.
@@ -1215,7 +1270,7 @@ const MagicSocketCallback = struct {
 
     /// the device will return two message on write
     ///
-    /// first is the status of the write operation
+    /// First one is the status of the write operation
     /// (BB_SOCKET_SEND_OK/BB_SOCKET_SEND_ERROR/BB_SOCKET_SEND_NEED_UPDATE_ADDR)
     /// whose payload is
     ///
@@ -1226,9 +1281,9 @@ const MagicSocketCallback = struct {
     /// };
     /// ```
     ///
-    /// with a few bytes of gibberish in the end (not sure why).
+    /// with a few bytes of gibberish in the end because of alignment padding.
     ///
-    /// second is the written length as `sta`, whose payload is the position of
+    /// Second one is the written length as `sta`, whose payload is the position of
     /// pointer (u64)
     ///
     /// I'm not sure if there's any command to query the position of the pointer (why the position is needed?)
@@ -1251,24 +1306,55 @@ const MagicSocketCallback = struct {
         const ud = obs.userdata;
         var self = Self.as(ud);
         _ = sbj;
+        var socket = self.dev.magicSocket();
         if (pack.sta >= 0) {
+            // sta is the length and payload is the position (u64)
             const len = pack.sta;
-            const txBuf = self.dev.xfer.tx_transfer.txBuf();
-            // pack header, pointer (u64), and actual data
-            std.debug.assert(len == (txBuf.len - 8 - UsbPack.fixedPackBase));
-            self.dev.withSrcLogger(logz.info(), @src())
-                .fmt("what", "written socket slot {} port {} len {}", .{ BB_SEL_SLOT, BB_SEL_PORT, len })
-                .log();
+            if (pack.data()) |pos| {
+                var position: u64 = undefined;
+                utils.fillWithBytes(&position, pos) catch unreachable;
+                socket.withLogger(self.dev.withSrcLogger(logz.info(), @src()))
+                    .string("what", "written")
+                    .int("pos", position)
+                    .int("len", len)
+                    .log();
+            } else |_| {}
         } else {
             switch (pack.sta) {
                 BB_SOCKET_SEND_OK => {
-                    // do nothing
+                    // a redundant message
+                    const len = @sizeOf(bb.err_socket_msg_ret_t);
+                    if (pack.data()) |data| {
+                        std.debug.assert(data.len >= len);
+                        var ret: bb.socket_msg_ret_t = undefined;
+                        utils.fillWithBytes(&ret, data[0..len]) catch unreachable;
+                        socket.withLogger(self.dev.withSrcLogger(logz.debug(), @src()))
+                            .string("what", "ok")
+                            .int("pos", ret.pos)
+                            .int("len", ret.len)
+                            .log();
+                    } else |_| {}
                 },
-                BB_SOCKET_SEND_NEED_UPDATE_ADDR => {
-                    // idk, do nothing for now
+                BB_SOCKET_SEND_NEED_UPDATE_ADDR => {},
+                BB_SOCKET_SEND_ERROR => {
+                    var ret: bb.err_socket_msg_ret_t = undefined;
+                    if (pack.data()) |data| {
+                        const len = @sizeOf(bb.err_socket_msg_ret_t);
+                        std.debug.assert(data.len >= len);
+                        utils.fillWithBytes(&ret, data[0..len]) catch unreachable;
+                        socket.withLogger(self.dev.withSrcLogger(logz.info(), @src()))
+                            .string("what", "socket write error")
+                            .fmt("got_pos", "0x{x:0>16}", .{ret.got_pos})
+                            .fmt("expected_pos", "0x{x:0>8}", .{ret.expected_pos})
+                            .log();
+                        // it won't work if it have already overflown (well, we should try at least)
+                        socket._position = @intCast(ret.expected_pos);
+                        // I prefer panic and restart everything, or try to reopen the magic socket
+                        std.debug.panic("socket write error, got_pos=0x{x:0>16}, expected_pos=0x{x:0>8}", .{ ret.got_pos, ret.expected_pos });
+                    } else |_| {
+                        std.debug.panic("socket write error", .{});
+                    }
                 },
-                // TODO: find a way to recover from this error
-                BB_SOCKET_SEND_ERROR => std.debug.panic("failed to write to socket. sta={d}", .{pack.sta}),
                 else => std.debug.panic("unknown status from socket write. sta={d}", .{pack.sta}),
             }
         }

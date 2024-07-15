@@ -3,6 +3,42 @@ const logz = @import("logz");
 const utils = @import("../utils.zig");
 const LengthNotEqual = utils.LengthNotEqual;
 
+pub const XorAcc = struct {
+    const SEED: u8 = 0xff;
+    state: u8 = SEED,
+
+    pub inline fn reset(self: *@This()) void {
+        self.state = SEED;
+    }
+
+    pub inline fn updateByte(self: *@This(), byte: u8) void {
+        self.state ^= byte;
+    }
+
+    pub inline fn updateSlice(self: *@This(), buf: []const u8) void {
+        for (buf) |byte| {
+            self.updateByte(byte);
+        }
+    }
+
+    /// https://ziglang.org/documentation/master/std/#std.io.Writer.writeInt
+    pub fn updateInt(self: *@This(), T: type, value: T, endian: std.builtin.Endian) void {
+        var bytes: [@divExact(@typeInfo(T).Int.bits, 8)]u8 = undefined;
+        std.mem.writeInt(std.math.ByteAlignedInt(@TypeOf(value)), &bytes, value, endian);
+        self.updateSlice(bytes[0..]);
+    }
+
+    pub inline fn peek(self: *@This()) u8 {
+        return self.state;
+    }
+
+    pub inline fn final(self: *@This()) u8 {
+        const st = self.state;
+        self.reset();
+        return st;
+    }
+};
+
 pub fn xorCheck(buf: []const u8) u8 {
     var xor: u8 = 0xff;
     for (buf) |byte| {
@@ -29,7 +65,7 @@ pub const UsbPack = packed struct {
 
     const Self = @This();
     // usbpack 的固定长度
-    pub const fixedPackBase = 1 + 4 + 4 + 4 + 4 + 1 + 1;
+    pub const fixed_pack_base = 1 + 4 + 4 + 4 + 4 + 1 + 1;
 
     /// data combines the `ptr` and `len` fields into a valid byte slice
     ///
@@ -115,41 +151,65 @@ pub const UsbPack = packed struct {
         }
     }
 
-    /// marshal packs the struct into a byte slice
-    ///
-    /// Please note that the returned slice is owned by the `alloc` allocator
-    pub fn marshal(self: *const Self, alloc: std.mem.Allocator) ![]u8 {
-        var list = std.ArrayList(u8).init(alloc);
-        defer list.deinit();
-        if (self.ptr != null and self.len > 0) {
-            try list.ensureTotalCapacity(self.len + Self.fixedPackBase);
-        } else {
-            try list.ensureTotalCapacity(Self.fixedPackBase);
-        }
-        var writer = list.writer();
+    /// write the struct into the writer
+    pub fn marshal(self: *const Self, writer: *std.io.AnyWriter) !void {
+        var acc = XorAcc{};
         try writer.writeByte(0xaa);
+        acc.updateByte(0xaa);
         if (self.ptr != null and self.len > 0) {
             try writer.writeInt(u32, self.len, std.builtin.Endian.little);
+            acc.updateInt(u32, self.len, std.builtin.Endian.little);
         } else {
             try writer.writeInt(u32, 0, std.builtin.Endian.little);
+            acc.updateInt(u32, 0, std.builtin.Endian.little);
         }
         try writer.writeInt(u32, self.reqid, std.builtin.Endian.big);
+        acc.updateInt(u32, self.reqid, std.builtin.Endian.big);
         try writer.writeInt(u32, self.msgid, std.builtin.Endian.big);
+        acc.updateInt(u32, self.msgid, std.builtin.Endian.big);
         try writer.writeInt(i32, self.sta, std.builtin.Endian.big);
-        const xor = xorCheck(list.items);
+        acc.updateInt(i32, self.sta, std.builtin.Endian.big);
+        const xor = acc.final();
         try writer.writeByte(xor);
         if (self.data()) |s| {
             _ = try writer.write(s);
         } else |_| {}
         try writer.writeByte(0xbb);
-        return list.toOwnedSlice();
+    }
+
+    /// writeHeaderOnly writes the header only, with specified `len`, without the `data` field.
+    /// Caller should write the `data` field and ending `0xbb` by themselves.
+    pub fn writeHeaderOnly(self: *const Self, writer: *std.io.AnyWriter, len: u32) !void {
+        var acc = XorAcc{};
+        try writer.writeByte(0xaa);
+        acc.updateByte(0xaa);
+        try writer.writeInt(u32, len, std.builtin.Endian.little);
+        try writer.writeInt(u32, self.reqid, std.builtin.Endian.big);
+        acc.updateInt(u32, self.reqid, std.builtin.Endian.big);
+        try writer.writeInt(u32, self.msgid, std.builtin.Endian.big);
+        acc.updateInt(u32, self.msgid, std.builtin.Endian.big);
+        try writer.writeInt(i32, self.sta, std.builtin.Endian.big);
+        acc.updateInt(i32, self.sta, std.builtin.Endian.big);
+        const xor = acc.final();
+        try writer.writeByte(xor);
+    }
+
+    /// marshal packs the struct into a byte slice
+    ///
+    /// Please note that the returned slice is owned by the `alloc` allocator
+    pub fn marshalAlloc(self: *const Self, alloc: std.mem.Allocator) ![]const u8 {
+        var list = std.ArrayList(u8).init(alloc);
+        defer list.deinit();
+        var writer = list.writer().any();
+        try self.marshal(&writer);
+        return list.toOwnedSlice() catch @panic("OOM");
     }
 
     /// unmarshal unpacks the byte slice into a struct.
     ///
     /// note that the `data` field is owned by the `alloc` allocator
     pub fn unmarshal(alloc: std.mem.Allocator, buf: []const u8) !Self {
-        if (buf.len < Self.fixedPackBase) {
+        if (buf.len < Self.fixed_pack_base) {
             return UnmarshalError.LengthTooShort;
         }
         var stream = std.io.fixedBufferStream(buf);

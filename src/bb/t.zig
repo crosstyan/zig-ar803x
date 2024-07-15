@@ -750,3 +750,13 @@ pub fn logWithStatus(logger: logz.Logger, status: *const c.bb_get_status_out_t) 
     };
     return st.logWith(logger);
 }
+
+pub const socket_msg_ret_t = extern struct {
+    pos: u64,
+    len: u32,
+};
+
+pub const err_socket_msg_ret_t = extern struct {
+    got_pos: u64,
+    expected_pos: u32,
+};

@@ -77,6 +77,12 @@ const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
 const UsbPackQueue = LockedQueue(ManagedUsbPack, 8);
 const is_windows = builtin.os.tag == .windows;
 
+/// can only use `BB_SEL_SLOT` and `BB_SEL_PORT`.
+/// Given that the `slot` and `port` are fixed, it's okay for now
+pub inline fn comptimeRequestId(opt: bb.SoCmdOpt) u32 {
+    return comptime bb.socketRequestId(opt, BB_SEL_SLOT, BB_SEL_PORT);
+}
+
 /// A naive implementation of the observer pattern for `UsbPack`
 ///
 /// See also
@@ -1219,9 +1225,6 @@ const MagicSocketCallback = struct {
     dev: *DeviceContext,
     const Self = @This();
 
-    const WriteSocketReqid = bb.socketRequestId(.write, BB_SEL_SLOT, BB_SEL_PORT);
-    const ReadSocketReqid = bb.socketRequestId(.read, BB_SEL_SLOT, BB_SEL_PORT);
-
     const Observer = PackObserverList.Observer;
 
     pub fn as(ud: ?*anyopaque) *Self {
@@ -1241,7 +1244,7 @@ const MagicSocketCallback = struct {
 
     pub fn subscribe_write(self: *@This()) !void {
         const subject = self.dev.rxObservable();
-        const predicate = ActionCallback.make_reqid_predicate(WriteSocketReqid);
+        const predicate = ActionCallback.make_reqid_predicate(comptimeRequestId(.write));
         try subject.subscribe(
             &predicate,
             &Self.write_on_data,
@@ -1345,7 +1348,7 @@ const MagicSocketCallback = struct {
 
     pub fn subscribe_read(self: *@This()) !void {
         const subject = self.dev.rxObservable();
-        const predicate = ActionCallback.make_reqid_predicate(ReadSocketReqid);
+        const predicate = ActionCallback.make_reqid_predicate(comptimeRequestId(.read));
         try subject.subscribe(
             &predicate,
             &Self.read_on_data,
@@ -1553,26 +1556,24 @@ const ActionCallback = struct {
         try self.dev.transmitWithPack(self.arena.allocator(), req, null);
     }
 
-    const OpenRequestId = bb.socketRequestId(.open, @intCast(BB_SEL_SLOT), @intCast(BB_SEL_PORT));
-    const CloseRequestId = bb.socketRequestId(.close, @intCast(BB_SEL_SLOT), @intCast(BB_SEL_PORT));
     const OpenSocketError = error{
         AlreadyOpened,
         Unspecified,
     };
 
-    pub fn close_socket_send(self: *@This()) !void {
+    pub fn reopen_socket_send(self: *@This()) !void {
         try self.dev.magicSocket().try_socket_close();
         var subject = self.dev.rxObservable();
-        const predicate = Self.make_reqid_predicate(CloseRequestId);
+        const predicate = Self.make_reqid_predicate(comptimeRequestId(.close));
         subject.subscribe(
             &predicate,
-            &Self.close_socket_on_data,
+            &Self.reopen_socket_on_data,
             null,
             self,
             null,
         ) catch unreachable;
     }
-    pub fn close_socket_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
+    pub fn reopen_socket_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
         const ud = obs.userdata;
         var self = Self.as(ud);
         var socket = self.dev.magicSocket();
@@ -1588,7 +1589,7 @@ const ActionCallback = struct {
         magic_socket.initialize(self.dev, BB_SEL_SLOT, BB_SEL_PORT);
         try magic_socket.try_socket_open();
         var subject = self.dev.rxObservable();
-        const predicate = Self.make_reqid_predicate(OpenRequestId);
+        const predicate = Self.make_reqid_predicate(comptimeRequestId(.open));
         subject.subscribe(
             &predicate,
             &Self.open_socket_on_data,
@@ -1602,24 +1603,20 @@ const ActionCallback = struct {
         // TODO: use state machine
         const ud = obs.userdata;
         var self = Self.as(ud);
+        const skt = self.dev.magicSocket();
         switch (pack.sta) {
             BB_STA_OK => {
-                var socket = self.dev.magicSocket();
-                socket.setOpen(true);
+                skt.setOpen(true);
                 try self.listen_to_socket();
-                self.dev.withSrcLogger(logz.info(), @src())
-                    .int("slot", BB_SEL_SLOT)
-                    .int("port", BB_SEL_PORT)
+                skt.withLogger(self.dev.withSrcLogger(logz.info(), @src()))
                     .string("what", "socket opened")
                     .log();
             },
             BB_ERROR_ALREADY_OPENED_SOCKET => {
-                self.dev.withSrcLogger(logz.info(), @src())
-                    .int("slot", BB_SEL_SLOT)
-                    .int("port", BB_SEL_PORT)
+                skt.withLogger(self.dev.withSrcLogger(logz.warn(), @src()))
                     .string("what", "socket opened, try to close it than reopen")
                     .log();
-                try close_socket_send(self);
+                try reopen_socket_send(self);
                 return;
             },
             BB_ERROR_UNSPECIFIED => return OpenSocketError.Unspecified,

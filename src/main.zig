@@ -472,6 +472,7 @@ const DeviceContext = struct {
         _status: ArtoStatus = undefined,
         /// seconds UNIX timestamp when the status is updated
         _last_status_updated: i64 = NEVER_UPDATED,
+        _magic_socket: MagicSocket = undefined,
 
         pub inline fn status(self: *const @This()) ?*const ArtoStatus {
             if (self._last_status_updated == NEVER_UPDATED) {
@@ -488,6 +489,73 @@ const DeviceContext = struct {
         pub inline fn setStatus(self: *@This(), new_status: *const ArtoStatus) void {
             self._status = new_status.*;
             self._last_status_updated = std.time.timestamp();
+        }
+    };
+
+    /// `MagicSocket` refers to the Arto's socket
+    const MagicSocket = struct {
+        // should only be SET BY CALLBACK
+        _is_open: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        _slot: u8,
+        _port: u8,
+        _position: u64 = 0,
+        _dev: *DeviceContext,
+
+        const flag: u8 = @intCast(c.BB_SOCK_FLAG_TX | c.BB_SOCK_FLAG_RX);
+        const common_payload = &[_]u8{
+            flag, 0x00, 0x00, 0x00, // flags, with alignment
+            0x00, 0x08, 0x00, 0x00, // 2048 in `bb.bb_sock_opt_t.tx_buf_size`
+            0x00, 0x0c, 0x00, 0x00, // 3072 in `bb.bb_sock_opt_t.rx_buf_size`
+        };
+
+        pub inline fn isOpen(self: *const @This()) bool {
+            return self._is_open.load(std.builtin.AtomicOrder.unordered);
+        }
+
+        pub inline fn setOpen(self: *@This(), open: bool) void {
+            self._is_open.store(open, std.builtin.AtomicOrder.unordered);
+        }
+
+        pub inline fn position(self: *const @This()) u64 {
+            return self._position;
+        }
+
+        pub fn withLogger(self: *const @This(), logger: logz.Logger) logz.Logger {
+            return logger
+                .int("slot", self._slot)
+                .int("port", self._port)
+                .int("position", self._position);
+        }
+
+        pub inline fn initialize(self: *@This(), arg_dev: *DeviceContext, slot: u8, port: u8) void {
+            self._is_open.store(false, std.builtin.AtomicOrder.unordered);
+            self._slot = slot;
+            self._port = port;
+            self._dev = arg_dev;
+            self._position = 0;
+        }
+
+        pub inline fn requestId(self: *const @This(), opt: bb.SoCmdOpt) u32 {
+            return bb.socketRequestId(opt, self._slot, self._port);
+        }
+
+        pub inline fn movePosition(self: *@This(), offset: u64) void {
+            self._position += offset;
+        }
+
+        pub inline fn resetPosition(self: *@This()) void {
+            self._position = 0;
+        }
+
+        fn try_socket_open(self: *@This()) !void {
+            // see `session_socket.c:232`
+            const OpenRequestId = self.requestId(.open);
+            try self._dev.transmitSliceWithPack(self._dev.allocator(), OpenRequestId, common_payload);
+        }
+
+        fn try_socket_close(self: *@This()) !void {
+            const CloseRequestId = self.requestId(.close);
+            try self._dev.transmitSliceWithPack(self._dev.allocator(), CloseRequestId, common_payload);
         }
     };
 
@@ -557,6 +625,10 @@ const DeviceContext = struct {
 
     pub inline fn rxObservable(self: *@This()) *PackObserverList {
         return &self.xfer.rx_observable;
+    }
+
+    pub inline fn magicSocket(self: *@This()) *MagicSocket {
+        return &self.arto._magic_socket;
     }
 
     /// See `DeviceDesc`
@@ -780,17 +852,16 @@ const DeviceContext = struct {
     /// write to the magical socket, requires an open socket
     pub fn transmitViaSocket(self: *@This(), payload: []const u8) !void {
         const alloc = self.allocator();
-        // FIXME: dirty hack to verify the pointer logic
-        const WritePointer = struct {
-            var position: u64 = 0;
-        };
-        // TODO: find out why a 8-byte prepend is needed
+        var socket = self.magicSocket();
+        if (!socket.isOpen()) {
+            return ClosedError.Closed;
+        }
         var list = std.ArrayList(u8).init(alloc);
         defer list.deinit();
-        const prepend = try list.addManyAsSlice(8);
-        const position_slice = utils.anytype2Slice(&WritePointer.position);
+        const prepend = try list.addManyAsSlice(@sizeOf(u64));
+        const position_slice = utils.anytype2Slice(&socket._position);
         @memcpy(prepend, position_slice);
-        WritePointer.position += payload.len;
+        socket.movePosition(payload.len);
         const payload_slice = try list.addManyAsSlice(payload.len);
         @memcpy(payload_slice, payload);
         const reqid = bb.socketRequestId(.write, BB_SEL_SLOT, BB_SEL_PORT);
@@ -1420,18 +1491,8 @@ const ActionCallback = struct {
         Unspecified,
     };
 
-    fn try_socket_close(self: *@This()) !void {
-        const flag: u8 = @intCast(c.BB_SOCK_FLAG_TX | c.BB_SOCK_FLAG_RX);
-        // see `session_socket.c:232`
-        const buf = &[_]u8{
-            flag, 0x00, 0x00, 0x00, // flags, with alignment
-            0x00, 0x08, 0x00, 0x00, // 2048 in `bb.bb_sock_opt_t.tx_buf_size`
-            0x00, 0x0c, 0x00, 0x00, // 3072 in `bb.bb_sock_opt_t.rx_buf_size`
-        };
-        try self.dev.transmitSliceWithPack(self.arena.allocator(), CloseRequestId, buf);
-    }
     pub fn close_socket_send(self: *@This()) !void {
-        try self.try_socket_close();
+        try self.dev.magicSocket().try_socket_close();
         var subject = self.dev.rxObservable();
         const predicate = Self.make_reqid_predicate(CloseRequestId);
         subject.subscribe(
@@ -1445,23 +1506,18 @@ const ActionCallback = struct {
     pub fn close_socket_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
         const ud = obs.userdata;
         var self = Self.as(ud);
+        var socket = self.dev.magicSocket();
+        socket.setOpen(false);
         std.debug.assert(pack.sta == BB_STA_OK);
-        try self.try_socket_open();
+        try self.dev.magicSocket().try_socket_open();
         sbj.unsubscribe(obs) catch unreachable;
     }
 
-    fn try_socket_open(self: *@This()) !void {
-        const flag: u8 = @intCast(c.BB_SOCK_FLAG_TX | c.BB_SOCK_FLAG_RX);
-        // see `session_socket.c:232`
-        const buf = &[_]u8{
-            flag, 0x00, 0x00, 0x00, // flags, with alignment
-            0x00, 0x08, 0x00, 0x00, // 2048 in `bb.bb_sock_opt_t.tx_buf_size`
-            0x00, 0x0c, 0x00, 0x00, // 3072 in `bb.bb_sock_opt_t.rx_buf_size`
-        };
-        try self.dev.transmitSliceWithPack(self.arena.allocator(), OpenRequestId, buf);
-    }
     pub fn open_socket_send(self: *@This()) !void {
-        try self.try_socket_open();
+        // we're initializing the socket here
+        var magic_socket = self.dev.magicSocket();
+        magic_socket.initialize(self.dev, BB_SEL_SLOT, BB_SEL_PORT);
+        try magic_socket.try_socket_open();
         var subject = self.dev.rxObservable();
         const predicate = Self.make_reqid_predicate(OpenRequestId);
         subject.subscribe(
@@ -1479,6 +1535,8 @@ const ActionCallback = struct {
         var self = Self.as(ud);
         switch (pack.sta) {
             BB_STA_OK => {
+                var socket = self.dev.magicSocket();
+                socket.setOpen(true);
                 try self.listen_to_socket();
                 self.dev.withSrcLogger(logz.info(), @src())
                     .int("slot", BB_SEL_SLOT)

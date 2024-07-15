@@ -184,6 +184,7 @@ pub const UsbPack = packed struct {
         try writer.writeByte(0xaa);
         acc.updateByte(0xaa);
         try writer.writeInt(u32, len, std.builtin.Endian.little);
+        acc.updateInt(u32, len, std.builtin.Endian.little);
         try writer.writeInt(u32, self.reqid, std.builtin.Endian.big);
         acc.updateInt(u32, self.reqid, std.builtin.Endian.big);
         try writer.writeInt(u32, self.msgid, std.builtin.Endian.big);
@@ -197,6 +198,7 @@ pub const UsbPack = packed struct {
     /// marshal packs the struct into a byte slice
     ///
     /// Please note that the returned slice is owned by the `alloc` allocator
+    /// and the caller should responsible to free it
     pub fn marshalAlloc(self: *const Self, alloc: std.mem.Allocator) ![]const u8 {
         var list = std.ArrayList(u8).init(alloc);
         defer list.deinit();

@@ -841,7 +841,7 @@ const DeviceContext = struct {
         self.xfer.tx_sync.setFree(false);
     }
 
-    /// write to the magical socket, requires an open socket
+    /// Write to the magical socket, requires an open socket
     pub fn transmitViaSocket(self: *@This(), payload: []const u8) !void {
         var socket = self.magicSocket();
         if (self.hasDeinit()) {
@@ -882,6 +882,7 @@ const DeviceContext = struct {
         if (ret != LIBUSB_OK) {
             return libusb_error_2_set(ret);
         }
+        socket.movePosition(@intCast(payload.len));
         self.xfer.tx_sync.setFree(false);
     }
 

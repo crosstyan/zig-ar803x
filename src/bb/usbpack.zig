@@ -194,14 +194,16 @@ pub const UsbPack = packed struct {
         } else |_| {}
     }
 
-    pub fn withLogger(pack: *const Self, logger: logz.Logger) logz.Logger {
+    pub fn withLogger(pack: *const Self, logger: logz.Logger, comptime is_log_content: bool) logz.Logger {
         var lg = logger
             .int("reqid", pack.reqid)
             .int("msgid", pack.msgid)
             .int("sta", pack.sta);
         if (pack.data()) |d| {
-            lg = lg.int("len", d.len)
-                .fmt("content", "{s}", .{std.fmt.fmtSliceHexLower(d)});
+            lg = lg.int("len", d.len);
+            if (is_log_content) {
+                lg = lg.fmt("content", "{s}", .{std.fmt.fmtSliceHexLower(d)});
+            }
         } else |_| {}
         return lg;
     }

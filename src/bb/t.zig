@@ -1,5 +1,5 @@
 const std = @import("std");
-const bb = @import("c.zig");
+pub const c = @import("c.zig");
 const logz = @import("logz");
 const utils = @import("../utils.zig");
 const BadEnum = utils.BadEnum;
@@ -25,32 +25,32 @@ pub const Event = enum {
 
     pub fn toC(event: Event) u8 {
         const ev: c_int = switch (event) {
-            .link_state => bb.BB_EVENT_LINK_STATE,
-            .mcs_change => bb.BB_EVENT_MCS_CHANGE,
-            .chan_change => bb.BB_EVENT_CHAN_CHANGE,
-            .plot_data => bb.BB_EVENT_PLOT_DATA,
-            .frame_start => bb.BB_EVENT_FRAME_START,
-            .offline => bb.BB_EVENT_OFFLINE,
-            .prj_dispatch => bb.BB_EVENT_PRJ_DISPATCH,
-            .pair_result => bb.BB_EVENT_PAIR_RESULT,
-            .prj_dispatch_2 => bb.BB_EVENT_PRJ_DISPATCH2,
-            .mcs_change_end => bb.BB_EVENT_MCS_CHANGE_END,
+            .link_state => c.BB_EVENT_LINK_STATE,
+            .mcs_change => c.BB_EVENT_MCS_CHANGE,
+            .chan_change => c.BB_EVENT_CHAN_CHANGE,
+            .plot_data => c.BB_EVENT_PLOT_DATA,
+            .frame_start => c.BB_EVENT_FRAME_START,
+            .offline => c.BB_EVENT_OFFLINE,
+            .prj_dispatch => c.BB_EVENT_PRJ_DISPATCH,
+            .pair_result => c.BB_EVENT_PAIR_RESULT,
+            .prj_dispatch_2 => c.BB_EVENT_PRJ_DISPATCH2,
+            .mcs_change_end => c.BB_EVENT_MCS_CHANGE_END,
         };
         return @intCast(ev);
     }
 
     pub fn fromC(event: c_int) Event {
         switch (event) {
-            bb.BB_EVENT_LINK_STATE => return Event.link_state,
-            bb.BB_EVENT_MCS_CHANGE => return Event.mcs_change,
-            bb.BB_EVENT_CHAN_CHANGE => return Event.chan_change,
-            bb.BB_EVENT_PLOT_DATA => return Event.plot_data,
-            bb.BB_EVENT_FRAME_START => return Event.frame_start,
-            bb.BB_EVENT_OFFLINE => return Event.offline,
-            bb.BB_EVENT_PRJ_DISPATCH => return Event.prj_dispatch,
-            bb.BB_EVENT_PAIR_RESULT => return Event.pair_result,
-            bb.BB_EVENT_PRJ_DISPATCH2 => return Event.prj_dispatch_2,
-            bb.BB_EVENT_MCS_CHANGE_END => return Event.mcs_change_end,
+            c.BB_EVENT_LINK_STATE => return Event.link_state,
+            c.BB_EVENT_MCS_CHANGE => return Event.mcs_change,
+            c.BB_EVENT_CHAN_CHANGE => return Event.chan_change,
+            c.BB_EVENT_PLOT_DATA => return Event.plot_data,
+            c.BB_EVENT_FRAME_START => return Event.frame_start,
+            c.BB_EVENT_OFFLINE => return Event.offline,
+            c.BB_EVENT_PRJ_DISPATCH => return Event.prj_dispatch,
+            c.BB_EVENT_PAIR_RESULT => return Event.pair_result,
+            c.BB_EVENT_PRJ_DISPATCH2 => return Event.prj_dispatch_2,
+            c.BB_EVENT_MCS_CHANGE_END => return Event.mcs_change_end,
             else => std.debug.panic("unknown C enum for `bb_event_e` {}", .{event}),
         }
     }
@@ -85,13 +85,13 @@ pub const SoCmdOpt = enum {
 
 /// see `BB_EVENT_*` constants
 pub fn subscribeRequestId(event: Event) u32 {
-    return @as(u32, bb.BB_REQ_CB) << 24 | @as(u32, SUBSCRIBE_REQ) << 16 | @as(u32, event.toC());
+    return @as(u32, c.BB_REQ_CB) << 24 | @as(u32, SUBSCRIBE_REQ) << 16 | @as(u32, event.toC());
 }
 
 /// see `dev_dat_so_write_proc`
 pub fn socketRequestId(soCmd: SoCmdOpt, slot: u8, port: u8) u32 {
-    std.debug.assert(slot < bb.BB_SLOT_MAX);
-    std.debug.assert(port < bb.BB_CONFIG_MAX_TRANSPORT_PER_SLOT);
+    std.debug.assert(slot < c.BB_SLOT_MAX);
+    std.debug.assert(port < c.BB_CONFIG_MAX_TRANSPORT_PER_SLOT);
     // https://github.com/ziglang/zig/issues/7605
     // needs explicit cast
     // wait for upstream to fix
@@ -104,16 +104,16 @@ const Role = enum {
 
     pub fn toC(role: Role) u8 {
         const r: c_int = switch (role) {
-            .ap => bb.BB_ROLE_AP,
-            .dev => bb.BB_ROLE_DEV,
+            .ap => c.BB_ROLE_AP,
+            .dev => c.BB_ROLE_DEV,
         };
         return @intCast(r);
     }
 
     pub fn fromC(role: c_int) BadEnum!Role {
         switch (role) {
-            bb.BB_ROLE_AP => return Role.ap,
-            bb.BB_ROLE_DEV => return Role.dev,
+            c.BB_ROLE_AP => return Role.ap,
+            c.BB_ROLE_DEV => return Role.dev,
             else => return BadEnum.BadEnum,
         }
     }
@@ -128,20 +128,20 @@ const Mode = enum {
 
     pub fn toC(mode: Mode) u8 {
         const m: c_int = switch (mode) {
-            .single_user => bb.BB_MODE_SINGLE_USER,
-            .multi_user => bb.BB_MODE_MULTI_USER,
-            .relay => bb.BB_MODE_RELAY,
-            .director => bb.BB_MODE_DIRECTOR,
+            .single_user => c.BB_MODE_SINGLE_USER,
+            .multi_user => c.BB_MODE_MULTI_USER,
+            .relay => c.BB_MODE_RELAY,
+            .director => c.BB_MODE_DIRECTOR,
         };
         return @intCast(m);
     }
 
     pub fn fromC(mode: c_int) BadEnum!Mode {
         switch (mode) {
-            bb.BB_MODE_SINGLE_USER => return Mode.single_user,
-            bb.BB_MODE_MULTI_USER => return Mode.multi_user,
-            bb.BB_MODE_RELAY => return Mode.relay,
-            bb.BB_MODE_DIRECTOR => return Mode.director,
+            c.BB_MODE_SINGLE_USER => return Mode.single_user,
+            c.BB_MODE_MULTI_USER => return Mode.multi_user,
+            c.BB_MODE_RELAY => return Mode.relay,
+            c.BB_MODE_DIRECTOR => return Mode.director,
             else => return BadEnum.BadEnum,
         }
     }
@@ -177,62 +177,62 @@ const PhyMcs = enum {
 
     pub fn toC(mcs: PhyMcs) u8 {
         const m: c_int = switch (mcs) {
-            .neg_2 => bb.BB_PHY_MCS_NEG_2,
-            .neg_1 => bb.BB_PHY_MCS_NEG_1,
-            .mcs_0 => bb.BB_PHY_MCS_0,
-            .mcs_1 => bb.BB_PHY_MCS_1,
-            .mcs_2 => bb.BB_PHY_MCS_2,
-            .mcs_3 => bb.BB_PHY_MCS_3,
-            .mcs_4 => bb.BB_PHY_MCS_4,
-            .mcs_5 => bb.BB_PHY_MCS_5,
-            .mcs_6 => bb.BB_PHY_MCS_6,
-            .mcs_7 => bb.BB_PHY_MCS_7,
-            .mcs_8 => bb.BB_PHY_MCS_8,
-            .mcs_9 => bb.BB_PHY_MCS_9,
-            .mcs_10 => bb.BB_PHY_MCS_10,
-            .mcs_11 => bb.BB_PHY_MCS_11,
-            .mcs_12 => bb.BB_PHY_MCS_12,
-            .mcs_13 => bb.BB_PHY_MCS_13,
-            .mcs_14 => bb.BB_PHY_MCS_14,
-            .mcs_15 => bb.BB_PHY_MCS_15,
-            .mcs_16 => bb.BB_PHY_MCS_16,
-            .mcs_17 => bb.BB_PHY_MCS_17,
-            .mcs_18 => bb.BB_PHY_MCS_18,
-            .mcs_19 => bb.BB_PHY_MCS_19,
-            .mcs_20 => bb.BB_PHY_MCS_20,
-            .mcs_21 => bb.BB_PHY_MCS_21,
-            .mcs_22 => bb.BB_PHY_MCS_22,
+            .neg_2 => c.BB_PHY_MCS_NEG_2,
+            .neg_1 => c.BB_PHY_MCS_NEG_1,
+            .mcs_0 => c.BB_PHY_MCS_0,
+            .mcs_1 => c.BB_PHY_MCS_1,
+            .mcs_2 => c.BB_PHY_MCS_2,
+            .mcs_3 => c.BB_PHY_MCS_3,
+            .mcs_4 => c.BB_PHY_MCS_4,
+            .mcs_5 => c.BB_PHY_MCS_5,
+            .mcs_6 => c.BB_PHY_MCS_6,
+            .mcs_7 => c.BB_PHY_MCS_7,
+            .mcs_8 => c.BB_PHY_MCS_8,
+            .mcs_9 => c.BB_PHY_MCS_9,
+            .mcs_10 => c.BB_PHY_MCS_10,
+            .mcs_11 => c.BB_PHY_MCS_11,
+            .mcs_12 => c.BB_PHY_MCS_12,
+            .mcs_13 => c.BB_PHY_MCS_13,
+            .mcs_14 => c.BB_PHY_MCS_14,
+            .mcs_15 => c.BB_PHY_MCS_15,
+            .mcs_16 => c.BB_PHY_MCS_16,
+            .mcs_17 => c.BB_PHY_MCS_17,
+            .mcs_18 => c.BB_PHY_MCS_18,
+            .mcs_19 => c.BB_PHY_MCS_19,
+            .mcs_20 => c.BB_PHY_MCS_20,
+            .mcs_21 => c.BB_PHY_MCS_21,
+            .mcs_22 => c.BB_PHY_MCS_22,
         };
         return @intCast(m);
     }
 
     pub fn fromC(mcs: c_int) PhyMcs {
         return switch (mcs) {
-            bb.BB_PHY_MCS_NEG_2 => .neg_2,
-            bb.BB_PHY_MCS_NEG_1 => .neg_1,
-            bb.BB_PHY_MCS_0 => .mcs_0,
-            bb.BB_PHY_MCS_1 => .mcs_1,
-            bb.BB_PHY_MCS_2 => .mcs_2,
-            bb.BB_PHY_MCS_3 => .mcs_3,
-            bb.BB_PHY_MCS_4 => .mcs_4,
-            bb.BB_PHY_MCS_5 => .mcs_5,
-            bb.BB_PHY_MCS_6 => .mcs_6,
-            bb.BB_PHY_MCS_7 => .mcs_7,
-            bb.BB_PHY_MCS_8 => .mcs_8,
-            bb.BB_PHY_MCS_9 => .mcs_9,
-            bb.BB_PHY_MCS_10 => .mcs_10,
-            bb.BB_PHY_MCS_11 => .mcs_11,
-            bb.BB_PHY_MCS_12 => .mcs_12,
-            bb.BB_PHY_MCS_13 => .mcs_13,
-            bb.BB_PHY_MCS_14 => .mcs_14,
-            bb.BB_PHY_MCS_15 => .mcs_15,
-            bb.BB_PHY_MCS_16 => .mcs_16,
-            bb.BB_PHY_MCS_17 => .mcs_17,
-            bb.BB_PHY_MCS_18 => .mcs_18,
-            bb.BB_PHY_MCS_19 => .mcs_19,
-            bb.BB_PHY_MCS_20 => .mcs_20,
-            bb.BB_PHY_MCS_21 => .mcs_21,
-            bb.BB_PHY_MCS_22 => .mcs_22,
+            c.BB_PHY_MCS_NEG_2 => .neg_2,
+            c.BB_PHY_MCS_NEG_1 => .neg_1,
+            c.BB_PHY_MCS_0 => .mcs_0,
+            c.BB_PHY_MCS_1 => .mcs_1,
+            c.BB_PHY_MCS_2 => .mcs_2,
+            c.BB_PHY_MCS_3 => .mcs_3,
+            c.BB_PHY_MCS_4 => .mcs_4,
+            c.BB_PHY_MCS_5 => .mcs_5,
+            c.BB_PHY_MCS_6 => .mcs_6,
+            c.BB_PHY_MCS_7 => .mcs_7,
+            c.BB_PHY_MCS_8 => .mcs_8,
+            c.BB_PHY_MCS_9 => .mcs_9,
+            c.BB_PHY_MCS_10 => .mcs_10,
+            c.BB_PHY_MCS_11 => .mcs_11,
+            c.BB_PHY_MCS_12 => .mcs_12,
+            c.BB_PHY_MCS_13 => .mcs_13,
+            c.BB_PHY_MCS_14 => .mcs_14,
+            c.BB_PHY_MCS_15 => .mcs_15,
+            c.BB_PHY_MCS_16 => .mcs_16,
+            c.BB_PHY_MCS_17 => .mcs_17,
+            c.BB_PHY_MCS_18 => .mcs_18,
+            c.BB_PHY_MCS_19 => .mcs_19,
+            c.BB_PHY_MCS_20 => .mcs_20,
+            c.BB_PHY_MCS_21 => .mcs_21,
+            c.BB_PHY_MCS_22 => .mcs_22,
             else => .invalid,
         };
     }
@@ -244,16 +244,16 @@ const SlotMode = enum {
 
     pub fn toC(mode: SlotMode) u8 {
         const m: c_int = switch (mode) {
-            .fixed => bb.BB_SLOT_MODE_FIXED,
-            .dynamic => bb.BB_SLOT_MODE_DYNAMIC,
+            .fixed => c.BB_SLOT_MODE_FIXED,
+            .dynamic => c.BB_SLOT_MODE_DYNAMIC,
         };
         return @intCast(m);
     }
 
     pub fn fromC(mode: c_int) BadEnum!SlotMode {
         switch (mode) {
-            bb.BB_SLOT_MODE_FIXED => return SlotMode.fixed,
-            bb.BB_SLOT_MODE_DYNAMIC => return SlotMode.dynamic,
+            c.BB_SLOT_MODE_FIXED => return SlotMode.fixed,
+            c.BB_SLOT_MODE_DYNAMIC => return SlotMode.dynamic,
             else => return BadEnum.BadEnum,
         }
     }
@@ -266,18 +266,18 @@ const LinkState = enum {
 
     pub fn toC(state: LinkState) u8 {
         const s: c_int = switch (state) {
-            .idle => bb.BB_LINK_STATE_IDLE,
-            .lock => bb.BB_LINK_STATE_LOCK,
-            .connect => bb.BB_LINK_STATE_CONNECT,
+            .idle => c.BB_LINK_STATE_IDLE,
+            .lock => c.BB_LINK_STATE_LOCK,
+            .connect => c.BB_LINK_STATE_CONNECT,
         };
         return @intCast(s);
     }
 
     pub fn fromC(state: c_int) BadEnum!LinkState {
         switch (state) {
-            bb.BB_LINK_STATE_IDLE => return LinkState.idle,
-            bb.BB_LINK_STATE_LOCK => return LinkState.lock,
-            bb.BB_LINK_STATE_CONNECT => return LinkState.connect,
+            c.BB_LINK_STATE_IDLE => return LinkState.idle,
+            c.BB_LINK_STATE_LOCK => return LinkState.lock,
+            c.BB_LINK_STATE_CONNECT => return LinkState.connect,
             else => return BadEnum.BadEnum,
         }
     }
@@ -290,18 +290,18 @@ const Band = enum {
 
     pub fn toC(band: Band) u8 {
         const b: c_int = switch (band) {
-            .band_1g => bb.BB_BAND_1G,
-            .band_2g => bb.BB_BAND_2G,
-            .band_5g => bb.BB_BAND_5G,
+            .band_1g => c.BB_BAND_1G,
+            .band_2g => c.BB_BAND_2G,
+            .band_5g => c.BB_BAND_5G,
         };
         return @intCast(b);
     }
 
     pub fn fromC(band: c_int) BadEnum!Band {
         switch (band) {
-            bb.BB_BAND_1G => return Band.band_1g,
-            bb.BB_BAND_2G => return Band.band_2g,
-            bb.BB_BAND_5G => return Band.band_5g,
+            c.BB_BAND_1G => return Band.band_1g,
+            c.BB_BAND_2G => return Band.band_2g,
+            c.BB_BAND_5G => return Band.band_5g,
             else => return BadEnum.BadEnum,
         }
     }
@@ -313,16 +313,16 @@ const RFPath = enum {
 
     pub fn toC(path: RFPath) u8 {
         const p: c_int = switch (path) {
-            .path_a => bb.BB_RF_PATH_A,
-            .path_b => bb.BB_RF_PATH_B,
+            .path_a => c.BB_RF_PATH_A,
+            .path_b => c.BB_RF_PATH_B,
         };
         return @intCast(p);
     }
 
     pub fn fromC(path: c_int) BadEnum!RFPath {
         switch (path) {
-            bb.BB_RF_PATH_A => return RFPath.path_a,
-            bb.BB_RF_PATH_B => return RFPath.path_b,
+            c.BB_RF_PATH_A => return RFPath.path_a,
+            c.BB_RF_PATH_B => return RFPath.path_b,
             else => return BadEnum.BadEnum,
         }
     }
@@ -336,20 +336,20 @@ const BandMode = enum {
 
     pub fn toC(mode: BandMode) u8 {
         const m: c_int = switch (mode) {
-            .single => bb.BB_BAND_MODE_SINGLE,
-            .band_2g_5g => bb.BB_BAND_MODE_2G_5G,
-            .band_1g_2g => bb.BB_BAND_MODE_1G_2G,
-            .band_1g_5g => bb.BB_BAND_MODE_1G_5G,
+            .single => c.BB_BAND_MODE_SINGLE,
+            .band_2g_5g => c.BB_BAND_MODE_2G_5G,
+            .band_1g_2g => c.BB_BAND_MODE_1G_2G,
+            .band_1g_5g => c.BB_BAND_MODE_1G_5G,
         };
         return @intCast(m);
     }
 
     pub fn fromC(mode: c_int) BadEnum!BandMode {
         switch (mode) {
-            bb.BB_BAND_MODE_SINGLE => return BandMode.single,
-            bb.BB_BAND_MODE_2G_5G => return BandMode.band_2g_5g,
-            bb.BB_BAND_MODE_1G_2G => return BandMode.band_1g_2g,
-            bb.BB_BAND_MODE_1G_5G => return BandMode.band_1g_5g,
+            c.BB_BAND_MODE_SINGLE => return BandMode.single,
+            c.BB_BAND_MODE_2G_5G => return BandMode.band_2g_5g,
+            c.BB_BAND_MODE_1G_2G => return BandMode.band_1g_2g,
+            c.BB_BAND_MODE_1G_5G => return BandMode.band_1g_5g,
             else => return BadEnum.BadEnum,
         }
     }
@@ -365,24 +365,24 @@ const Bandwidth = enum {
 
     pub fn toC(bw: Bandwidth) u8 {
         const b: c_int = switch (bw) {
-            .bw_1_25m => bb.BB_BW_1_25M,
-            .bw_2_5m => bb.BB_BW_2_5M,
-            .bw_5m => bb.BB_BW_5M,
-            .bw_10m => bb.BB_BW_10M,
-            .bw_20m => bb.BB_BW_20M,
-            .bw_40m => bb.BB_BW_40M,
+            .bw_1_25m => c.BB_BW_1_25M,
+            .bw_2_5m => c.BB_BW_2_5M,
+            .bw_5m => c.BB_BW_5M,
+            .bw_10m => c.BB_BW_10M,
+            .bw_20m => c.BB_BW_20M,
+            .bw_40m => c.BB_BW_40M,
         };
         return @intCast(b);
     }
 
     pub fn fromC(bw: c_int) BadEnum!Bandwidth {
         switch (bw) {
-            bb.BB_BW_1_25M => return Bandwidth.bw_1_25m,
-            bb.BB_BW_2_5M => return Bandwidth.bw_2_5m,
-            bb.BB_BW_5M => return Bandwidth.bw_5m,
-            bb.BB_BW_10M => return Bandwidth.bw_10m,
-            bb.BB_BW_20M => return Bandwidth.bw_20m,
-            bb.BB_BW_40M => return Bandwidth.bw_40m,
+            c.BB_BW_1_25M => return Bandwidth.bw_1_25m,
+            c.BB_BW_2_5M => return Bandwidth.bw_2_5m,
+            c.BB_BW_5M => return Bandwidth.bw_5m,
+            c.BB_BW_10M => return Bandwidth.bw_10m,
+            c.BB_BW_20M => return Bandwidth.bw_20m,
+            c.BB_BW_40M => return Bandwidth.bw_40m,
             else => return BadEnum.BadEnum,
         }
     }
@@ -397,22 +397,22 @@ const TimeIntlvLen = enum {
 
     pub fn toC(len: TimeIntlvLen) u8 {
         const l: c_int = switch (len) {
-            .len_3 => bb.BB_TIMEINTLV_LEN_3,
-            .len_6 => bb.BB_TIMEINTLV_LEN_6,
-            .len_12 => bb.BB_TIMEINTLV_LEN_12,
-            .len_24 => bb.BB_TIMEINTLV_LEN_24,
-            .len_48 => bb.BB_TIMEINTLV_LEN_48,
+            .len_3 => c.BB_TIMEINTLV_LEN_3,
+            .len_6 => c.BB_TIMEINTLV_LEN_6,
+            .len_12 => c.BB_TIMEINTLV_LEN_12,
+            .len_24 => c.BB_TIMEINTLV_LEN_24,
+            .len_48 => c.BB_TIMEINTLV_LEN_48,
         };
         return @intCast(l);
     }
 
     pub fn fromC(len: c_int) BadEnum!TimeIntlvLen {
         switch (len) {
-            bb.BB_TIMEINTLV_LEN_3 => return TimeIntlvLen.len_3,
-            bb.BB_TIMEINTLV_LEN_6 => return TimeIntlvLen.len_6,
-            bb.BB_TIMEINTLV_LEN_12 => return TimeIntlvLen.len_12,
-            bb.BB_TIMEINTLV_LEN_24 => return TimeIntlvLen.len_24,
-            bb.BB_TIMEINTLV_LEN_48 => return TimeIntlvLen.len_48,
+            c.BB_TIMEINTLV_LEN_3 => return TimeIntlvLen.len_3,
+            c.BB_TIMEINTLV_LEN_6 => return TimeIntlvLen.len_6,
+            c.BB_TIMEINTLV_LEN_12 => return TimeIntlvLen.len_12,
+            c.BB_TIMEINTLV_LEN_24 => return TimeIntlvLen.len_24,
+            c.BB_TIMEINTLV_LEN_48 => return TimeIntlvLen.len_48,
             else => return BadEnum.BadEnum,
         }
     }
@@ -424,16 +424,16 @@ const TimeIntlvEnable = enum {
 
     pub fn toC(enable: TimeIntlvEnable) u8 {
         const e: c_int = switch (enable) {
-            .off => bb.BB_TIMEINTLV_OFF,
-            .on => bb.BB_TIMEINTLV_ON,
+            .off => c.BB_TIMEINTLV_OFF,
+            .on => c.BB_TIMEINTLV_ON,
         };
         return @intCast(e);
     }
 
     pub fn fromC(enable: c_int) BadEnum!TimeIntlvEnable {
         switch (enable) {
-            bb.BB_TIMEINTLV_OFF => return TimeIntlvEnable.off,
-            bb.BB_TIMEINTLV_ON => return TimeIntlvEnable.on,
+            c.BB_TIMEINTLV_OFF => return TimeIntlvEnable.off,
+            c.BB_TIMEINTLV_ON => return TimeIntlvEnable.on,
             else => return BadEnum.BadEnum,
         }
     }
@@ -445,25 +445,25 @@ const TimeIntlvNum = enum {
 
     pub fn toC(num: TimeIntlvNum) u8 {
         const n: c_int = switch (num) {
-            .block_1 => bb.BB_TIMEINTLV_1_BLOCK,
-            .block_2 => bb.BB_TIMEINTLV_2_BLOCK,
+            .block_1 => c.BB_TIMEINTLV_1_BLOCK,
+            .block_2 => c.BB_TIMEINTLV_2_BLOCK,
         };
         return @intCast(n);
     }
 
     pub fn fromC(num: c_int) BadEnum!TimeIntlvNum {
         switch (num) {
-            bb.BB_TIMEINTLV_1_BLOCK => return TimeIntlvNum.block_1,
-            bb.BB_TIMEINTLV_2_BLOCK => return TimeIntlvNum.block_2,
+            c.BB_TIMEINTLV_1_BLOCK => return TimeIntlvNum.block_1,
+            c.BB_TIMEINTLV_2_BLOCK => return TimeIntlvNum.block_2,
             else => return BadEnum.BadEnum,
         }
     }
 };
 
-pub const MacAddr = [@intCast(bb.BB_MAC_LEN)]u8;
+pub const MacAddr = [@intCast(c.BB_MAC_LEN)]u8;
 
 pub fn logWithMacAddr(logger: logz.Logger, key: []const u8, mac: *const MacAddr) logz.Logger {
-    if (bb.BB_MAC_LEN != 4) {
+    if (c.BB_MAC_LEN != 4) {
         @compileError("unmatched MAC address length");
     }
     return logger.fmt(key, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ mac[0], mac[1], mac[2], mac[3] });
@@ -476,18 +476,18 @@ pub const TxMode = enum {
 
     pub fn toC(mode: TxMode) u8 {
         const m: c_int = switch (mode) {
-            .tx_1tx => bb.BB_TX_1TX,
-            .tx_2tx_stbc => bb.BB_TX_2TX_STBC,
-            .tx_2tx_mimo => bb.BB_TX_2TX_MIMO,
+            .tx_1tx => c.BB_TX_1TX,
+            .tx_2tx_stbc => c.BB_TX_2TX_STBC,
+            .tx_2tx_mimo => c.BB_TX_2TX_MIMO,
         };
         return @intCast(m);
     }
 
     pub fn fromC(mode: c_int) BadEnum!TxMode {
         switch (mode) {
-            bb.BB_TX_1TX => return TxMode.tx_1tx,
-            bb.BB_TX_2TX_STBC => return TxMode.tx_2tx_stbc,
-            bb.BB_TX_2TX_MIMO => return TxMode.tx_2tx_mimo,
+            c.BB_TX_1TX => return TxMode.tx_1tx,
+            c.BB_TX_2TX_STBC => return TxMode.tx_2tx_stbc,
+            c.BB_TX_2TX_MIMO => return TxMode.tx_2tx_mimo,
             else => return BadEnum.BadEnum,
         }
     }
@@ -501,20 +501,20 @@ pub const RxMode = enum {
 
     pub fn toC(mode: RxMode) u8 {
         const m: c_int = switch (mode) {
-            .rx_1t1r => bb.BB_RX_1T1R,
-            .rx_1t2r => bb.BB_RX_1T2R,
-            .rx_2t2r_stbc => bb.BB_RX_2T2R_STBC,
-            .rx_2t2r_mimo => bb.BB_RX_2T2R_MIMO,
+            .rx_1t1r => c.BB_RX_1T1R,
+            .rx_1t2r => c.BB_RX_1T2R,
+            .rx_2t2r_stbc => c.BB_RX_2T2R_STBC,
+            .rx_2t2r_mimo => c.BB_RX_2T2R_MIMO,
         };
         return @intCast(m);
     }
 
     pub fn fromC(mode: c_int) BadEnum!RxMode {
         switch (mode) {
-            bb.BB_RX_1T1R => return RxMode.rx_1t1r,
-            bb.BB_RX_1T2R => return RxMode.rx_1t2r,
-            bb.BB_RX_2T2R_STBC => return RxMode.rx_2t2r_stbc,
-            bb.BB_RX_2T2R_MIMO => return RxMode.rx_2t2r_mimo,
+            c.BB_RX_1T1R => return RxMode.rx_1t1r,
+            c.BB_RX_1T2R => return RxMode.rx_1t2r,
+            c.BB_RX_2T2R_STBC => return RxMode.rx_2t2r_stbc,
+            c.BB_RX_2T2R_MIMO => return RxMode.rx_2t2r_mimo,
             else => return BadEnum.BadEnum,
         }
     }
@@ -548,7 +548,7 @@ const PhyStatus = struct {
         };
     }
 
-    pub fn fromC(status: *const bb.bb_phy_status_t, is_tx: bool) BadEnum!Self {
+    pub fn fromC(status: *const c.bb_phy_status_t, is_tx: bool) BadEnum!Self {
         var rf_mode: RfMode = undefined;
         if (is_tx) {
             rf_mode = RfMode{ .tx = try TxMode.fromC(@intCast(status.rf_mode)) };
@@ -593,7 +593,7 @@ const LinkStatus = struct {
     }
 
     const Self = @This();
-    pub fn fromC(status: *const bb.bb_link_status_t) BadEnum!Self {
+    pub fn fromC(status: *const c.bb_link_status_t) BadEnum!Self {
         return Self{
             .state = try LinkState.fromC(@intCast(status.state)),
             .rx_mcs = PhyMcs.fromC(@intCast(status.rx_mcs)),
@@ -610,7 +610,7 @@ const LinkStatus = struct {
     }
 };
 
-pub fn logWithUserStatus(logger: logz.Logger, status: *const bb.bb_user_status_t) logz.Logger {
+pub fn logWithUserStatus(logger: logz.Logger, status: *const c.bb_user_status_t) logz.Logger {
     const tx = &status.tx_status;
     const rx = &status.rx_status;
     var lg = logger.string("user", "tx");
@@ -679,7 +679,7 @@ pub const Status = struct {
         return self.bmp_status(alloc, self.rt_bmp);
     }
 
-    pub fn fromC(status: *const bb.bb_get_status_out_t) BadEnum!Self {
+    pub fn fromC(status: *const c.bb_get_status_out_t) BadEnum!Self {
         var user_status: [SLOT_MAX]UserStatus = undefined;
         var link_status: [SLOT_MAX]LinkStatus = undefined;
         for (0..SLOT_MAX) |i| {
@@ -724,7 +724,7 @@ pub const Status = struct {
     }
 };
 
-pub fn logWithPhyStatus(logger: logz.Logger, status: *const bb.bb_phy_status_t, is_tx: bool) logz.Logger {
+pub fn logWithPhyStatus(logger: logz.Logger, status: *const c.bb_phy_status_t, is_tx: bool) logz.Logger {
     const st = PhyStatus.fromC(status, is_tx) catch {
         return logger
             .string("error", "invalid `bb_phy_status_t`")
@@ -733,7 +733,7 @@ pub fn logWithPhyStatus(logger: logz.Logger, status: *const bb.bb_phy_status_t, 
     return st.logWith(logger);
 }
 
-pub fn logWithLinkStatus(logger: logz.Logger, status: *const bb.bb_link_status_t) logz.Logger {
+pub fn logWithLinkStatus(logger: logz.Logger, status: *const c.bb_link_status_t) logz.Logger {
     const st = LinkStatus.fromC(status) catch {
         return logger
             .string("error", "invalid `bb_link_status_t`")
@@ -742,7 +742,7 @@ pub fn logWithLinkStatus(logger: logz.Logger, status: *const bb.bb_link_status_t
     return st.logWith(logger);
 }
 
-pub fn logWithStatus(logger: logz.Logger, status: *const bb.bb_get_status_out_t) logz.Logger {
+pub fn logWithStatus(logger: logz.Logger, status: *const c.bb_get_status_out_t) logz.Logger {
     const st = Status.fromC(status) catch {
         return logger
             .string("error", "invalid `bb_get_status_out_t`")

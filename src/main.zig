@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const logz = @import("logz");
-const bb = @import("bb/c.zig");
-const bt = @import("bb/t.zig");
+const bb = @import("bb/t.zig");
+const c = bb.c;
 const UsbPack = @import("bb/usbpack.zig").UsbPack;
 const ManagedUsbPack = @import("bb/usbpack.zig").ManagedUsbPack;
 const utils = @import("utils.zig");
@@ -34,7 +34,7 @@ const printStrDesc = helper.printStrDesc;
 const usbSpeedToString = helper.usbSpeedToString;
 const libusb_error_2_set = helper.libusb_error_2_set;
 
-const ArtoStatus = bt.Status;
+const ArtoStatus = bb.Status;
 
 /// Select every possible slot (14 slot?).
 /// Anyway it's a magic number.
@@ -49,9 +49,9 @@ const TRANSFER_BUF_SIZE = 3072;
 const DEFAULT_THREAD_STACK_SIZE = 16 * 1024 * 1024;
 const MAX_SERIAL_SIZE = 32;
 const REFRESH_CONTAINER_DEFAULT_CAP = 4;
-const BB_STA_OK = bt.STA_OK;
+const BB_STA_OK = bb.STA_OK;
 const LIBUSB_OK = helper.LIBUSB_OK;
-const BB_SEL_SLOT = bb.BB_SLOT_0;
+const BB_SEL_SLOT = c.BB_SLOT_0;
 const BB_SEL_PORT = 3;
 const BB_ERROR_ALREADY_OPENED_SOCKET = 257;
 const BB_ERROR_UNSPECIFIED = -259;
@@ -64,7 +64,10 @@ const BB_SOCKET_SEND_ERROR: i32 = -0x108;
 const BB_REQID_DEBUG_ENABLE = 0x05000000;
 const BB_REQID_DEBUG_WRITE = 0x05000001;
 
+/// whether log the content when `tx`/`rx` involve
 const is_log_content: bool = false;
+/// whether log the content when logging the `UsbPack`
+const is_log_packet_content: bool = true;
 
 const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
     .thread_safe = true,
@@ -210,7 +213,9 @@ const PackObserverList = struct {
                         on_err(self, pack, o, e);
                     } else {
                         const h = o.xxhash();
-                        pack.withLogger(utils.logWithSrc(logz.warn(), @src()).fmt("what", "unhandled observer(0x{x:0>4}) error", .{h})).err(e).log();
+                        pack.withLogger(utils.logWithSrc(logz.warn(), @src())
+                            .fmt("what", "unhandled observer(0x{x:0>4}) error", .{h}), is_log_packet_content)
+                            .err(e).log();
                     }
                 };
                 cnt += 1;
@@ -218,7 +223,8 @@ const PackObserverList = struct {
         }
 
         if (cnt == 0) {
-            pack.withLogger(utils.logWithSrc(logz.warn(), @src())).string("what", "no observer is notified").log();
+            pack.withLogger(utils.logWithSrc(logz.warn(), @src()), is_log_packet_content)
+                .string("what", "no observer is notified").log();
         }
     }
 
@@ -474,8 +480,8 @@ const DeviceContext = struct {
             return &self._status;
         }
 
-        pub inline fn setWithBBStatus(self: *@This(), new_bb_status: *const bb.bb_get_status_out_t) !void {
-            const new_status = try bt.Status.fromC(new_bb_status);
+        pub inline fn setWithBBStatus(self: *@This(), new_bb_status: *const c.bb_get_status_out_t) !void {
+            const new_status = try bb.Status.fromC(new_bb_status);
             self.setStatus(&new_status);
         }
 
@@ -787,7 +793,7 @@ const DeviceContext = struct {
         WritePointer.position += payload.len;
         const payload_slice = try list.addManyAsSlice(payload.len);
         @memcpy(payload_slice, payload);
-        const reqid = bt.socketRequestId(.write, BB_SEL_SLOT, BB_SEL_PORT);
+        const reqid = bb.socketRequestId(.write, BB_SEL_SLOT, BB_SEL_PORT);
         return self.transmitSliceWithPack(alloc, reqid, list.items);
     }
 
@@ -1104,8 +1110,8 @@ const MagicSocketCallback = struct {
     dev: *DeviceContext,
     const Self = @This();
 
-    const WriteSocketReqid = bt.socketRequestId(.write, BB_SEL_SLOT, BB_SEL_PORT);
-    const ReadSocketReqid = bt.socketRequestId(.read, BB_SEL_SLOT, BB_SEL_PORT);
+    const WriteSocketReqid = bb.socketRequestId(.write, BB_SEL_SLOT, BB_SEL_PORT);
+    const ReadSocketReqid = bb.socketRequestId(.read, BB_SEL_SLOT, BB_SEL_PORT);
 
     const Observer = PackObserverList.Observer;
 
@@ -1329,11 +1335,11 @@ const ActionCallback = struct {
     // as we don't have proper async/await support
 
     pub fn query_status_send(self: *@This()) !void {
-        var in = bb.bb_get_status_in_t{
+        var in = c.bb_get_status_in_t{
             .user_bmp = SLOT_BIT_MAP_MAX,
         };
-        try self.dev.transmitWithPack(self.arena.allocator(), bb.BB_GET_STATUS, &in);
-        const predicate = Self.make_reqid_predicate(bb.BB_GET_STATUS);
+        try self.dev.transmitWithPack(self.arena.allocator(), c.BB_GET_STATUS, &in);
+        const predicate = Self.make_reqid_predicate(c.BB_GET_STATUS);
         var subject = self.dev.rxObservable();
         subject.subscribe(
             &predicate,
@@ -1347,8 +1353,8 @@ const ActionCallback = struct {
     pub fn query_status_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
         const ud = obs.userdata;
         var self = Self.as(ud);
-        const status = try pack.dataAs(bb.bb_get_status_out_t);
-        bt.logWithStatus(self.dev.withSrcLogger(logz.info(), @src()), &status).log();
+        const status = try pack.dataAs(c.bb_get_status_out_t);
+        bb.logWithStatus(self.dev.withSrcLogger(logz.info(), @src()), &status).log();
         try self.dev.arto.setWithBBStatus(&status);
         // ***** and_then *****
         try self.query_info_send();
@@ -1357,8 +1363,8 @@ const ActionCallback = struct {
     }
 
     pub fn query_info_send(self: *@This()) !void {
-        try self.dev.transmitWithPack(self.arena.allocator(), bb.BB_GET_SYS_INFO, null);
-        const predicate = Self.make_reqid_predicate(bb.BB_GET_SYS_INFO);
+        try self.dev.transmitWithPack(self.arena.allocator(), c.BB_GET_SYS_INFO, null);
+        const predicate = Self.make_reqid_predicate(c.BB_GET_SYS_INFO);
         var subject = self.dev.rxObservable();
         subject.subscribe(
             &predicate,
@@ -1373,7 +1379,7 @@ const ActionCallback = struct {
         std.debug.assert(pack.sta == BB_STA_OK);
         const ud = obs.userdata;
         var self = Self.as(ud);
-        const info = try pack.dataAs(bb.bb_get_sys_info_out_t);
+        const info = try pack.dataAs(c.bb_get_sys_info_out_t);
 
         const compile_time: [*:0]const u8 = @ptrCast(&info.compile_time);
         const soft_ver: [*:0]const u8 = @ptrCast(&info.soft_ver);
@@ -1402,19 +1408,50 @@ const ActionCallback = struct {
     /// subscribe an event, don't care if it's successful or not.
     /// I don't care the response.
     /// without closure it's become tedious.
-    pub fn subscribe_event_no_response(self: *@This(), event: bt.Event) !void {
-        const req = bt.subscribeRequestId(event);
+    pub fn subscribe_event_no_response(self: *@This(), event: bb.Event) !void {
+        const req = bb.subscribeRequestId(event);
         try self.dev.transmitWithPack(self.arena.allocator(), req, null);
     }
 
-    const OpenRequestId = bt.socketRequestId(.open, @intCast(BB_SEL_SLOT), @intCast(BB_SEL_PORT));
+    const OpenRequestId = bb.socketRequestId(.open, @intCast(BB_SEL_SLOT), @intCast(BB_SEL_PORT));
+    const CloseRequestId = bb.socketRequestId(.close, @intCast(BB_SEL_SLOT), @intCast(BB_SEL_PORT));
     const OpenSocketError = error{
         AlreadyOpened,
         Unspecified,
     };
 
+    fn try_socket_close(self: *@This()) !void {
+        const flag: u8 = @intCast(c.BB_SOCK_FLAG_TX | c.BB_SOCK_FLAG_RX);
+        // see `session_socket.c:232`
+        const buf = &[_]u8{
+            flag, 0x00, 0x00, 0x00, // flags, with alignment
+            0x00, 0x08, 0x00, 0x00, // 2048 in `bb.bb_sock_opt_t.tx_buf_size`
+            0x00, 0x0c, 0x00, 0x00, // 3072 in `bb.bb_sock_opt_t.rx_buf_size`
+        };
+        try self.dev.transmitSliceWithPack(self.arena.allocator(), CloseRequestId, buf);
+    }
+    pub fn close_socket_send(self: *@This()) !void {
+        try self.try_socket_close();
+        var subject = self.dev.rxObservable();
+        const predicate = Self.make_reqid_predicate(CloseRequestId);
+        subject.subscribe(
+            &predicate,
+            &Self.close_socket_on_data,
+            null,
+            self,
+            null,
+        ) catch unreachable;
+    }
+    pub fn close_socket_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
+        const ud = obs.userdata;
+        var self = Self.as(ud);
+        std.debug.assert(pack.sta == BB_STA_OK);
+        try self.try_socket_open();
+        sbj.unsubscribe(obs) catch unreachable;
+    }
+
     fn try_socket_open(self: *@This()) !void {
-        const flag: u8 = @intCast(bb.BB_SOCK_FLAG_TX | bb.BB_SOCK_FLAG_RX);
+        const flag: u8 = @intCast(c.BB_SOCK_FLAG_TX | c.BB_SOCK_FLAG_RX);
         // see `session_socket.c:232`
         const buf = &[_]u8{
             flag, 0x00, 0x00, 0x00, // flags, with alignment
@@ -1423,7 +1460,6 @@ const ActionCallback = struct {
         };
         try self.dev.transmitSliceWithPack(self.arena.allocator(), OpenRequestId, buf);
     }
-
     pub fn open_socket_send(self: *@This()) !void {
         try self.try_socket_open();
         var subject = self.dev.rxObservable();
@@ -1438,8 +1474,7 @@ const ActionCallback = struct {
     }
     pub const open_socket_on_error = Self.make_generic_error_handler("failed to open socket");
     pub fn open_socket_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
-        // if we must handle these shit
-        // we'd better make a state machine
+        // TODO: use state machine
         const ud = obs.userdata;
         var self = Self.as(ud);
         switch (pack.sta) {
@@ -1452,12 +1487,13 @@ const ActionCallback = struct {
                     .log();
             },
             BB_ERROR_ALREADY_OPENED_SOCKET => {
-                try self.listen_to_socket();
                 self.dev.withSrcLogger(logz.info(), @src())
                     .int("slot", BB_SEL_SLOT)
                     .int("port", BB_SEL_PORT)
-                    .string("what", "reuse opened socket")
+                    .string("what", "socket opened, try to close it than reopen")
                     .log();
+                try close_socket_send(self);
+                return;
             },
             BB_ERROR_UNSPECIFIED => return OpenSocketError.Unspecified,
             else => std.debug.panic("unexpected status {d}", .{pack.sta}),
@@ -1565,7 +1601,7 @@ const TransferCallback = struct {
             var mpk_ = ManagedUsbPack.unmarshal(self.alloc, rx_buf);
             if (mpk_) |*mpk| {
                 lg = utils.logWithSrc(self.dev.withLogger(logz.debug()), @src());
-                mpk.pack.withLogger(lg).log();
+                mpk.pack.withLogger(lg, is_log_packet_content).log();
                 self.dev.xfer.rx_queue.enqueue(mpk.*) catch |e| {
                     lg = utils.logWithSrc(self.dev.withLogger(logz.err()), @src());
                     lg.err(e).string("what", "failed to enqueue").log();

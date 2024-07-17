@@ -32,7 +32,7 @@ pub fn PointeeType(comptime T: type) type {
     switch (@typeInfo(T)) {
         .Pointer => |info| return info.child,
         .Optional => |info| return info.child,
-        else => @compileError("T is expected to be a pointer, found `" ++ @typeName(T) ++ "`"),
+        else => @compileError("T is expected to be a pointer like, found `" ++ @typeName(T) ++ "`"),
     }
 }
 
@@ -74,6 +74,7 @@ pub fn anytype2Slice(src: anytype) []const u8 {
             switch (@typeInfo(T)) {
                 // prevent nested pointer type, usually it's not meaningful and error-prone
                 .Pointer => @compileError("nested pointer type is not allowed, found `" ++ @typeName(P) ++ "`"),
+                .Optional => @compileError("nested pointer type is not allowed, found `" ++ @typeName(P) ++ "`"),
                 else => {},
             }
             const size = @sizeOf(T);
@@ -286,6 +287,10 @@ pub fn u8ToArray(u: u8, comptime msb_first: bool) [8]bool {
         ret[7] = (u & 0x80) != 0x00;
     }
     return ret;
+}
+
+pub fn as(comptime T: type, ud: ?*anyopaque) *T {
+    return @alignCast(@ptrCast(ud.?));
 }
 
 const expect = std.testing.expect;

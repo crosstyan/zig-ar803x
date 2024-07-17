@@ -231,9 +231,14 @@ const PackObserverList = struct {
                         on_err(self, pack, o, e);
                     } else {
                         const h = o.xxhash();
-                        pack.withLogger(utils.logWithSrc(logz.warn(), @src())
-                            .fmt("what", "unhandled observer(0x{x:0>4}) error", .{h}), is_log_packet_content)
-                            .err(e).log();
+                        var lg = pack.withLogger(utils.logWithSrc(logz.warn(), @src())
+                            .fmt("what", "unhandled observer(0x{x:0>8}) error", .{h}), is_log_packet_content)
+                            .err(e);
+                        switch (o.predicate) {
+                            .func => |f| lg = lg.fmt("predicate_fn", "{*}", .{f}),
+                            .reqid => |id| lg = lg.fmt("reqid", "0x{x:0>8}", .{id}),
+                        }
+                        lg.log();
                     }
                 };
                 cnt += 1;
@@ -499,6 +504,51 @@ const DeviceContext = struct {
         _last_status_updated: i64 = NEVER_UPDATED,
         _magic_socket: MagicSocket = undefined,
 
+        const UpdateStatusCallback = struct {
+            dev: *DeviceContext,
+            const Observer = PackObserverList.Observer;
+
+            pub fn create(arg_dev: *DeviceContext) !*@This() {
+                var self = try arg_dev.allocator().create(@This());
+                self.dev = arg_dev;
+                return self;
+            }
+
+            pub fn subscribe(self: *@This()) !void {
+                const Callback = @This();
+                const predicate = Observer.Predicate{ .reqid = c.BB_GET_STATUS };
+                var subject = self.dev.rxObservable();
+                try subject.subscribe(
+                    predicate,
+                    &Callback.onData,
+                    null,
+                    self,
+                    @ptrCast(&Callback.deinit),
+                );
+            }
+
+            pub fn deinit(self: *@This()) void {
+                self.dev.allocator().destroy(self);
+            }
+
+            pub fn onData(_: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
+                const ud = obs.userdata;
+                var self = utils.as(@This(), ud);
+                const st = try pack.dataAs(c.bb_get_status_out_t);
+                bb.logWithStatus(self.dev.withSrcLogger(logz.info(), @src()), &st).log();
+                try self.dev.arto.setWithBBStatus(&st);
+            }
+        };
+
+        pub inline fn dev(self: *@This()) *DeviceContext {
+            return @fieldParentPtr("arto", self);
+        }
+
+        pub inline fn initCallback(self: *@This()) !void {
+            var cb = try UpdateStatusCallback.create(self.dev());
+            try cb.subscribe();
+        }
+
         pub inline fn status(self: *const @This()) ?*const ArtoStatus {
             if (self._last_status_updated == NEVER_UPDATED) {
                 return null;
@@ -583,6 +633,175 @@ const DeviceContext = struct {
         }
     };
 
+    /// one should call `create` to initialize the sockets
+    const ExternalSockets = struct {
+        _has_init: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        _downstream: network.Socket = undefined,
+        _upstream: network.Socket = undefined,
+        upstream_thread: std.Thread = undefined,
+        const Ext = @This();
+
+        const DownStreamCallback = struct {
+            dev: *DeviceContext,
+            const Observer = PackObserverList.Observer;
+
+            pub fn create(arg_dev: *DeviceContext) !*@This() {
+                var self = try arg_dev.allocator().create(@This());
+                self.dev = arg_dev;
+                return self;
+            }
+
+            pub fn subscribe(self: *@This()) !void {
+                const Callback = @This();
+                const magic_socket = self.dev.magicSocket();
+                const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.read) };
+                var subject = self.dev.rxObservable();
+                try subject.subscribe(
+                    predicate,
+                    &Callback.onData,
+                    null,
+                    self,
+                    @ptrCast(&Callback.deinit),
+                );
+            }
+
+            pub fn deinit(self: *@This()) void {
+                self.dev.allocator().destroy(self);
+            }
+
+            pub fn onData(_: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
+                const ud = obs.userdata;
+                const self = utils.as(@This(), ud);
+                var down = &self.dev.ext._downstream;
+                const buf = try pack.data();
+                const sz = try down.send(buf);
+                if (sz != buf.len) {
+                    return AppError.BadSize;
+                }
+            }
+        };
+
+        pub inline fn dev(self: *@This()) *DeviceContext {
+            return @fieldParentPtr("ext", self);
+        }
+
+        pub inline fn initCallback(self: *@This()) !void {
+            var cb = try DownStreamCallback.create(self.dev());
+            try cb.subscribe();
+        }
+
+        pub inline fn downstream(self: *@This()) ?*network.Socket {
+            if (!self.hasInit()) {
+                return null;
+            }
+            return &self._downstream;
+        }
+
+        pub inline fn upstream(self: *@This()) ?*network.Socket {
+            if (!self.hasInit()) {
+                return null;
+            }
+            return &self._upstream;
+        }
+
+        /// unless fully certain that the sockets are initialized
+        /// you should check this field before using the sockets
+        pub inline fn hasInit(self: *const @This()) bool {
+            return self._has_init.load(std.builtin.AtomicOrder.unordered);
+        }
+
+        fn upstreamIter(self: *@This()) !void {
+            var buf: [BB_SOCKET_TX_BUFFER]u8 = undefined;
+            const n = try self._upstream.receive(buf[0..]);
+            if (n == 0) {
+                return AppError.Empty;
+            }
+            try self.dev().transmitViaSocket(buf[0..n]);
+        }
+
+        fn upstreamLoop(self: *@This()) void {
+            while (self.hasInit()) {
+                self.upstreamIter() catch |e| {
+                    switch (e) {
+                        error.ConnectionTimedOut => continue,
+                        AppError.Empty => continue,
+                        else => {
+                            self.dev().withSrcLogger(logz.err(), @src())
+                                .string("what", "upstream loop exception")
+                                .err(e).log();
+                            break;
+                        },
+                    }
+                };
+            }
+            self.dev().withSrcLogger(logz.info(), @src())
+                .string("what", "exit upstream loop").log();
+        }
+
+        fn initForward(self: *@This()) !void {
+            const config = std.Thread.SpawnConfig{
+                .stack_size = DEFAULT_THREAD_STACK_SIZE,
+                .allocator = self.dev().allocator(),
+            };
+            try self._upstream.setReadTimeout(std.time.us_per_ms * 100);
+            self.upstream_thread = try std.Thread.spawn(config, Ext.upstreamLoop, .{self});
+            try self.initCallback();
+        }
+
+        pub fn init(
+            self: *@This(),
+            upstream_listen_port: u16,
+            downstream_endpoint: network.EndPoint,
+        ) !void {
+            if (self.hasInit()) {
+                return AppError.HasInit;
+            }
+            var ds = try network.Socket.create(.ipv4, .udp);
+            try ds.connect(downstream_endpoint);
+            errdefer ds.close();
+            const a = &downstream_endpoint.address.ipv4.value;
+            logz.info()
+                .string("what", "downstream connected")
+                .fmt("address", "{}.{}.{}.{}", .{ a[0], a[1], a[2], a[3] })
+                .int("port", downstream_endpoint.port).log();
+
+            var us = try network.Socket.create(.ipv4, .udp);
+            try us.bind(network.EndPoint{
+                .address = try network.Address.parse("0.0.0.0"),
+                .port = upstream_listen_port,
+            });
+            errdefer us.close();
+            // it can provide port 0 to bind() as its connection parameter. That
+            // triggers the operating system to automatically search for and
+            // return a suitable available port in the TCP/IP dynamic port
+            // number range.
+            const addr = try us.getLocalEndPoint();
+            if (upstream_listen_port == 0) {
+                logz.info()
+                    .string("what", "dynamic upstream port requested")
+                    .int("port", addr.port).log();
+            } else {
+                logz.info()
+                    .string("what", "upstream")
+                    .int("port", addr.port).log();
+            }
+            self._has_init.store(true, std.builtin.AtomicOrder.unordered);
+            self._downstream = ds;
+            self._upstream = us;
+            try self.initForward();
+        }
+
+        pub fn deinit(self: *@This()) void {
+            if (!self.hasInit()) {
+                return;
+            }
+            self._has_init.store(false, std.builtin.AtomicOrder.unordered);
+            self.upstream_thread.join();
+            self._downstream.close();
+            self._upstream.close();
+        }
+    };
+
     const Self = @This();
 
     // ****** fields ******
@@ -595,6 +814,7 @@ const DeviceContext = struct {
     endpoints: []Endpoint,
     xfer: TransferContext,
     arto: ArtoContext,
+    ext: ExternalSockets,
 
     _ports_buf: [USB_MAX_PORTS]u8 = undefined,
     _ports_len: usize = 0,
@@ -699,6 +919,7 @@ const DeviceContext = struct {
             .endpoints = eps,
             .xfer = undefined,
             .arto = ArtoContext{},
+            .ext = ExternalSockets{},
         };
 
         std.debug.assert(sn.len <= MAX_SERIAL_SIZE);
@@ -956,7 +1177,7 @@ const DeviceContext = struct {
     fn initTransferTx(self: *@This(), ep: *Endpoint) void {
         const alloc = self.allocator();
         var transfer: *Transfer = &self.xfer.tx_transfer;
-        const cb = TransferCallback.init(
+        const cb = TransferCallback.create(
             alloc,
             self,
             transfer,
@@ -979,7 +1200,7 @@ const DeviceContext = struct {
         var ret: c_int = undefined;
         const alloc = self.allocator();
         var transfer: *Transfer = &self.xfer.rx_transfer;
-        const cb = TransferCallback.init(
+        const cb = TransferCallback.create(
             alloc,
             self,
             transfer,
@@ -1021,7 +1242,7 @@ const DeviceContext = struct {
         // for the running of observable
         self.initThreads();
 
-        var debug_cb = MagicSocketCallback.init(self.allocator(), self) catch unreachable;
+        var debug_cb = MagicSocketCallback.create(self.allocator(), self) catch unreachable;
         debug_cb.subscribe_debug() catch unreachable;
         self.transmitWithPack(self.allocator(), BB_REQID_DEBUG_ENABLE, null) catch unreachable;
         self.waitForTxComplete();
@@ -1030,8 +1251,8 @@ const DeviceContext = struct {
         //
         // we only needs a little push to start the chain
         // query_status.than(query_info).than(open_socket)
-        var action = ActionCallback.init(self.allocator(), self) catch unreachable;
-        action.query_status_send() catch unreachable;
+        var action = InitActionCallback.create(self.allocator(), self) catch unreachable;
+        action.status_query_send() catch unreachable;
     }
 
     /// run `loopPrepare` in a separate thread
@@ -1237,11 +1458,7 @@ const MagicSocketCallback = struct {
 
     const Observer = PackObserverList.Observer;
 
-    pub fn as(ud: ?*anyopaque) *Self {
-        return @alignCast(@ptrCast(ud.?));
-    }
-
-    pub fn init(alloc: std.mem.Allocator, dev: *DeviceContext) !*Self {
+    pub fn create(alloc: std.mem.Allocator, dev: *DeviceContext) !*Self {
         var ret = try alloc.create(Self);
         ret.allocator = alloc;
         ret.dev = dev;
@@ -1301,7 +1518,7 @@ const MagicSocketCallback = struct {
     /// What's `wr_cpl_max` and `wr_cpl_init`?
     pub fn write_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
         const ud = obs.userdata;
-        var self = Self.as(ud);
+        var self = utils.as(@This(), ud);
         _ = sbj;
         var socket = self.dev.magicSocket();
         if (pack.sta >= 0) {
@@ -1371,7 +1588,7 @@ const MagicSocketCallback = struct {
     }
     pub fn read_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
         const ud = obs.userdata;
-        var self = Self.as(ud);
+        var self = utils.as(@This(), ud);
         var socket = self.dev.magicSocket();
         _ = sbj;
         // the magic sta, no idea what it means
@@ -1403,7 +1620,7 @@ const MagicSocketCallback = struct {
     }
     pub fn debug_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
         const ud = obs.userdata;
-        const self = Self.as(ud);
+        const self = utils.as(@This(), ud);
         _ = self;
         _ = sbj;
         std.debug.assert(pack.sta == BB_STA_OK);
@@ -1415,7 +1632,7 @@ const MagicSocketCallback = struct {
 };
 
 /// only used in `DeviceContext.loopPrepare`
-const ActionCallback = struct {
+const InitActionCallback = struct {
     arena: std.heap.ArenaAllocator,
     /// reference, not OWNING
     dev: *DeviceContext,
@@ -1427,7 +1644,7 @@ const ActionCallback = struct {
         return @alignCast(@ptrCast(ud.?));
     }
 
-    pub fn init(alloc: std.mem.Allocator, dev: *DeviceContext) !*Self {
+    pub fn create(alloc: std.mem.Allocator, dev: *DeviceContext) !*Self {
         var arena = std.heap.ArenaAllocator.init(alloc);
         var ret = try arena.allocator().create(Self);
         ret.arena = arena;
@@ -1471,8 +1688,8 @@ const ActionCallback = struct {
 
     /// listen to the magic socket write/read by creating callbacks
     pub fn listen_to_socket(self: *@This()) !void {
-        var socket_cb_write = try MagicSocketCallback.init(self.dev.allocator(), self.dev);
-        var socket_cb_read = try MagicSocketCallback.init(self.dev.allocator(), self.dev);
+        var socket_cb_write = try MagicSocketCallback.create(self.dev.allocator(), self.dev);
+        var socket_cb_read = try MagicSocketCallback.create(self.dev.allocator(), self.dev);
         try socket_cb_write.subscribe_write();
         try socket_cb_read.subscribe_read();
     }
@@ -1489,48 +1706,49 @@ const ActionCallback = struct {
     // although it might confuse the reader,
     // as we don't have proper async/await support
 
-    pub fn query_status_send(self: *@This()) !void {
+    pub fn status_query_send(self: *@This()) !void {
         var in = c.bb_get_status_in_t{
             .user_bmp = SLOT_BIT_MAP_MAX,
         };
         try self.dev.transmitWithPack(self.arena.allocator(), c.BB_GET_STATUS, &in);
         const predicate = Observer.Predicate{ .reqid = c.BB_GET_STATUS };
         var subject = self.dev.rxObservable();
+        // `UpdateStatusCallback` is responsible for updating the status
+        try self.dev.arto.initCallback();
+
+        // `query_status_on_data` responsible for pushing the next initialization action
         subject.subscribe(
             predicate,
-            &Self.query_status_on_data,
-            &Self.query_status_on_error,
+            &Self.status_on_data,
+            &Self.status_on_error,
             self,
             null,
         ) catch unreachable;
     }
-    pub const query_status_on_error = Self.make_generic_error_handler("failed to query status");
-    pub fn query_status_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
+    pub const status_on_error = Self.make_generic_error_handler("exception on handle status query response");
+    pub fn status_on_data(sbj: *PackObserverList, _: *const UsbPack, obs: *Observer) !void {
         const ud = obs.userdata;
         var self = Self.as(ud);
-        const status = try pack.dataAs(c.bb_get_status_out_t);
-        bb.logWithStatus(self.dev.withSrcLogger(logz.info(), @src()), &status).log();
-        try self.dev.arto.setWithBBStatus(&status);
         // ***** and_then *****
-        try self.query_info_send();
+        try self.sys_info_query_send();
 
         sbj.unsubscribe(obs) catch unreachable;
     }
 
-    pub fn query_info_send(self: *@This()) !void {
+    pub fn sys_info_query_send(self: *@This()) !void {
         try self.dev.transmitWithPack(self.arena.allocator(), c.BB_GET_SYS_INFO, null);
         const predicate = PackObserverList.Predicate{ .reqid = c.BB_GET_SYS_INFO };
         var subject = self.dev.rxObservable();
         subject.subscribe(
             predicate,
-            &Self.query_info_on_data,
-            &Self.query_info_on_error,
+            &Self.sys_info_on_data,
+            &Self.sys_info_on_error,
             self,
             null,
         ) catch unreachable;
     }
-    pub const query_info_on_error = Self.make_generic_error_handler("failed to query info");
-    pub fn query_info_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
+    pub const sys_info_on_error = Self.make_generic_error_handler("exception on handle system info query response");
+    pub fn sys_info_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
         std.debug.assert(pack.sta == BB_STA_OK);
         const ud = obs.userdata;
         var self = Self.as(ud);
@@ -1624,6 +1842,24 @@ const ActionCallback = struct {
                 skt.withLogger(self.dev.withSrcLogger(logz.info(), @src()))
                     .string("what", "socket opened")
                     .log();
+                if (self.dev.arto.status()) |status| {
+                    var upstream_listen_port: u16 = undefined;
+                    var downstream_endpoint: network.EndPoint = undefined;
+                    if (status.role == .dev) {
+                        upstream_listen_port = 39000;
+                        downstream_endpoint = network.EndPoint{
+                            .address = try network.Address.parse("127.0.0.1"),
+                            .port = 39001,
+                        };
+                    } else {
+                        upstream_listen_port = 38000;
+                        downstream_endpoint = network.EndPoint{
+                            .address = try network.Address.parse("127.0.0.1"),
+                            .port = 38001,
+                        };
+                    }
+                    try self.dev.ext.init(upstream_listen_port, downstream_endpoint);
+                }
             },
             BB_ERROR_ALREADY_OPENED_SOCKET => {
                 skt.withLogger(self.dev.withSrcLogger(logz.warn(), @src()))
@@ -1662,7 +1898,7 @@ const TransferCallback = struct {
     endpoint: Endpoint,
     const Self = @This();
 
-    pub fn init(alloc: std.mem.Allocator, dev: *DeviceContext, transfer: *DeviceContext.Transfer, endpoint: Endpoint) !*Self {
+    pub fn create(alloc: std.mem.Allocator, dev: *DeviceContext, transfer: *DeviceContext.Transfer, endpoint: Endpoint) !*Self {
         var ret = try alloc.create(@This());
         ret.alloc = alloc;
         ret.dev = dev;

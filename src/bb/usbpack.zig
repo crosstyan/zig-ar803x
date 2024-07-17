@@ -28,7 +28,7 @@ pub const XorAcc = struct {
         self.updateSlice(bytes[0..]);
     }
 
-    pub inline fn peek(self: *@This()) u8 {
+    pub inline fn peek(self: *const @This()) u8 {
         return self.state;
     }
 
@@ -39,14 +39,6 @@ pub const XorAcc = struct {
     }
 };
 
-pub fn xorCheck(buf: []const u8) u8 {
-    var xor: u8 = 0xff;
-    for (buf) |byte| {
-        xor ^= byte;
-    }
-    return xor;
-}
-
 pub const UnmarshalError = error{
     InvalidStartMagic,
     InvalidEndMagic,
@@ -55,7 +47,7 @@ pub const UnmarshalError = error{
 const NoContent = error{NoContent};
 const HasContent = error{HasContent};
 
-// Note that this struct is NOT owning `data`
+/// Note that `UsbPack` is NOT owning `data` (`ptr` and `len`)
 pub const UsbPack = packed struct {
     reqid: u32,
     msgid: u32,
@@ -258,7 +250,7 @@ pub const UsbPack = packed struct {
 
     pub fn withLogger(pack: *const Self, logger: logz.Logger, comptime is_log_content: bool) logz.Logger {
         var lg = logger
-            .int("reqid", pack.reqid)
+            .fmt("reqid", "0x{x:0>8}", .{pack.reqid})
             .int("msgid", pack.msgid)
             .int("sta", pack.sta);
         if (pack.data()) |d| {

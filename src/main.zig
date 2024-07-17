@@ -77,12 +77,6 @@ const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
 const UsbPackQueue = LockedQueue(ManagedUsbPack, 8);
 const is_windows = builtin.os.tag == .windows;
 
-/// can only use `BB_SEL_SLOT` and `BB_SEL_PORT`.
-/// Given that the `slot` and `port` are fixed, it's okay for now
-pub inline fn comptimeRequestId(opt: bb.SoCmdOpt) u32 {
-    return comptime bb.socketRequestId(opt, BB_SEL_SLOT, BB_SEL_PORT);
-}
-
 /// A naive implementation of the observer pattern for `UsbPack`
 ///
 /// See also
@@ -97,6 +91,7 @@ const PackObserverList = struct {
         NotFound,
     };
 
+    pub const Predicate = Observer.Predicate;
     pub const OnDataFn = fn (*PackObserverList, *const UsbPack, *Observer) anyerror!void;
     pub const OnDataFnPtr = *const OnDataFn;
 
@@ -113,7 +108,8 @@ const PackObserverList = struct {
     // Observer provider could use
     // reference counting in dtor
     const Observer = struct {
-        predicate: PredicateFnPtr,
+        pub const Predicate = union(enum) { func: PredicateFnPtr, reqid: u32 };
+        predicate: Observer.Predicate,
         /// the callback function SHOULD NOT block
         on_data: OnDataFnPtr,
         on_error: NullableOnErrorFnPtr,
@@ -123,8 +119,13 @@ const PackObserverList = struct {
         /// hashing the pointer, don't ask me why it's useful
         pub fn xxhash(self: *const @This()) u32 {
             var h = std.hash.XxHash32.init(XXHASH_SEED);
-            const predicate_addr = @intFromPtr(self.predicate);
-            h.update(utils.anytype2Slice(&predicate_addr));
+            switch (self.predicate) {
+                .func => |f| {
+                    const predicate_addr = @intFromPtr(f);
+                    h.update(utils.anytype2Slice(&predicate_addr));
+                },
+                .reqid => |id| h.update(utils.anytype2Slice(&id)),
+            }
             const notify_addr = @intFromPtr(self.on_data);
             h.update(utils.anytype2Slice(&notify_addr));
             if (self.on_error) |ptr| {
@@ -173,14 +174,14 @@ const PackObserverList = struct {
 
     /// subscribe an observable as an observer
     ///
-    ///   - `predicate`: a function to determine whether the observer should be notified
+    ///   - `predicate`: a function to determine whether the observer should be notified, or a `reqid`
     ///   - `on_data`: the callback function when the observer is notified, could return `anyerror`
     ///   - `on_error`: the callback function when `on_data` returns an error
     ///   - `userdata`: closure
     ///   - `dtor`: destructor for the closure, optional
     pub fn subscribe(
         self: *@This(),
-        predicate: PredicateFnPtr,
+        predicate: Predicate,
         on_data: OnDataFnPtr,
         on_error: NullableOnErrorFnPtr,
         userdata: ?*anyopaque,
@@ -215,7 +216,16 @@ const PackObserverList = struct {
         // explicit no lock here
         var cnt: usize = 0;
         for (self._list.items) |*o| {
-            if (o.predicate(pack, o.userdata)) {
+            var ok: bool = undefined;
+            switch (o.predicate) {
+                .func => |f| {
+                    ok = f(pack, o.userdata);
+                },
+                .reqid => |id| {
+                    ok = pack.reqid == id;
+                },
+            }
+            if (ok) {
                 o.on_data(self, pack, o) catch |e| {
                     if (o.on_error) |on_err| {
                         on_err(self, pack, o, e);
@@ -1244,9 +1254,10 @@ const MagicSocketCallback = struct {
 
     pub fn subscribe_write(self: *@This()) !void {
         const subject = self.dev.rxObservable();
-        const predicate = ActionCallback.make_reqid_predicate(comptimeRequestId(.write));
+        const magic_socket = self.dev.magicSocket();
+        const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.open) };
         try subject.subscribe(
-            &predicate,
+            predicate,
             &Self.write_on_data,
             null,
             self,
@@ -1348,9 +1359,10 @@ const MagicSocketCallback = struct {
 
     pub fn subscribe_read(self: *@This()) !void {
         const subject = self.dev.rxObservable();
-        const predicate = ActionCallback.make_reqid_predicate(comptimeRequestId(.read));
+        const magic_socket = self.dev.magicSocket();
+        const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.open) };
         try subject.subscribe(
-            &predicate,
+            predicate,
             &Self.read_on_data,
             null,
             self,
@@ -1380,9 +1392,9 @@ const MagicSocketCallback = struct {
     /// to enable debug mode one should write `BB_REQID_DEBUG_ENABLE` to the device
     pub fn subscribe_debug(self: *@This()) !void {
         const subject = self.dev.rxObservable();
-        const predicate = ActionCallback.make_reqid_predicate(BB_REQID_DEBUG_WRITE);
+        const predicate = Observer.Predicate{ .reqid = BB_REQID_DEBUG_WRITE };
         try subject.subscribe(
-            &predicate,
+            predicate,
             &Self.debug_on_data,
             null,
             self,
@@ -1482,10 +1494,10 @@ const ActionCallback = struct {
             .user_bmp = SLOT_BIT_MAP_MAX,
         };
         try self.dev.transmitWithPack(self.arena.allocator(), c.BB_GET_STATUS, &in);
-        const predicate = Self.make_reqid_predicate(c.BB_GET_STATUS);
+        const predicate = Observer.Predicate{ .reqid = c.BB_GET_STATUS };
         var subject = self.dev.rxObservable();
         subject.subscribe(
-            &predicate,
+            predicate,
             &Self.query_status_on_data,
             &Self.query_status_on_error,
             self,
@@ -1507,10 +1519,10 @@ const ActionCallback = struct {
 
     pub fn query_info_send(self: *@This()) !void {
         try self.dev.transmitWithPack(self.arena.allocator(), c.BB_GET_SYS_INFO, null);
-        const predicate = Self.make_reqid_predicate(c.BB_GET_SYS_INFO);
+        const predicate = PackObserverList.Predicate{ .reqid = c.BB_GET_SYS_INFO };
         var subject = self.dev.rxObservable();
         subject.subscribe(
-            &predicate,
+            predicate,
             &Self.query_info_on_data,
             &Self.query_info_on_error,
             self,
@@ -1564,9 +1576,10 @@ const ActionCallback = struct {
     pub fn reopen_socket_send(self: *@This()) !void {
         try self.dev.magicSocket().try_socket_close();
         var subject = self.dev.rxObservable();
-        const predicate = Self.make_reqid_predicate(comptimeRequestId(.close));
+        const magic_socket = self.dev.magicSocket();
+        const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.open) };
         subject.subscribe(
-            &predicate,
+            predicate,
             &Self.reopen_socket_on_data,
             null,
             self,
@@ -1589,9 +1602,9 @@ const ActionCallback = struct {
         magic_socket.initialize(self.dev, BB_SEL_SLOT, BB_SEL_PORT);
         try magic_socket.try_socket_open();
         var subject = self.dev.rxObservable();
-        const predicate = Self.make_reqid_predicate(comptimeRequestId(.open));
+        const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.open) };
         subject.subscribe(
-            &predicate,
+            predicate,
             &Self.open_socket_on_data,
             &Self.open_socket_on_error,
             self,
@@ -1798,6 +1811,9 @@ pub fn main() !void {
             std.debug.print("GPA thinks there are memory leaks\n", .{});
         }
     }
+
+    try network.init();
+    defer network.deinit();
 
     const pc_version = usb.libusb_get_version();
     const p_version: ?*const usb.libusb_version = @ptrCast(pc_version);

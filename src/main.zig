@@ -108,13 +108,20 @@ const PackObserverList = struct {
     // Observer provider could use
     // reference counting in dtor
     const Observer = struct {
+        pub const MAX_NAME_LEN = 24;
         pub const Predicate = union(enum) { func: PredicateFnPtr, reqid: u32 };
+        /// expected zero-terminated string
+        name_buf_z: [MAX_NAME_LEN + 1]u8 = std.mem.zeroes([MAX_NAME_LEN + 1]u8),
         predicate: Observer.Predicate,
         /// the callback function SHOULD NOT block
         on_data: OnDataFnPtr,
         on_error: NullableOnErrorFnPtr,
         userdata: ?*anyopaque,
         dtor: NullableDtorPtr,
+
+        pub fn name(self: *const @This()) [*:0]const u8 {
+            return @ptrCast(&self.name_buf_z);
+        }
 
         /// hashing the pointer, don't ask me why it's useful
         pub fn xxhash(self: *const @This()) u32 {
@@ -174,26 +181,37 @@ const PackObserverList = struct {
 
     /// subscribe an observable as an observer
     ///
+    ///   - `name`: the name of the observer (won't affect hash)
     ///   - `predicate`: a function to determine whether the observer should be notified, or a `reqid`
     ///   - `on_data`: the callback function when the observer is notified, could return `anyerror`
     ///   - `on_error`: the callback function when `on_data` returns an error
     ///   - `userdata`: closure
     ///   - `dtor`: destructor for the closure, optional
+    ///
+    /// Note that if the `name` is longer than `Observer.MAX_NAME_LEN`, it will be truncated silently.
     pub fn subscribe(
         self: *@This(),
+        name: []const u8,
         predicate: Predicate,
         on_data: OnDataFnPtr,
         on_error: NullableOnErrorFnPtr,
         userdata: ?*anyopaque,
         dtor: NullableDtorPtr,
     ) !void {
-        const obs = Observer{
+        var obs = Observer{
             .predicate = predicate,
             .on_data = on_data,
             .on_error = on_error,
             .userdata = userdata,
             .dtor = dtor,
         };
+
+        // truncate the name if it's too long
+        if (name.len > Observer.MAX_NAME_LEN) {
+            @memcpy(obs.name_buf_z[0..Observer.MAX_NAME_LEN], name[0..Observer.MAX_NAME_LEN]);
+        } else {
+            @memcpy(obs.name_buf_z[0..name.len], name);
+        }
         const h = obs.xxhash();
 
         {
@@ -231,11 +249,13 @@ const PackObserverList = struct {
                         on_err(self, pack, o, e);
                     } else {
                         const h = o.xxhash();
-                        var lg = pack.withLogger(utils.logWithSrc(logz.warn(), @src())
-                            .fmt("what", "unhandled observer(0x{x:0>8}) error", .{h}), is_log_packet_content)
+                        var lg = pack.withLogger(utils.logWithSrc(logz.err(), @src())
+                            .string("what", "unhandled observer error")
+                            .stringZ("name", o.name())
+                            .fmt("hash", "0x{x:0>8}", .{h}), is_log_packet_content)
                             .err(e);
                         switch (o.predicate) {
-                            .func => |f| lg = lg.fmt("predicate_fn", "{*}", .{f}),
+                            .func => {},
                             .reqid => |id| lg = lg.fmt("reqid", "0x{x:0>8}", .{id}),
                         }
                         lg.log();
@@ -519,6 +539,7 @@ const DeviceContext = struct {
                 const predicate = Observer.Predicate{ .reqid = c.BB_GET_STATUS };
                 var subject = self.dev.rxObservable();
                 try subject.subscribe(
+                    "status",
                     predicate,
                     &Callback.onData,
                     null,
@@ -657,6 +678,7 @@ const DeviceContext = struct {
                 const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.read) };
                 var subject = self.dev.rxObservable();
                 try subject.subscribe(
+                    "downstream",
                     predicate,
                     &Callback.onData,
                     null,
@@ -1474,6 +1496,7 @@ const MagicSocketCallback = struct {
         const magic_socket = self.dev.magicSocket();
         const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.open) };
         try subject.subscribe(
+            "socket_write",
             predicate,
             &Self.write_on_data,
             null,
@@ -1579,6 +1602,7 @@ const MagicSocketCallback = struct {
         const magic_socket = self.dev.magicSocket();
         const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.open) };
         try subject.subscribe(
+            "socket_read",
             predicate,
             &Self.read_on_data,
             null,
@@ -1611,6 +1635,7 @@ const MagicSocketCallback = struct {
         const subject = self.dev.rxObservable();
         const predicate = Observer.Predicate{ .reqid = BB_REQID_DEBUG_WRITE };
         try subject.subscribe(
+            "debug",
             predicate,
             &Self.debug_on_data,
             null,
@@ -1718,6 +1743,7 @@ const InitActionCallback = struct {
 
         // `query_status_on_data` responsible for pushing the next initialization action
         subject.subscribe(
+            "status_query",
             predicate,
             &Self.status_on_data,
             &Self.status_on_error,
@@ -1740,6 +1766,7 @@ const InitActionCallback = struct {
         const predicate = PackObserverList.Predicate{ .reqid = c.BB_GET_SYS_INFO };
         var subject = self.dev.rxObservable();
         subject.subscribe(
+            "sysinfo",
             predicate,
             &Self.sys_info_on_data,
             &Self.sys_info_on_error,
@@ -1797,6 +1824,7 @@ const InitActionCallback = struct {
         const magic_socket = self.dev.magicSocket();
         const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.open) };
         subject.subscribe(
+            "reopen",
             predicate,
             &Self.reopen_socket_on_data,
             null,
@@ -1822,6 +1850,7 @@ const InitActionCallback = struct {
         var subject = self.dev.rxObservable();
         const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.open) };
         subject.subscribe(
+            "open_socket",
             predicate,
             &Self.open_socket_on_data,
             &Self.open_socket_on_error,

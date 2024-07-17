@@ -41,6 +41,7 @@
         "sigset",
         "stbc",
         "struct",
+        "sysinfo",
         "TIMEINTLV",
         "timeval",
         "tintlv",

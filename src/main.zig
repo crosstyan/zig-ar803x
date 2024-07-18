@@ -70,6 +70,7 @@ const BB_REQID_DEBUG_WRITE = 0x05000001;
 const is_log_content: bool = false;
 /// whether log the content when logging the `UsbPack`
 const is_log_packet_content: bool = false;
+const is_enable_ar8030_debug_callback: bool = false;
 
 const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
     .thread_safe = true,
@@ -703,6 +704,9 @@ const DeviceContext = struct {
                 var down = &self.dev.ext._downstream;
                 const buf = try pack.data();
                 const sz = try down.send(buf);
+                self.dev.withSrcLogger(logz.debug(), @src())
+                    .string("what", "downstream")
+                    .int("len", sz).log();
                 if (sz != buf.len) {
                     return AppError.BadSize;
                 }
@@ -752,6 +756,7 @@ const DeviceContext = struct {
                 self.upstreamIter() catch |e| {
                     switch (e) {
                         error.ConnectionTimedOut => continue,
+                        error.WouldBlock => continue,
                         AppError.Empty => continue,
                         else => {
                             self.dev().withSrcLogger(logz.err(), @src())
@@ -1267,10 +1272,12 @@ const DeviceContext = struct {
         // for the running of observable
         self.initThreads();
 
-        var debug_cb = MagicSocketCallback.create(self.allocator(), self) catch unreachable;
-        debug_cb.subscribe_debug() catch unreachable;
-        self.transmitWithPack(self.allocator(), BB_REQID_DEBUG_ENABLE, null) catch unreachable;
-        self.waitForTxComplete();
+        if (is_enable_ar8030_debug_callback) {
+            var debug_cb = MagicSocketCallback.create(self.allocator(), self) catch unreachable;
+            debug_cb.subscribe_debug() catch unreachable;
+            self.transmitWithPack(self.allocator(), BB_REQID_DEBUG_ENABLE, null) catch unreachable;
+            self.waitForTxComplete();
+        }
 
         // it's quite hard to design a promise chain without lambda/closure.
         //
@@ -1497,7 +1504,7 @@ const MagicSocketCallback = struct {
     pub fn subscribe_write(self: *@This()) !void {
         const subject = self.dev.rxObservable();
         const magic_socket = self.dev.magicSocket();
-        const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.open) };
+        const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.write) };
         try subject.subscribe(
             "so_write",
             predicate,
@@ -1603,7 +1610,7 @@ const MagicSocketCallback = struct {
     pub fn subscribe_read(self: *@This()) !void {
         const subject = self.dev.rxObservable();
         const magic_socket = self.dev.magicSocket();
-        const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.open) };
+        const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.read) };
         try subject.subscribe(
             "so_read",
             predicate,
@@ -1826,7 +1833,7 @@ const InitSequenceCallback = struct {
         try self.dev.magicSocket().try_socket_close();
         var subject = self.dev.rxObservable();
         const magic_socket = self.dev.magicSocket();
-        const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.open) };
+        const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.close) };
         subject.subscribe(
             "so_reopen",
             predicate,
@@ -1879,21 +1886,21 @@ const InitSequenceCallback = struct {
                     var upstream_listen_port: u16 = undefined;
                     var downstream_endpoint: network.EndPoint = undefined;
                     if (status.role == .dev) {
-                        upstream_listen_port = 39000;
+                        upstream_listen_port = 39450;
                         downstream_endpoint = network.EndPoint{
                             .address = try network.Address.parse("127.0.0.1"),
-                            .port = 39001,
+                            .port = 39451,
                         };
                     } else {
-                        upstream_listen_port = 38000;
+                        upstream_listen_port = 38450;
                         downstream_endpoint = network.EndPoint{
                             .address = try network.Address.parse("127.0.0.1"),
-                            .port = 38001,
+                            .port = 38451,
                         };
                     }
                     try self.dev.ext.init(upstream_listen_port, downstream_endpoint);
                 } else {
-                    std.debug.panic("uninitialized status when socket opened");
+                    std.debug.panic("uninitialized status when socket opened", .{});
                 }
             },
             BB_ERROR_ALREADY_OPENED_SOCKET => {
@@ -2053,6 +2060,11 @@ const TransferCallback = struct {
 };
 
 pub fn main() !void {
+    // required for Windows
+    // https://github.com/ziglang/zig/issues/8943
+    try network.init();
+    defer network.deinit();
+
     // Use a separate allocator for logz
     var _logz_gpa = std.heap.GeneralPurposeAllocator(.{
         .thread_safe = false,
@@ -2082,9 +2094,6 @@ pub fn main() !void {
             std.debug.print("GPA thinks there are memory leaks\n", .{});
         }
     }
-
-    try network.init();
-    defer network.deinit();
 
     const pc_version = usb.libusb_get_version();
     const p_version: ?*const usb.libusb_version = @ptrCast(pc_version);

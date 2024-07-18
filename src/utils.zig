@@ -289,7 +289,7 @@ pub fn u8ToArray(u: u8, comptime msb_first: bool) [8]bool {
     return ret;
 }
 
-pub fn as(comptime T: type, ud: ?*anyopaque) *T {
+pub inline fn as(comptime T: type, ud: ?*anyopaque) *T {
     return @alignCast(@ptrCast(ud.?));
 }
 

@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const logz = @import("logz");
 const common = @import("app_common.zig");
-const usb = @cImport({
+pub const c = @cImport({
     @cInclude("libusb.h");
 });
 
@@ -11,7 +11,7 @@ const BadEnum = common.BadEnum;
 const LengthNotEqual = common.LengthNotEqual;
 const ClosedError = common.ClosedError;
 
-pub const LIBUSB_OK = usb.LIBUSB_SUCCESS;
+pub const LIBUSB_OK = c.LIBUSB_SUCCESS;
 
 pub const LibUsbError = error{
     IO,
@@ -35,7 +35,7 @@ pub inline fn usbEndpointNum(ep_addr: u8) u8 {
 }
 
 pub inline fn usbEndpointTransferType(ep_attr: u8) u8 {
-    return ep_attr & @as(u8, usb.LIBUSB_TRANSFER_TYPE_MASK);
+    return ep_attr & @as(u8, c.LIBUSB_TRANSFER_TYPE_MASK);
 }
 
 pub const Direction = enum {
@@ -61,23 +61,23 @@ pub const Endpoint = struct {
     transferType: TransferType,
     maxPacketSize: u16,
 
-    pub fn fromDesc(iConfig: u8, iInterface: u8, ep: *const usb.libusb_endpoint_descriptor) AppError!Endpoint {
+    pub fn fromDesc(iConfig: u8, iInterface: u8, ep: *const c.libusb_endpoint_descriptor) AppError!Endpoint {
         const local_t = struct {
             pub inline fn addr_to_dir(addr: u8) BadEnum!Direction {
-                const dir = addr & usb.LIBUSB_ENDPOINT_DIR_MASK;
+                const dir = addr & c.LIBUSB_ENDPOINT_DIR_MASK;
                 const r = switch (dir) {
-                    usb.LIBUSB_ENDPOINT_IN => Direction.in,
-                    usb.LIBUSB_ENDPOINT_OUT => Direction.out,
+                    c.LIBUSB_ENDPOINT_IN => Direction.in,
+                    c.LIBUSB_ENDPOINT_OUT => Direction.out,
                     else => return BadEnum.BadEnum,
                 };
                 return r;
             }
             pub inline fn attr_to_transfer_type(attr: u8) BadEnum!TransferType {
                 const r = switch (usbEndpointTransferType(attr)) {
-                    usb.LIBUSB_TRANSFER_TYPE_CONTROL => TransferType.control,
-                    usb.LIBUSB_TRANSFER_TYPE_ISOCHRONOUS => TransferType.isochronous,
-                    usb.LIBUSB_TRANSFER_TYPE_BULK => TransferType.bulk,
-                    usb.LIBUSB_TRANSFER_TYPE_INTERRUPT => TransferType.interrupt,
+                    c.LIBUSB_TRANSFER_TYPE_CONTROL => TransferType.control,
+                    c.LIBUSB_TRANSFER_TYPE_ISOCHRONOUS => TransferType.isochronous,
+                    c.LIBUSB_TRANSFER_TYPE_BULK => TransferType.bulk,
+                    c.LIBUSB_TRANSFER_TYPE_INTERRUPT => TransferType.interrupt,
                     else => return BadEnum.BadEnum,
                 };
                 return r;
@@ -104,11 +104,11 @@ pub const Endpoint = struct {
     }
 };
 
-pub fn logWithDevice(logger: logz.Logger, device: *usb.libusb_device, desc: *const usb.libusb_device_descriptor) logz.Logger {
+pub fn logWithDevice(logger: logz.Logger, device: *c.libusb_device, desc: *const c.libusb_device_descriptor) logz.Logger {
     const vid = desc.idVendor;
     const pid = desc.idProduct;
-    const bus = usb.libusb_get_bus_number(device);
-    const port = usb.libusb_get_port_number(device);
+    const bus = c.libusb_get_bus_number(device);
+    const port = c.libusb_get_port_number(device);
     return logger
         .fmt("vid", "0x{x:0>4}", .{vid})
         .fmt("pid", "0x{x:0>4}", .{pid})
@@ -116,14 +116,14 @@ pub fn logWithDevice(logger: logz.Logger, device: *usb.libusb_device, desc: *con
         .int("port", port);
 }
 
-pub fn getEndpoints(alloc: std.mem.Allocator, device: *usb.libusb_device, ldesc: *const usb.libusb_device_descriptor) []Endpoint {
+pub fn getEndpoints(alloc: std.mem.Allocator, device: *c.libusb_device, ldesc: *const c.libusb_device_descriptor) []Endpoint {
     var ret: c_int = undefined;
     var list = std.ArrayList(Endpoint).init(alloc);
     defer list.deinit();
     const n_config = ldesc.bNumConfigurations;
     for (0..n_config) |i| {
-        var config_: ?*usb.libusb_config_descriptor = undefined;
-        ret = usb.libusb_get_config_descriptor(device, @intCast(i), &config_);
+        var config_: ?*c.libusb_config_descriptor = undefined;
+        ret = c.libusb_get_config_descriptor(device, @intCast(i), &config_);
         if (ret != 0) continue;
         if (config_) |config| {
             const ifaces = config.interface[0..@intCast(config.bNumInterfaces)];
@@ -172,18 +172,18 @@ pub const Speed = enum {
 
     pub fn fromC(speed: c_int) BadEnum!Speed {
         return switch (speed) {
-            usb.LIBUSB_SPEED_UNKNOWN => Speed.unknown,
-            usb.LIBUSB_SPEED_LOW => Speed.low,
-            usb.LIBUSB_SPEED_FULL => Speed.full,
-            usb.LIBUSB_SPEED_HIGH => Speed.high,
-            usb.LIBUSB_SPEED_SUPER => Speed.super,
-            usb.LIBUSB_SPEED_SUPER_PLUS => Speed.super_plus,
+            c.LIBUSB_SPEED_UNKNOWN => Speed.unknown,
+            c.LIBUSB_SPEED_LOW => Speed.low,
+            c.LIBUSB_SPEED_FULL => Speed.full,
+            c.LIBUSB_SPEED_HIGH => Speed.high,
+            c.LIBUSB_SPEED_SUPER => Speed.super,
+            c.LIBUSB_SPEED_SUPER_PLUS => Speed.super_plus,
             else => BadEnum.BadEnum,
         };
     }
 
-    pub fn getDeviceSpeed(device: *usb.libusb_device) BadEnum!Speed {
-        const speed = usb.libusb_get_device_speed(device);
+    pub fn getDeviceSpeed(device: *c.libusb_device) BadEnum!Speed {
+        const speed = c.libusb_get_device_speed(device);
         return Speed.fromC(speed);
     }
 };
@@ -200,22 +200,22 @@ pub const TransferStatus = enum {
 
 pub fn transferStatusFromInt(status: c_uint) BadEnum!TransferStatus {
     return switch (status) {
-        usb.LIBUSB_TRANSFER_COMPLETED => TransferStatus.completed,
-        usb.LIBUSB_TRANSFER_ERROR => TransferStatus.err,
-        usb.LIBUSB_TRANSFER_TIMED_OUT => TransferStatus.timed_out,
-        usb.LIBUSB_TRANSFER_CANCELLED => TransferStatus.cancelled,
-        usb.LIBUSB_TRANSFER_STALL => TransferStatus.stall,
-        usb.LIBUSB_TRANSFER_NO_DEVICE => TransferStatus.no_device,
-        usb.LIBUSB_TRANSFER_OVERFLOW => TransferStatus.overflow,
+        c.LIBUSB_TRANSFER_COMPLETED => TransferStatus.completed,
+        c.LIBUSB_TRANSFER_ERROR => TransferStatus.err,
+        c.LIBUSB_TRANSFER_TIMED_OUT => TransferStatus.timed_out,
+        c.LIBUSB_TRANSFER_CANCELLED => TransferStatus.cancelled,
+        c.LIBUSB_TRANSFER_STALL => TransferStatus.stall,
+        c.LIBUSB_TRANSFER_NO_DEVICE => TransferStatus.no_device,
+        c.LIBUSB_TRANSFER_OVERFLOW => TransferStatus.overflow,
         else => return BadEnum.BadEnum,
     };
 }
 
 /// Get a string descriptor or return a default value
-pub fn dynStringDescriptorOr(alloc: std.mem.Allocator, hdl: *usb.libusb_device_handle, idx: u8, default: []const u8) []const u8 {
+pub fn dynStringDescriptorOr(alloc: std.mem.Allocator, hdl: *c.libusb_device_handle, idx: u8, default: []const u8) []const u8 {
     const BUF_SIZE = 128;
     var buf: [BUF_SIZE]u8 = undefined;
-    const sz: c_int = usb.libusb_get_string_descriptor_ascii(hdl, idx, &buf, @intCast(buf.len));
+    const sz: c_int = c.libusb_get_string_descriptor_ascii(hdl, idx, &buf, @intCast(buf.len));
     if (sz > 0) {
         var dyn_str = alloc.alloc(u8, @intCast(sz)) catch @panic("OOM");
         @memcpy(dyn_str, buf[0..@intCast(sz)]);
@@ -231,14 +231,14 @@ pub fn dynStringDescriptorOr(alloc: std.mem.Allocator, hdl: *usb.libusb_device_h
 
 /// Print the manufacturer, product, serial number of a device.
 /// If a string descriptor is not available, 'N/A' will be display.
-pub fn printStrDesc(hdl: *usb.libusb_device_handle, desc: *const usb.libusb_device_descriptor) void {
+pub fn printStrDesc(hdl: *c.libusb_device_handle, desc: *const c.libusb_device_descriptor) void {
     const local_t = struct {
         /// Get string descriptor or return a default value.
         /// Note that the caller must ensure the buffer is large enough.
         /// The return slice will be a slice of the buffer.
-        pub fn get_string_descriptor_or(lhdl: *usb.libusb_device_handle, idx: u8, buf: []u8, default: []const u8) []const u8 {
+        pub fn get_string_descriptor_or(lhdl: *c.libusb_device_handle, idx: u8, buf: []u8, default: []const u8) []const u8 {
             var lsz: c_int = undefined;
-            lsz = usb.libusb_get_string_descriptor_ascii(lhdl, idx, buf.ptr, @intCast(buf.len));
+            lsz = c.libusb_get_string_descriptor_ascii(lhdl, idx, buf.ptr, @intCast(buf.len));
             if (lsz > 0) {
                 return buf[0..@intCast(lsz)];
             } else {
@@ -266,19 +266,19 @@ pub fn printStrDesc(hdl: *usb.libusb_device_handle, desc: *const usb.libusb_devi
 
 pub fn libusb_error_2_set(err: c_int) LibUsbError {
     return switch (err) {
-        usb.LIBUSB_ERROR_IO => LibUsbError.IO,
-        usb.LIBUSB_ERROR_INVALID_PARAM => LibUsbError.InvalidParam,
-        usb.LIBUSB_ERROR_ACCESS => LibUsbError.Access,
-        usb.LIBUSB_ERROR_NO_DEVICE => LibUsbError.NoDevice,
-        usb.LIBUSB_ERROR_NOT_FOUND => LibUsbError.NotFound,
-        usb.LIBUSB_ERROR_BUSY => LibUsbError.Busy,
-        usb.LIBUSB_ERROR_TIMEOUT => LibUsbError.Timeout,
-        usb.LIBUSB_ERROR_OVERFLOW => LibUsbError.Overflow,
-        usb.LIBUSB_ERROR_PIPE => LibUsbError.Pipe,
-        usb.LIBUSB_ERROR_INTERRUPTED => LibUsbError.Interrupted,
-        usb.LIBUSB_ERROR_NO_MEM => LibUsbError.NoMem,
-        usb.LIBUSB_ERROR_NOT_SUPPORTED => LibUsbError.NotSupported,
-        usb.LIBUSB_ERROR_OTHER => LibUsbError.Other,
+        c.LIBUSB_ERROR_IO => LibUsbError.IO,
+        c.LIBUSB_ERROR_INVALID_PARAM => LibUsbError.InvalidParam,
+        c.LIBUSB_ERROR_ACCESS => LibUsbError.Access,
+        c.LIBUSB_ERROR_NO_DEVICE => LibUsbError.NoDevice,
+        c.LIBUSB_ERROR_NOT_FOUND => LibUsbError.NotFound,
+        c.LIBUSB_ERROR_BUSY => LibUsbError.Busy,
+        c.LIBUSB_ERROR_TIMEOUT => LibUsbError.Timeout,
+        c.LIBUSB_ERROR_OVERFLOW => LibUsbError.Overflow,
+        c.LIBUSB_ERROR_PIPE => LibUsbError.Pipe,
+        c.LIBUSB_ERROR_INTERRUPTED => LibUsbError.Interrupted,
+        c.LIBUSB_ERROR_NO_MEM => LibUsbError.NoMem,
+        c.LIBUSB_ERROR_NOT_SUPPORTED => LibUsbError.NotSupported,
+        c.LIBUSB_ERROR_OTHER => LibUsbError.Other,
         else => std.debug.panic("unknown libusb error code: {}", .{err}),
     };
 }

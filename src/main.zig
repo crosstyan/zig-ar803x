@@ -7,11 +7,9 @@ const UsbPack = @import("bb/usbpack.zig").UsbPack;
 const ManagedUsbPack = @import("bb/usbpack.zig").ManagedUsbPack;
 const utils = @import("utils.zig");
 const common = @import("app_common.zig");
-const usb = @cImport({
-    @cInclude("libusb.h");
-});
 const network = @import("network");
 const helper = @import("libusb_helper.zig");
+const usb = helper.c;
 const Mutex = std.Thread.Mutex;
 const RwLock = std.Thread.RwLock;
 const Condition = std.Thread.Condition;

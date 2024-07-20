@@ -59,10 +59,17 @@ const BB_SOCKET_SEND_NEED_UPDATE_ADDR: i32 = -0x107; // 强制更新写入地址
 const BB_SOCKET_SEND_ERROR: i32 = -0x108;
 const BB_SOCKET_TX_BUFFER = 2048;
 const BB_SOCKET_RX_BUFFER = 3072;
-// TODO: investigate reqid=0x05'00'00'01
-// looks like debug related packet
-const BB_REQID_DEBUG_ENABLE = 0x05000000;
-const BB_REQID_DEBUG_WRITE = 0x05000001;
+// debug related packet
+// See `BB_REQ_DBG`
+//
+// /**定义debug 通道 msgid*/
+// typedef enum {
+//     BB_DBG_CLIENT_CHANGE,
+//     BB_DBG_DATA,
+//     BB_DBG_MAX,
+// } bb_debug_id_e;
+const BB_REQID_DEBUG_CLIENT_CHANGE = 0x05000000;
+const BB_REQID_DEBUG_DATA = 0x05000001;
 
 const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
     .thread_safe = true,
@@ -1295,7 +1302,7 @@ const DeviceContext = struct {
         if (GlobalConfig.is_enable_ar8030_debug_callback) {
             var debug_cb = MagicSocketCallback.create(self.allocator(), self) catch unreachable;
             debug_cb.subscribe_debug() catch unreachable;
-            self.transmitWithPack(self.allocator(), BB_REQID_DEBUG_ENABLE, null) catch unreachable;
+            self.transmitWithPack(self.allocator(), BB_REQID_DEBUG_CLIENT_CHANGE, null) catch unreachable;
             self.waitForTxComplete();
         }
 
@@ -1650,7 +1657,7 @@ const MagicSocketCallback = struct {
     /// to enable debug mode one should write `BB_REQID_DEBUG_ENABLE` to the device
     pub fn subscribe_debug(self: *@This()) !void {
         const subject = self.dev.rxObservable();
-        const predicate = Observer.Predicate{ .reqid = BB_REQID_DEBUG_WRITE };
+        const predicate = Observer.Predicate{ .reqid = BB_REQID_DEBUG_DATA };
         try subject.subscribe(
             "debug",
             predicate,

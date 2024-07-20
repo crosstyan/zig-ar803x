@@ -25,15 +25,25 @@ pub const SUBSCRIBE_REQ_FAL = 4;
 /// ```
 ///
 pub const Event = enum {
+    /// 链路状态发生变化事件
     link_state,
+    /// MCS等级发生变化事件
     mcs_change,
+    /// 工作信道发生变化事件
     chan_change,
     plot_data,
+    /// 每一个基带帧开始的事件
     frame_start,
+    /// 当设备离线时获得通知
+    /// (daemon 专用, 设备端不应发送此事件)
     offline,
+    /// 项目自定义事件分发 (with 256 bytes payload)
     prj_dispatch,
+    /// 配对结果事件分发
     pair_result,
+    /// 项目自定义事件分发 2 (with 1024 bytes payload)
     prj_dispatch_2,
+    /// MCS等级发生变化结束事件
     mcs_change_end,
 
     pub fn toC(event: Event) u8 {

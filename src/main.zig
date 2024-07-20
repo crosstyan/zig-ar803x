@@ -1554,15 +1554,10 @@ const MagicSocketCallback = struct {
     /// The original code uses a ring-buffer to write the data, but I still don't see the necessity of
     /// this field...
     ///
-    /// btw I'm using a static variable to store the position in `transmitViaSocket`, which
-    /// increases after each write operation. (won't work if two devices are connected)
-    ///
     /// If `BB_SOCKET_SEND_ERROR` is the status, than
-    /// `socket_msg_ret.pos` means the position given to device (which made the device not happy),
-    /// `socket_msg_ret.len` is the position expected
-    /// (what if the position is overflown uint32_t? The expected position will be WRONG!)
-    ///
-    /// What's `wr_cpl_max` and `wr_cpl_init`?
+    /// `socket_msg_ret.pos` means the position given to device, which made the device not happy,
+    /// `socket_msg_ret.len` is the position expected, but it might be a overflowed value since
+    /// its width is only 32 bits.
     pub fn write_on_data(sbj: *PackObserverList, pack: *const UsbPack, obs: *Observer) !void {
         const ud = obs.userdata;
         var self = utils.as(@This(), ud);
@@ -1583,7 +1578,6 @@ const MagicSocketCallback = struct {
         } else {
             switch (pack.sta) {
                 BB_SOCKET_SEND_OK => {
-                    // a redundant message
                     const len = @sizeOf(bb.err_socket_msg_ret_t);
                     if (pack.data()) |data| {
                         std.debug.assert(data.len >= len);
@@ -1596,7 +1590,7 @@ const MagicSocketCallback = struct {
                             .log();
                     } else |_| {}
                 },
-                BB_SOCKET_SEND_NEED_UPDATE_ADDR => {},
+                BB_SOCKET_SEND_NEED_UPDATE_ADDR => std.debug.panic("fixme: BB_SOCKET_SEND_NEED_UPDATE_ADDR", .{}),
                 BB_SOCKET_SEND_ERROR => {
                     var ret: bb.err_socket_msg_ret_t = undefined;
                     if (pack.data()) |data| {
@@ -1608,9 +1602,9 @@ const MagicSocketCallback = struct {
                             .fmt("got_pos", "0x{x:0>16}", .{ret.got_pos})
                             .fmt("expected_pos", "0x{x:0>8}", .{ret.expected_pos})
                             .log();
-                        // it won't work if it have already overflown (well, we should try at least)
+                        // we could try to recover the position
                         socket._position = @intCast(ret.expected_pos);
-                        // I prefer panic and restart everything, or try to reopen the magic socket
+                        // but I still prefer panic
                         std.debug.panic("socket write error, got_pos=0x{x:0>16}, expected_pos=0x{x:0>8}", .{ ret.got_pos, ret.expected_pos });
                     } else |_| {
                         std.debug.panic("socket write error", .{});
@@ -1654,7 +1648,6 @@ const MagicSocketCallback = struct {
         } else |_| {}
     }
 
-    /// to enable debug mode one should write `BB_REQID_DEBUG_ENABLE` to the device
     pub fn subscribe_debug(self: *@This()) !void {
         const subject = self.dev.rxObservable();
         const predicate = Observer.Predicate{ .reqid = BB_REQID_DEBUG_DATA };
@@ -1832,8 +1825,6 @@ const InitSequenceCallback = struct {
     }
 
     /// subscribe an event, don't care if it's successful or not.
-    /// I don't care the response.
-    /// without closure it's become tedious.
     pub fn subscribe_event_no_response(self: *@This(), event: bb.Event) !void {
         const req = bb.subscribeRequestId(event);
         try self.dev.transmitWithPack(self.arena.allocator(), req, null);

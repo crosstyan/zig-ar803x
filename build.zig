@@ -4,7 +4,8 @@ const log = std.log;
 const bd = std.Build;
 const fs = std.fs;
 
-// only useful in Windows
+// Only used in Windows
+//
 // If zls is not working, modify this to the correct path
 // since zls might not be able to get the correct environment variables
 const VCPKG_ROOT_FALLBACK = "C:/tool/vcpkg/";
@@ -57,10 +58,13 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("network", network_module);
     // *********** end zig link/import ***********
 
+    // If it's Windows, please make sure you have installed libusb via vcpkg
+    //
+    // @sa https://vcpkg.link/ports/libusb
     if (builtin.os.tag == .windows) {
         // See also
         //
-        // C:\tools\vcpkg\packages\libusb_x64-windows\lib\pkgconfig
+        //   $env:VCPKG_ROOT\packages\libusb_x64-windows\lib\pkgconfig
         //
         // I still don't want to deal with Zig package system bullshit
         // That's ugly but it works, except you MUST reconfigure
@@ -76,17 +80,17 @@ pub fn build(b: *std.Build) void {
         exe.addIncludePath(bd.LazyPath{ .cwd_relative = usb_include_dir });
         exe.linkSystemLibrary("c");
         exe.linkSystemLibrary("libusb-1.0");
-        // and you should copy the DLL to the same directory as the executable
+        // copy the DLL to the same directory as the executable
         const usb_lib_file_path = b.pathJoin(&.{ usb_bin_dir, "libusb-1.0.dll" });
-        const usb_lib_file_lazy_path = bd.LazyPath{ .cwd_relative = usb_lib_file_path };
-        // see b.installFile
-        b.getInstallStep().dependOn(&b.addInstallFileWithDir(usb_lib_file_lazy_path, .prefix, "bin/libusb-1.0.dll").step);
+        const usb_lib_file_lp = bd.LazyPath{ .cwd_relative = usb_lib_file_path };
+        // see also b.installFile
+        b.getInstallStep().dependOn(&b.addInstallFileWithDir(usb_lib_file_lp, .prefix, "bin/libusb-1.0.dll").step);
     } else {
         exe.linkSystemLibrary("c");
         exe.linkSystemLibrary("libusb-1.0");
     }
 
-    // include ar8030 base band driver
+    // include ar8030 base band API definition
     exe.addIncludePath(bd.LazyPath{ .cwd_relative = "inc" });
 
     // This declares intent for the executable to be installed into the

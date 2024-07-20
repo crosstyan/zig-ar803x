@@ -32,6 +32,7 @@
         "mimo",
         "msgid",
         "orelse",
+        "pkgconfig",
         "pointee",
         "posix",
         "QPSK",
@@ -53,6 +54,8 @@
         "usec",
         "userdata",
         "usize",
+        "vcpkg",
+        "VCPKGROOT",
         "WINAPI",
         "xfer",
         "XXHASH"

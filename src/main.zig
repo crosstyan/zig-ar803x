@@ -66,15 +66,19 @@ const BB_SOCKET_RX_BUFFER = 3072;
 const BB_REQID_DEBUG_ENABLE = 0x05000000;
 const BB_REQID_DEBUG_WRITE = 0x05000001;
 
-/// whether log the content when `tx`/`rx` involve
-const is_log_content: bool = false;
-/// whether log the content when logging the `UsbPack`
-const is_log_packet_content: bool = false;
-const is_enable_ar8030_debug_callback: bool = false;
-
 const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
     .thread_safe = true,
 });
+
+const GlobalConfig = struct {
+    /// whether log the content when `tx`/`rx` involve (raw packet, including the `UsbPack` header)
+    const is_log_content: bool = false;
+    /// whether log the content when logging the `UsbPack`
+    const is_log_packet_content: bool = false;
+    const is_enable_ar8030_debug_callback: bool = false;
+    const is_start_test_send_loop = false;
+};
+
 const UsbPackQueue = LockedQueue(ManagedUsbPack, 8);
 const is_windows = builtin.os.tag == .windows;
 
@@ -259,7 +263,7 @@ const PackObserverList = struct {
                         var lg = pack.withLogger(utils.logWithSrc(logz.err(), @src())
                             .string("what", "unhandled observer error")
                             .stringZ("name", o.name())
-                            .fmt("hash", "0x{x:0>8}", .{h}), is_log_packet_content)
+                            .fmt("hash", "0x{x:0>8}", .{h}), GlobalConfig.is_log_packet_content)
                             .err(e);
                         switch (o.predicate) {
                             .func => {},
@@ -273,7 +277,7 @@ const PackObserverList = struct {
         }
 
         if (cnt == 0) {
-            pack.withLogger(utils.logWithSrc(logz.warn(), @src()), is_log_packet_content)
+            pack.withLogger(utils.logWithSrc(logz.warn(), @src()), GlobalConfig.is_log_packet_content)
                 .string("what", "no observer is notified").log();
         }
     }
@@ -514,13 +518,32 @@ const DeviceContext = struct {
         ///   - https://rxjs.dev/guide/subject
         rx_observable: PackObserverList,
 
+        inline fn dev(self: *@This()) *DeviceContext {
+            return @fieldParentPtr("xfer", self);
+        }
+
+        pub fn initThreads(self: *@This()) void {
+            const alloc = self.dev().allocator();
+            const config = std.Thread.SpawnConfig{
+                .stack_size = DEFAULT_THREAD_STACK_SIZE,
+                .allocator = alloc,
+            };
+            self.rx_thread = std.Thread.spawn(config, DeviceContext.recvLoop, .{self.dev()}) catch unreachable;
+            self.rx_observable = PackObserverList.init(alloc);
+            if (GlobalConfig.is_start_test_send_loop) {
+                self.tx_thread = std.Thread.spawn(config, DeviceContext.testSendLoop, .{self.dev()}) catch unreachable;
+            }
+        }
+
         pub fn deinit(self: *@This()) void {
             self.tx_transfer.deinit();
             self.rx_transfer.deinit();
             self.rx_queue.deinit();
             self.rx_observable.deinit();
-            self.tx_thread.join();
             self.rx_thread.join();
+            if (GlobalConfig.is_start_test_send_loop) {
+                self.tx_thread.join();
+            }
         }
     };
 
@@ -568,7 +591,7 @@ const DeviceContext = struct {
             }
         };
 
-        pub inline fn dev(self: *@This()) *DeviceContext {
+        inline fn dev(self: *@This()) *DeviceContext {
             return @fieldParentPtr("arto", self);
         }
 
@@ -713,7 +736,7 @@ const DeviceContext = struct {
             }
         };
 
-        pub inline fn dev(self: *@This()) *DeviceContext {
+        inline fn dev(self: *@This()) *DeviceContext {
             return @fieldParentPtr("ext", self);
         }
 
@@ -1268,11 +1291,10 @@ const DeviceContext = struct {
 
     /// it still NEEDS event loop running. Please call it in a separate thread.
     fn loopPrepare(self: *@This()) void {
-        // first, we start the loop thread,
-        // for the running of observable
-        self.initThreads();
+        // first, we start the loop thread for observable
+        self.xfer.initThreads();
 
-        if (is_enable_ar8030_debug_callback) {
+        if (GlobalConfig.is_enable_ar8030_debug_callback) {
             var debug_cb = MagicSocketCallback.create(self.allocator(), self) catch unreachable;
             debug_cb.subscribe_debug() catch unreachable;
             self.transmitWithPack(self.allocator(), BB_REQID_DEBUG_ENABLE, null) catch unreachable;
@@ -1299,21 +1321,8 @@ const DeviceContext = struct {
         t_hdl.detach();
     }
 
-    fn initThreads(self: *@This()) void {
-        const config = std.Thread.SpawnConfig{
-            .stack_size = DEFAULT_THREAD_STACK_SIZE,
-            .allocator = self.allocator(),
-        };
-        const tx_thread = std.Thread.spawn(config, Self.sendLoop, .{self}) catch unreachable;
-        const rx_thread = std.Thread.spawn(config, Self.recvLoop, .{self}) catch unreachable;
-        self.xfer.tx_thread = tx_thread;
-        self.xfer.rx_thread = rx_thread;
-        self.xfer.rx_observable = PackObserverList.init(self.allocator());
-    }
-
-    /// basically do nothing... for now
-    /// reserve for future use
-    fn sendLoop(self: *@This()) void {
+    /// send message depending on the role, only for testing
+    fn testSendLoop(self: *@This()) void {
         while (true) {
             if (self.hasDeinit()) {
                 break;
@@ -1976,7 +1985,7 @@ const TransferCallback = struct {
             .int("flags", trans.*.flags)
             .string("action", "transmit")
             .int("len", tx_buf.len);
-        if (is_log_content) {
+        if (GlobalConfig.is_log_content) {
             lg = lg.fmt("content", "{s}", .{std.fmt.fmtSliceHexLower(tx_buf)});
         }
         lg.log();
@@ -2007,7 +2016,7 @@ const TransferCallback = struct {
             .int("flags", trans.*.flags)
             .string("action", "receive")
             .int("len", rx_buf.len);
-        if (is_log_content) {
+        if (GlobalConfig.is_log_content) {
             lg = lg.fmt("content", "{s}", .{std.fmt.fmtSliceHexLower(rx_buf)});
         }
         lg.log();
@@ -2016,7 +2025,7 @@ const TransferCallback = struct {
             var mpk_ = ManagedUsbPack.unmarshal(self.alloc, rx_buf);
             if (mpk_) |*mpk| {
                 lg = utils.logWithSrc(self.dev.withLogger(logz.debug()), @src());
-                mpk.pack.withLogger(lg, is_log_packet_content).log();
+                mpk.pack.withLogger(lg, GlobalConfig.is_log_packet_content).log();
                 self.dev.xfer.rx_queue.enqueue(mpk.*) catch |e| {
                     lg = utils.logWithSrc(self.dev.withLogger(logz.err()), @src());
                     lg.err(e).string("what", "failed to enqueue").log();

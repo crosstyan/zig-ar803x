@@ -2,6 +2,7 @@ const std = @import("std");
 const logz = @import("logz");
 const utils = @import("../utils.zig");
 const LengthNotEqual = utils.LengthNotEqual;
+const ContentError = utils.ContentError;
 
 pub const XorAcc = struct {
     const SEED: u8 = 0xff;
@@ -44,8 +45,6 @@ pub const UnmarshalError = error{
     InvalidEndMagic,
     LengthTooShort,
 };
-const NoContent = error{NoContent};
-const HasContent = error{HasContent};
 
 /// Note that `UsbPack` is NOT owning `data` (`ptr` and `len`)
 pub const UsbPack = packed struct {
@@ -62,9 +61,9 @@ pub const UsbPack = packed struct {
     /// data combines the `ptr` and `len` fields into a valid byte slice
     ///
     /// note that the actual ownership of the data is NOT transferred
-    pub fn data(self: *const Self) NoContent![]const u8 {
+    pub fn data(self: *const Self) ContentError![]const u8 {
         if (self.ptr == null or self.len == 0) {
-            return NoContent.NoContent;
+            return ContentError.NoContent;
         }
         return self.ptr.?[0..self.len];
     }
@@ -98,7 +97,7 @@ pub const UsbPack = packed struct {
     /// Call might needs to call `deinitWith` to free the buffer.
     pub fn fillWithAlloc(self: *Self, alloc: std.mem.Allocator, data_ref: anytype) !void {
         if (self.data()) |_| {
-            return HasContent.HasContent;
+            return ContentError.HasContent;
         } else |_| {
             // I'm expecting no content here
             const P = @TypeOf(data_ref);
@@ -122,7 +121,7 @@ pub const UsbPack = packed struct {
     /// since there's no allocation happens here, only reinterpreting the data.
     pub fn fillWith(self: *Self, data_ref: anytype) !void {
         if (self.data()) |_| {
-            return HasContent.HasContent;
+            return ContentError.HasContent;
         } else |_| {
             // I'm expecting no content here
             const P = @TypeOf(data_ref);

@@ -15,3 +15,7 @@ pub const AppError = error{
 pub const BadEnum = error{BadEnum};
 pub const LengthNotEqual = error{LengthNotEqual};
 pub const ClosedError = error{Closed};
+pub const ContentError = error{
+    NoContent,
+    HasContent,
+};

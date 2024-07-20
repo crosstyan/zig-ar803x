@@ -7,6 +7,7 @@ const RwLock = std.Thread.RwLock;
 pub const BadEnum = common.BadEnum;
 pub const LengthNotEqual = common.LengthNotEqual;
 pub const ClosedError = common.ClosedError;
+pub const ContentError = common.ContentError;
 
 /// generate a unique number for a type `T`
 ///
@@ -146,20 +147,28 @@ pub fn LockedQueue(comptime T: type, comptime max_size: usize) type {
         const MAX_SIZE = max_size;
         const Self = @This();
 
-        /// should be false until `deinit` is called
-        _has_deinit: std.atomic.Value(bool),
-        /// WARNING: don't use it directly
+        /// `init` will set it to `false`, `deinit` will set it to `true`
+        _has_deinit: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+        /// internal buffer, don't access it directly
         _list: std.ArrayList(T),
         /// used when modifying the `_list`
-        lock: RwLock = RwLock{},
+        _lock: RwLock = RwLock{},
 
         /// used with `cv` to signal the `dequeue`, different from `lock`
-        mutex: Mutex = Mutex{},
-        cv: std.Thread.Condition = std.Thread.Condition{},
-        /// function to call when removing an element.
-        /// Only useful when the queue is full, and needs to discard old
-        /// elements.
-        elem_dtor: ?*const fn (*T) void = null,
+        _mutex: Mutex = Mutex{},
+        _cv: std.Thread.Condition = std.Thread.Condition{},
+        /// function to call when removing an element. Useful when
+        ///
+        ///   - the queue is full, and needs to discard old elements
+        ///   - the queue is being deinitialized
+        ///
+        /// Dequeue won't call the destructor since the ownership is transferred to the caller.
+        _elem_dtor: ?*const fn (*T) void = null,
+
+        /// set the element destructor, used when the queue overflows
+        pub inline fn setElemDtor(self: *@This(), dtor: *const fn (*T) void) void {
+            self._elem_dtor = dtor;
+        }
 
         pub fn init(alloc: std.mem.Allocator) Self {
             var l = std.ArrayList(T).init(alloc);
@@ -170,13 +179,21 @@ pub fn LockedQueue(comptime T: type, comptime max_size: usize) type {
             };
         }
 
-        pub fn hasDeinit(self: *const @This()) bool {
+        pub inline fn hasDeinit(self: *const @This()) bool {
             return self._has_deinit.load(std.builtin.AtomicOrder.unordered);
         }
 
         pub fn deinit(self: *@This()) void {
+            self._lock.lockShared();
+            defer self._lock.lockShared();
+
             self._has_deinit.store(true, std.builtin.AtomicOrder.unordered);
-            self.cv.broadcast();
+            self._cv.broadcast();
+            if (self._elem_dtor) |dtor| {
+                for (self._list.items) |*elem| {
+                    dtor(elem);
+                }
+            }
             self._list.deinit();
         }
 
@@ -185,19 +202,19 @@ pub fn LockedQueue(comptime T: type, comptime max_size: usize) type {
                 return ClosedError.Closed;
             }
             {
-                self.lock.lockShared();
-                defer self.lock.unlockShared();
+                self._lock.lockShared();
+                defer self._lock.unlockShared();
                 while (self.lenNoCheck() >= MAX_SIZE) {
                     logWithSrc(logz.warn(), @src())
                         .string("what", "full queue, discarding old element").log();
                     var elem = self._list.orderedRemove(0);
-                    if (self.elem_dtor) |dtor| {
+                    if (self._elem_dtor) |dtor| {
                         dtor(&elem);
                     }
                 }
                 self._list.append(pkt) catch @panic("OOM");
             }
-            self.cv.signal();
+            self._cv.signal();
         }
 
         inline fn lenNoCheck(self: *const @This()) usize {
@@ -213,8 +230,8 @@ pub fn LockedQueue(comptime T: type, comptime max_size: usize) type {
             if (self.hasDeinit()) {
                 return ClosedError.Closed;
             }
-            self.lock.lock();
-            defer self.lock.unlock();
+            self._lock.lock();
+            defer self._lock.unlock();
             return self.lenNoCheck();
         }
 
@@ -223,14 +240,18 @@ pub fn LockedQueue(comptime T: type, comptime max_size: usize) type {
             return try self.len() == 0;
         }
 
-        pub fn peek(self: *@This()) ClosedError!?T {
+        /// return the first element of the queue without removing it
+        ///
+        /// - if the queue is empty, it will return `ContentError.NoContent`
+        /// - if the queue is closed, it will return `ClosedError.Closed`
+        pub fn peek(self: *@This()) !T {
             if (self.hasDeinit()) {
                 return ClosedError.Closed;
             }
-            self.lock.lock();
-            defer self.lock.unlock();
+            self._lock.lock();
+            defer self._lock.unlock();
             if (self._list.len == 0) {
-                return null;
+                return ContentError.NoContent;
             } else {
                 const ret = self._list.items[0];
                 return ret;
@@ -240,8 +261,8 @@ pub fn LockedQueue(comptime T: type, comptime max_size: usize) type {
         /// note that this function will block indefinitely
         /// until the queue is not empty
         pub fn dequeue(self: *@This()) ClosedError!T {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self._mutex.lock();
+            defer self._mutex.unlock();
 
             if (self.hasDeinit()) {
                 return ClosedError.Closed;
@@ -250,13 +271,13 @@ pub fn LockedQueue(comptime T: type, comptime max_size: usize) type {
                 if (self.hasDeinit()) {
                     return ClosedError.Closed;
                 }
-                self.cv.wait(&self.mutex);
+                self._cv.wait(&self._mutex);
             }
             if (self.hasDeinit()) {
                 return ClosedError.Closed;
             }
-            self.lock.lockShared();
-            defer self.lock.unlockShared();
+            self._lock.lockShared();
+            defer self._lock.unlockShared();
             const ret = self._list.items[0];
             _ = self._list.orderedRemove(0);
             return ret;

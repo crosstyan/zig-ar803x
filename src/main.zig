@@ -52,7 +52,7 @@ const LIBUSB_OK = helper.LIBUSB_OK;
 const BB_SEL_SLOT = c.BB_SLOT_0;
 const BB_SEL_PORT = 3;
 const BB_ERROR_ALREADY_OPENED_SOCKET = 257;
-const BB_ERROR_UNSPECIFIED = -259;
+const BB_ERROR_UNSPECIFIED = -259; // unspecified error, only vendor knows
 // See `dev_dat_so_write_proc` in `sock_node.c`.
 const BB_SOCKET_SEND_OK: i32 = -0x106;
 const BB_SOCKET_SEND_NEED_UPDATE_ADDR: i32 = -0x107; // 强制更新写入地址
@@ -71,21 +71,22 @@ const BB_SOCKET_RX_BUFFER = 3072;
 const BB_REQID_DEBUG_CLIENT_CHANGE = 0x05000000;
 const BB_REQID_DEBUG_DATA = 0x05000001;
 
-const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
-    .thread_safe = true,
-});
-
 const GlobalConfig = struct {
     /// whether log the content when `tx`/`rx` involve (raw packet, including the `UsbPack` header)
     const is_log_content: bool = false;
     /// whether log the content when logging the `UsbPack`
     const is_log_packet_content: bool = false;
+    /// whether enable the debug callback for AR8030.
+    /// The debug message will be printed to `stdout` directly.
     const is_enable_ar8030_debug_callback: bool = false;
     const is_start_test_send_loop = false;
 };
-
-const UsbPackQueue = LockedQueue(ManagedUsbPack, 8);
 const is_windows = builtin.os.tag == .windows;
+
+const DeviceGPA = std.heap.GeneralPurposeAllocator(.{
+    .thread_safe = true,
+});
+const UsbPackQueue = LockedQueue(ManagedUsbPack, 8);
 
 /// A naive implementation of the observer pattern for `UsbPack`
 ///
@@ -171,9 +172,10 @@ const PackObserverList = struct {
 
     // ******** fields ********
     allocator: std.mem.Allocator,
-    /// WARNING: DO NOT access this field directly
+    /// internal list of observers.
+    /// user SHOULD NOT interact with it directly
     _list: std.ArrayList(Observer),
-    lk: RwLock = RwLock{},
+    _lk: RwLock = RwLock{},
     // ******** end fields ********
 
     const Self = @This();
@@ -191,7 +193,7 @@ const PackObserverList = struct {
 
     /// subscribe an observable as an observer
     ///
-    ///   - `name`: the name of the observer (won't affect hash)
+    ///   - `name`: the name of the observer, only for debug purpose, won't be hashed
     ///   - `predicate`: a function to determine whether the observer should be notified, or a `reqid`
     ///   - `on_data`: the callback function when the observer is notified, could return `anyerror`
     ///   - `on_error`: the callback function when `on_data` returns an error
@@ -216,7 +218,6 @@ const PackObserverList = struct {
             .dtor = dtor,
         };
 
-        // truncate the name if it's too long
         if (name.len > Observer.MAX_NAME_LEN) {
             @memcpy(obs.name_buf_z[0..Observer.MAX_NAME_LEN], name[0..Observer.MAX_NAME_LEN]);
             utils.logWithSrc(logz.warn(), @src())
@@ -231,8 +232,8 @@ const PackObserverList = struct {
         const h = obs.xxhash();
 
         {
-            self.lk.lock();
-            defer self.lk.unlock();
+            self._lk.lock();
+            defer self._lk.unlock();
             for (self._list.items) |*o| {
                 if (o.xxhash() == h) {
                     return ObserverError.Existed;
@@ -240,8 +241,8 @@ const PackObserverList = struct {
             }
         }
 
-        self.lk.lockShared();
-        defer self.lk.unlockShared();
+        self._lk.lockShared();
+        defer self._lk.unlockShared();
         try self._list.append(obs);
     }
 
@@ -291,7 +292,6 @@ const PackObserverList = struct {
         return self.unsubscribeByHash(obs.xxhash());
     }
 
-    /// unsubscribe an observer by hash
     pub fn unsubscribeByHash(self: *@This(), hash: u32) ObserverError!void {
         const NOT_FOUND: isize = -1;
         var idx: isize = NOT_FOUND;
@@ -309,24 +309,22 @@ const PackObserverList = struct {
             return ObserverError.NotFound;
         }
 
-        self.lk.lockShared();
+        self._lk.lockShared();
         var el = self._list.swapRemove(@intCast(idx));
-        self.lk.unlockShared();
+        self._lk.unlockShared();
         el.deinit();
     }
 
     /// unsubscribe all observers
     pub fn unsubscribeAll(self: *@This()) void {
-        self.lk.lockShared();
-        defer self.lk.lockShared();
-        for (self._list.items) |*o| {
-            o.deinit();
-        }
-        self._list.deinit();
+        self.deinit();
         self._list = std.ArrayList(Observer).init(self.allocator);
     }
 
     pub fn deinit(self: *@This()) void {
+        self._lk.lockShared();
+        defer self._lk.lockShared();
+
         for (self._list.items) |*o| {
             o.deinit();
         }
@@ -677,13 +675,13 @@ const DeviceContext = struct {
             self._position = 0;
         }
 
-        fn try_socket_open(self: *@This()) !void {
+        pub fn trySocketOpen(self: *@This()) !void {
             // see `session_socket.c:232`
             const OpenRequestId = self.requestId(.open);
             try self._dev.transmitSliceWithPack(self._dev.allocator(), OpenRequestId, common_payload);
         }
 
-        fn try_socket_close(self: *@This()) !void {
+        pub fn trySocketClose(self: *@This()) !void {
             const CloseRequestId = self.requestId(.close);
             try self._dev.transmitSliceWithPack(self._dev.allocator(), CloseRequestId, common_payload);
         }
@@ -694,12 +692,13 @@ const DeviceContext = struct {
         _has_deinit: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
         _downstream: network.Socket = undefined,
         _upstream: network.Socket = undefined,
-        upstream_thread: std.Thread = undefined,
+        _upstream_thread: std.Thread = undefined,
         const Ext = @This();
 
         const DownStreamCallback = struct {
             dev: *DeviceContext,
             const Observer = PackObserverList.Observer;
+            const Callback = @This();
 
             pub fn create(arg_dev: *DeviceContext) !*@This() {
                 var self = try arg_dev.allocator().create(@This());
@@ -708,7 +707,6 @@ const DeviceContext = struct {
             }
 
             pub fn subscribe(self: *@This()) !void {
-                const Callback = @This();
                 const magic_socket = self.dev.magicSocket();
                 const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.read) };
                 var subject = self.dev.rxObservable();
@@ -786,16 +784,17 @@ const DeviceContext = struct {
                         error.ConnectionTimedOut => continue,
                         error.WouldBlock => continue,
                         AppError.Empty => continue,
+                        ClosedError.Closed => break,
                         else => {
                             self.dev().withSrcLogger(logz.err(), @src())
                                 .string("what", "upstream loop exception")
                                 .err(e).log();
-                            break;
+                            std.debug.panic("upstream loop exception {}", .{e});
                         },
                     }
                 };
             }
-            self.dev().withSrcLogger(logz.info(), @src())
+            self.dev().withSrcLogger(logz.debug(), @src())
                 .string("what", "exit upstream loop").log();
         }
 
@@ -808,7 +807,7 @@ const DeviceContext = struct {
             };
             try self._upstream.setReadTimeout(std.time.us_per_ms * 100);
             try self._downstream.setWriteTimeout(std.time.us_per_ms * 10);
-            self.upstream_thread = try std.Thread.spawn(config, Ext.upstreamLoop, .{self});
+            self._upstream_thread = try std.Thread.spawn(config, Ext.upstreamLoop, .{self});
             try self.initCallback();
         }
 
@@ -854,7 +853,7 @@ const DeviceContext = struct {
                 return;
             }
             self._has_deinit.store(true, std.builtin.AtomicOrder.unordered);
-            self.upstream_thread.join();
+            self._upstream_thread.join();
             self._downstream.close();
             self._upstream.close();
         }
@@ -863,12 +862,12 @@ const DeviceContext = struct {
     const Self = @This();
 
     // ****** fields ******
-    _has_deinit: std.atomic.Value(bool),
+    _has_deinit: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     gpa: DeviceGPA,
     core: DeviceHandles,
     bus: u8,
     port: u8,
-    /// managed by `alloc`
+    /// managed by `gpa`
     endpoints: []Endpoint,
     xfer: TransferContext,
     arto: ArtoContext,
@@ -963,7 +962,6 @@ const DeviceContext = struct {
         var gpa = DeviceGPA{};
         const eps = getEndpoints(gpa.allocator(), d.dev, &l_desc);
         var dc = DeviceContext{
-            ._has_deinit = std.atomic.Value(bool).init(true),
             .gpa = gpa,
             .core = DeviceHandles{
                 .dev = d.dev,
@@ -994,11 +992,12 @@ const DeviceContext = struct {
         dc.xfer.rx_transfer = Transfer{
             .self = rx_transfer,
         };
-        // somehow the `rx_queue` is not happy with allocated with allocator in
+        // `rx_queue` is not happy with allocated with allocator in
         // the `DeviceContext`, which would cause a deadlock.
-        // Interestingly, the deadlock is from the internal of GPA, needs to be
-        // investigated further.
+        // Interestingly, the deadlock is from the internal of GPA.
+        // For now, using a external allocator to allocate the queue.
         dc.xfer.rx_queue = UsbPackQueue.init(alloc);
+        dc.xfer.rx_queue.setElemDtor(&ManagedUsbPack.deinit);
         return dc;
     }
 
@@ -1223,7 +1222,7 @@ const DeviceContext = struct {
     /// Note that the consumer is responsible for freeing the memory
     /// by calling `deinit` after receiving a packet.
     ///
-    /// It's recommended to subscribe the observer to the `arto.obs_queue`, instead of
+    /// It's recommended to subscribe the observable, instead of
     /// calling this function directly.
     inline fn unsafeBlockReceive(self: *@This()) ClosedError!ManagedUsbPack {
         if (self.hasDeinit()) {
@@ -1376,12 +1375,12 @@ const DeviceContext = struct {
     }
 };
 
-/// allocator for `DeviceContext` that would persist and `arena` for the temporary memory.
+/// Refresh the `ctx_list`. Note that will mutate `ctx_list` in place.
 ///
-/// will mutate `ctx_list` in place.
+/// - `allocator` is for `DeviceContext`, which would persist
+/// - `arena` for the temporary memory.
 fn refreshDevList(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator, ctx: *usb.libusb_context, ctx_list: *std.ArrayList(DeviceContext)) void {
     var c_device_list: [*c]?*usb.libusb_device = undefined;
-    const sz = usb.libusb_get_device_list(ctx, &c_device_list);
     // See also
     // Device discovery and reference counting
     // in https://libusb.sourceforge.io/api-1.0/group__libusb__dev.html
@@ -1390,6 +1389,7 @@ fn refreshDevList(allocator: std.mem.Allocator, arena: *std.heap.ArenaAllocator,
     //
     // If the unref_devices parameter is set, the reference count of each device
     // in the list is decremented by 1
+    const sz = usb.libusb_get_device_list(ctx, &c_device_list);
     defer usb.libusb_free_device_list(c_device_list, 1);
     const device_list = c_device_list[0..@intCast(sz)];
 
@@ -1845,9 +1845,9 @@ const InitSequenceCallback = struct {
     };
 
     pub fn reopen_socket_send(self: *@This()) !void {
-        try self.dev.magicSocket().try_socket_close();
-        var subject = self.dev.rxObservable();
         const magic_socket = self.dev.magicSocket();
+        try magic_socket.trySocketClose();
+        var subject = self.dev.rxObservable();
         const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.close) };
         subject.subscribe(
             "so_reopen",
@@ -1864,15 +1864,14 @@ const InitSequenceCallback = struct {
         var socket = self.dev.magicSocket();
         socket.setOpen(false);
         std.debug.assert(pack.sta == BB_STA_OK);
-        try self.dev.magicSocket().try_socket_open();
+        try socket.trySocketOpen();
         sbj.unsubscribe(obs) catch unreachable;
     }
 
     pub fn open_socket_send(self: *@This()) !void {
-        // we're initializing the socket here
         var magic_socket = self.dev.magicSocket();
         magic_socket.initialize(self.dev, BB_SEL_SLOT, BB_SEL_PORT);
-        try magic_socket.try_socket_open();
+        try magic_socket.trySocketOpen();
         var subject = self.dev.rxObservable();
         const predicate = Observer.Predicate{ .reqid = magic_socket.requestId(.open) };
         subject.subscribe(

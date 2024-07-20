@@ -1,3 +1,8 @@
+// This file is generated with `zig translate-c`
+// Don't edit this file manually
+//
+// See also `bb_api.h`
+
 pub const __builtin_bswap16 = @import("std").zig.c_builtins.__builtin_bswap16;
 pub const __builtin_bswap32 = @import("std").zig.c_builtins.__builtin_bswap32;
 pub const __builtin_bswap64 = @import("std").zig.c_builtins.__builtin_bswap64;

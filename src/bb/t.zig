@@ -11,6 +11,19 @@ pub const SUBSCRIBE_REQ_RET = 2;
 pub const SUBSCRIBE_DAT_RET = 3;
 pub const SUBSCRIBE_REQ_FAL = 4;
 
+/// ```c
+/// static const BBCB_TAB cbtab[] = {
+///     { BB_EVENT_LINK_STATE       ,   sizeof(bb_event_link_state_t    )   },
+///     { BB_EVENT_MCS_CHANGE       ,   sizeof(bb_event_mcs_change_t    )   },
+///     { BB_EVENT_MCS_CHANGE_END   ,   sizeof(bb_event_mcs_change_end_t)   },
+///     { BB_EVENT_CHAN_CHANGE      ,   sizeof(bb_event_chan_change_t   )   },
+///     { BB_EVENT_PLOT_DATA        ,   sizeof(bb_event_plot_data_t     )   },
+///     { BB_EVENT_PRJ_DISPATCH     ,   sizeof(bb_event_prj_dispatch_t  )   },
+///     { BB_EVENT_PAIR_RESULT      ,   sizeof(bb_event_pair_result_t   )   },
+///     { BB_EVENT_PRJ_DISPATCH2    ,   sizeof(bb_event_prj_dispatch2_t )   },
+/// };
+/// ```
+///
 pub const Event = enum {
     link_state,
     mcs_change,

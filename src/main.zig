@@ -2022,20 +2022,19 @@ const TransferCallback = struct {
         lg.log();
 
         if (rx_buf.len > 0) {
-            var mpk_ = ManagedUsbPack.unmarshal(self.alloc, rx_buf);
-            if (mpk_) |*mpk| {
+            var e_mpk = ManagedUsbPack.unmarshal(self.alloc, rx_buf);
+            if (e_mpk) |*mpk| {
                 lg = utils.logWithSrc(self.dev.withLogger(logz.debug()), @src());
                 mpk.pack.withLogger(lg, GlobalConfig.is_log_packet_content).log();
                 self.dev.xfer.rx_queue.enqueue(mpk.*) catch |e| {
-                    lg = utils.logWithSrc(self.dev.withLogger(logz.err()), @src());
-                    lg.err(e).string("what", "failed to enqueue").log();
+                    utils.logWithSrc(self.dev.withLogger(logz.err()), @src())
+                        .err(e).string("what", "failed to enqueue").log();
                     mpk.deinit();
                 };
             } else |err| {
-                lg = utils.logWithSrc(self.dev.withLogger(logz.err()), @src());
-                lg.string("what", "failed to unmarshal")
-                    .fmt("data", "{any}", .{rx_buf})
-                    .err(err)
+                utils.logWithSrc(self.dev.withLogger(logz.err()), @src())
+                    .err(err).string("what", "failed to unmarshal")
+                    .fmt("data", "{s}", .{std.fmt.fmtSliceHexLower(rx_buf)})
                     .log();
             }
         }

@@ -162,18 +162,31 @@ pub fn printEndpoints(vid: u16, pid: u16, endpoints: []const Endpoint) void {
     }
 }
 
-pub fn usbSpeedToString(speed: c_int) []const u8 {
-    const r = switch (speed) {
-        usb.LIBUSB_SPEED_UNKNOWN => "UNKNOWN",
-        usb.LIBUSB_SPEED_LOW => "LOW",
-        usb.LIBUSB_SPEED_FULL => "FULL",
-        usb.LIBUSB_SPEED_HIGH => "HIGH",
-        usb.LIBUSB_SPEED_SUPER => "SUPER",
-        usb.LIBUSB_SPEED_SUPER_PLUS => "SUPER_PLUS",
-        else => "INVALID",
-    };
-    return r;
-}
+pub const Speed = enum {
+    unknown,
+    low,
+    full,
+    high,
+    super,
+    super_plus,
+
+    pub fn fromC(speed: c_int) BadEnum!Speed {
+        return switch (speed) {
+            usb.LIBUSB_SPEED_UNKNOWN => Speed.unknown,
+            usb.LIBUSB_SPEED_LOW => Speed.low,
+            usb.LIBUSB_SPEED_FULL => Speed.full,
+            usb.LIBUSB_SPEED_HIGH => Speed.high,
+            usb.LIBUSB_SPEED_SUPER => Speed.super,
+            usb.LIBUSB_SPEED_SUPER_PLUS => Speed.super_plus,
+            else => BadEnum.BadEnum,
+        };
+    }
+
+    pub fn getDeviceSpeed(device: *usb.libusb_device) BadEnum!Speed {
+        const speed = usb.libusb_get_device_speed(device);
+        return Speed.fromC(speed);
+    }
+};
 
 pub const TransferStatus = enum {
     completed,

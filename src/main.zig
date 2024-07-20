@@ -26,12 +26,12 @@ const LibUsbError = helper.LibUsbError;
 const Endpoint = helper.Endpoint;
 const Direction = helper.Direction;
 const TransferType = helper.TransferType;
+const UsbSpeed = helper.Speed;
 const getEndpoints = helper.getEndpoints;
 const printEndpoints = helper.printEndpoints;
 const transferStatusFromInt = helper.transferStatusFromInt;
 const dynStringDescriptorOr = helper.dynStringDescriptorOr;
 const printStrDesc = helper.printStrDesc;
-const usbSpeedToString = helper.usbSpeedToString;
 const libusb_error_2_set = helper.libusb_error_2_set;
 
 const ArtoStatus = bb.Status;
@@ -1025,8 +1025,8 @@ const DeviceContext = struct {
         // we could call transmit/receive from now on, as long as the event loop is running
 
         self.runLoopPrepare();
-        const speed = usb.libusb_get_device_speed(self.mutDev());
-        self.withLogger(logz.info()).string("speed", usbSpeedToString(speed)).log();
+        const speed = UsbSpeed.getDeviceSpeed(self.mutDev()) catch unreachable;
+        self.withLogger(logz.info()).string("speed", @tagName(speed)).log();
     }
 
     pub fn deinit(self: *Self) void {
@@ -1721,6 +1721,7 @@ const InitSequenceCallback = struct {
                 const ud = obs.userdata;
                 var self = Self.as(ud);
                 self.dev.withSrcLogger(logz.err(), @src())
+                    .stringZ("observer", obs.name())
                     .err(err)
                     .string("what", what)
                     .log();
@@ -1963,7 +1964,7 @@ const TransferCallback = struct {
     }
 
     /// return a type-erased pointer to the destructor
-    pub fn dtorPtrTypeErased() *const fn (*anyopaque) void {
+    pub inline fn dtorPtrTypeErased() *const fn (*anyopaque) void {
         return @ptrCast(&@This().deinit);
     }
 
